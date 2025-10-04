@@ -9,11 +9,12 @@ import altair as alt
 import uuid
 import numpy as np
 import numpy_financial as npf
+from mftool import Mftool
+import time
 
 # --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
 
-# NEW Correct Version
 st.set_page_config(
     page_title="Finance Dashboard",
     layout="wide",
@@ -59,9 +60,9 @@ def get_db_connection():
         st.stop()
 
 def initialize_database(conn):
-    """Initializes all database tables if they don't exist."""
+    """Initializes all database tables if they don't exist and handles schema migrations."""
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS portfolio (ticker TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS portfolio (ticker TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, sector TEXT, market_cap TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS trades (symbol TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, target_price REAL NOT NULL, stop_loss_price REAL NOT NULL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close_price REAL, PRIMARY KEY (ticker, date))""")
     c.execute("""CREATE TABLE IF NOT EXISTS realized_stocks (transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL, sell_price REAL NOT NULL, sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL)""")
@@ -73,9 +74,29 @@ def initialize_database(conn):
     c.execute("""CREATE TABLE IF NOT EXISTS mf_transactions (transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL, scheme_name TEXT NOT NULL, yfinance_symbol TEXT NOT NULL, type TEXT NOT NULL, units REAL NOT NULL, nav REAL NOT NULL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS mf_sips (sip_id INTEGER PRIMARY KEY AUTOINCREMENT, scheme_name TEXT NOT NULL UNIQUE, yfinance_symbol TEXT NOT NULL, amount REAL NOT NULL, day_of_month INTEGER NOT NULL)""")
     conn.commit()
+    _add_missing_columns(conn)
+
+def _add_missing_columns(conn):
+    """Adds 'sector' and 'market_cap' columns to the portfolio table if they are missing."""
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(portfolio)")
+    columns = [info[1] for info in c.fetchall()]
+    if 'sector' not in columns:
+        c.execute("ALTER TABLE portfolio ADD COLUMN sector TEXT")
+        logging.info("Added 'sector' column to 'portfolio' table.")
+    if 'market_cap' not in columns:
+        c.execute("ALTER TABLE portfolio ADD COLUMN market_cap TEXT")
+        logging.info("Added 'market_cap' column to 'portfolio' table.")
+    conn.commit()
 
 DB_CONN = get_db_connection()
 initialize_database(DB_CONN)
+
+# --- NEW: FUNCTION TO UPDATE FUNDS ---
+def update_funds_on_transaction(transaction_type, amount, description, date):
+    c = DB_CONN.cursor()
+    c.execute("INSERT INTO fund_transactions (transaction_id, date, type, amount, description) VALUES (?, ?, ?, ?, ?)", (str(uuid.uuid4()), date, transaction_type, amount, description))
+    DB_CONN.commit()
 
 # --- API & DATA FUNCTIONS ---
 @st.cache_data(ttl=3600)
@@ -92,20 +113,86 @@ def search_for_ticker(company_name):
         return []
 
 @st.cache_data(ttl=600)
-def fetch_current_price(symbol):
+def fetch_stock_info(symbol):
+    """Fetches key stock information including price, sector, and market cap."""
+    max_retries = 3
+    retry_delay = 5  # seconds
+    for attempt in range(max_retries):
+        try:
+            ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol else symbol
+            ticker_obj = yf.Ticker(ticker_str)
+            info = ticker_obj.info
+
+            price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('last_price')
+            if price:
+                price = round(price, 2)
+            else:
+                data = ticker_obj.history(period='2d', auto_adjust=True)
+                if not data.empty:
+                    price = round(data['Close'].iloc[-1], 2)
+
+            sector = info.get('sector', 'N/A')
+            market_cap = info.get('marketCap', 'N/A')
+
+            return {
+                'price': price,
+                'sector': sector,
+                'market_cap': market_cap
+            }
+        except Exception as e:
+            logging.warning(f"Attempt {attempt + 1}/{max_retries} to fetch info for {symbol} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logging.error(f"All {max_retries} attempts failed for {symbol}.")
+                return {
+                    'price': None,
+                    'sector': 'N/A',
+                    'market_cap': 'N/A'
+                }
+
+@st.cache_data(ttl=3600)
+def fetch_mf_schemes():
+    """Fetches all mutual fund scheme codes and names using mftool."""
     try:
-        ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol else symbol
-        ticker_obj = yf.Ticker(ticker_str)
-        price = ticker_obj.fast_info.get('last_price')
-        if price:
-            return round(price, 2)
-        data = ticker_obj.history(period='2d', auto_adjust=True)
-        if not data.empty:
-            return round(data['Close'].iloc[-1], 2)
+        mf = Mftool()
+        schemes = mf.get_scheme_codes()
+        return {v: k for k, v in schemes.items()}
+    except Exception as e:
+        logging.error(f"Failed to fetch mutual fund schemes: {e}")
+        return {}
+
+@st.cache_data(ttl=600)
+def fetch_latest_mf_nav(scheme_code):
+    """Fetches the latest NAV for a given scheme code."""
+    try:
+        mf = Mftool()
+        data = mf.get_scheme_quote(scheme_code)
+        if data and 'nav' in data and data['nav']:
+            return float(data['nav'])
         return None
     except Exception as e:
-        logging.error(f"YFinance fetch_current_price failed for {symbol}: {e}")
+        logging.error(f"Failed to fetch NAV for scheme {scheme_code}: {e}")
         return None
+
+@st.cache_data(ttl=86400) # Cache for 24 hours
+def get_mf_historical_data(scheme_code):
+    """Fetches historical NAV data for a mutual fund."""
+    try:
+        mf = Mftool()
+        data = mf.get_scheme_historical_nav(scheme_code)
+        if not data or 'data' not in data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data['data'])
+        df.rename(columns={'nav': 'NAV', 'date': 'Date'}, inplace=True)
+        df['Date'] = pd.to_datetime(df['Date'], format='%d-%m-%Y')
+        df['NAV'] = pd.to_numeric(df['NAV'])
+        df.set_index('Date', inplace=True)
+        return df
+    except Exception as e:
+        logging.error(f"Failed to fetch historical data for scheme {scheme_code}: {e}")
+        return pd.DataFrame()
 
 def update_stock_data(symbol):
     try:
@@ -130,7 +217,7 @@ def get_holdings_df(table_name):
     if table_name == "trades":
         query = "SELECT p.symbol, p.buy_price, p.buy_date, p.quantity, p.target_price, p.stop_loss_price, h.close_price AS current_price FROM trades p LEFT JOIN (SELECT ticker, close_price FROM price_history WHERE (ticker, date) IN (SELECT ticker, MAX(date) FROM price_history GROUP BY ticker)) h ON p.symbol = h.ticker"
     else:
-        query = "SELECT p.ticker AS symbol, p.buy_price, p.buy_date, p.quantity, h.close_price AS current_price FROM portfolio p LEFT JOIN (SELECT ticker, close_price FROM price_history WHERE (ticker, date) IN (SELECT ticker, MAX(date) FROM price_history GROUP BY ticker)) h ON p.ticker = h.ticker"
+        query = "SELECT p.ticker AS symbol, p.buy_price, p.buy_date, p.quantity, p.sector, p.market_cap, h.close_price AS current_price FROM portfolio p LEFT JOIN (SELECT ticker, close_price FROM price_history WHERE (ticker, date) IN (SELECT ticker, MAX(date) FROM price_history GROUP BY ticker)) h ON p.ticker = h.ticker"
     try:
         df = pd.read_sql(query, DB_CONN)
         if df.empty:
@@ -165,6 +252,45 @@ def get_realized_df(table_name):
         logging.error(f"Error querying {table_name}: {e}")
         return pd.DataFrame()
 
+def _update_existing_portfolio_info():
+    """Fetches and updates missing sector and market cap data for existing stocks."""
+    c = DB_CONN.cursor()
+
+    # Check for tickers with missing sector or market_cap
+    c.execute("SELECT ticker FROM portfolio WHERE sector IS NULL OR market_cap IS NULL OR sector = 'N/A' OR market_cap = 'N/A'")
+    tickers_to_update = [row[0] for row in c.fetchall()]
+
+    if tickers_to_update:
+        st.info(f"Updating missing info for {len(tickers_to_update)} existing stocks...")
+        for ticker in tickers_to_update:
+            try:
+                stock_info = fetch_stock_info(ticker)
+                sector = stock_info['sector']
+                market_cap = stock_info['market_cap']
+
+                if sector != 'N/A' or market_cap != 'N/A':
+                    c.execute("UPDATE portfolio SET sector = ?, market_cap = ? WHERE ticker = ?", (sector, market_cap, ticker))
+                    logging.info(f"Updated sector and market cap for {ticker}.")
+            except Exception as e:
+                logging.error(f"Failed to update info for {ticker}: {e}")
+        DB_CONN.commit()
+        st.success("Existing portfolio data has been updated.")
+
+def _categorize_market_cap(market_cap_value):
+    """Categorizes a market cap value into Large, Mid, or Small Cap."""
+    if isinstance(market_cap_value, (int, float)):
+        # Using general, widely-accepted ranges.
+        # Note: These values can be different for different markets (e.g., US vs India)
+        # and are subject to change over time.
+        # $1B = 1,000,000,000
+        if market_cap_value >= 10000000000:  # $10 Billion USD
+            return "Large Cap"
+        elif market_cap_value >= 2000000000:  # $2 Billion USD
+            return "Mid Cap"
+        else:
+            return "Small Cap"
+    return "N/A"
+
 # --- HELPER FUNCTIONS ---
 def _process_recurring_expenses():
     c = DB_CONN.cursor()
@@ -197,9 +323,11 @@ def _calculate_xirr(transactions_df, latest_nav):
     redemptions['cash_flow'] = 1 * redemptions['units'] * redemptions['nav']
     total_units = purchases['units'].sum() - redemptions['units'].sum()
     if total_units <= 0.001:
-        if redemptions.empty: return 0.0
+        if redemptions.empty:
+            return 0.0
         all_flows = pd.concat([purchases[['date', 'cash_flow']], redemptions[['date', 'cash_flow']]])
-        if all_flows['cash_flow'].min() >= 0 or all_flows['cash_flow'].max() <= 0: return 0.0
+        if all_flows['cash_flow'].min() >= 0 or all_flows['cash_flow'].max() <= 0:
+            return 0.0
     else:
         current_value = total_units * latest_nav
         final_redemption = pd.DataFrame([{'date': datetime.date.today().strftime('%Y-%m-%d'), 'cash_flow': current_value}])
@@ -210,8 +338,18 @@ def _calculate_xirr(transactions_df, latest_nav):
     if len(values) < 2 or not any(v < 0 for v in values) or not any(v > 0 for v in values):
         return 0.0
     try:
-        return npf.xirr(values, dates) * 100
-    except Exception:
+        # Check if xirr is available in numpy_financial
+        if hasattr(npf, 'xirr'):
+            xirr = npf.xirr(values, dates)
+            if not np.isfinite(xirr):
+                logging.warning("XIRR returned non-finite value, defaulting to 0.0")
+                return 0.0
+            return xirr * 100
+        else:
+            logging.warning("numpy_financial.xirr not available, defaulting XIRR to 0.0. Please update numpy_financial to version 1.0.0 or higher.")
+            return 0.0
+    except Exception as e:
+        logging.error(f"XIRR calculation failed: {e}")
         return 0.0
 
 def _process_mf_sips():
@@ -221,6 +359,7 @@ def _process_mf_sips():
         sips_df = pd.read_sql("SELECT * FROM mf_sips", DB_CONN)
         if sips_df.empty:
             return
+        mf = Mftool()
         for _, sip in sips_df.iterrows():
             day = min(sip['day_of_month'], pd.Timestamp.now().days_in_month)
             sip_date_this_month = today.replace(day=day)
@@ -228,10 +367,11 @@ def _process_mf_sips():
                 existing_sip_tx = pd.read_sql(f"SELECT * FROM mf_transactions WHERE scheme_name = ? AND date = ?", (sip['scheme_name'], sip_date_this_month.strftime('%Y-%m-%d')))
                 if existing_sip_tx.empty:
                     try:
-                        nav_data = yf.Ticker(sip['yfinance_symbol']).history(start=sip_date_this_month, end=sip_date_this_month + datetime.timedelta(days=1))
-                        if not nav_data.empty:
-                            nav = nav_data['Close'].iloc[0]
+                        nav_data = mf.get_scheme_quote(sip['yfinance_symbol'])
+                        if nav_data and 'nav' in nav_data and nav_data['nav']:
+                            nav = float(nav_data['nav'])
                             units = sip['amount'] / nav
+                            update_funds_on_transaction("Withdrawal", sip['amount'], f"MF SIP: {sip['scheme_name']}", sip_date_this_month.strftime('%Y-%m-%d'))
                             c.execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), sip_date_this_month.strftime('%Y-%m-%d'), sip['scheme_name'], sip['yfinance_symbol'], 'Purchase', units, nav))
                             DB_CONN.commit()
                             logging.info(f"Auto-logged SIP for {sip['scheme_name']}")
@@ -241,6 +381,7 @@ def _process_mf_sips():
     except Exception as e:
         logging.error(f"Failed during MF SIP processing: {e}")
 
+# This function is not used in the mutual fund page but remains in the code for other sections
 @st.cache_data(ttl=3600)
 def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     if holdings_df.empty:
@@ -250,6 +391,9 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
 
     benchmark_map = {
         'Nifty 50': '^NSEI',
+        'Nifty 100': '^CNX100',
+        'Nifty Midcap 150': '^NIFTY_MIDCAP_150.NS',
+        'Nifty Smallcap 250': '^NIFTY_SMALLCAP_250.NS',
         'Nifty 500': '^CRSLDX'
     }
     selected_ticker = benchmark_map.get(benchmark_choice)
@@ -265,8 +409,7 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
         benchmarks = benchmark_df['Close'].copy()
         benchmarks.ffill(inplace=True)
         benchmark_returns = ((benchmarks / benchmarks.iloc[0] - 1) * 100)
-        benchmark_returns.name = benchmark_choice  # Set the Series name directly
-
+        benchmark_returns.name = benchmark_choice
         all_tickers = holdings_df['symbol'].unique().tolist()
         price_data_query = f"""SELECT date, ticker, close_price FROM price_history WHERE ticker IN ({','.join(['?']*len(all_tickers))}) AND date >= ?"""
         all_prices = pd.read_sql(price_data_query, DB_CONN, params=[*all_tickers, start_date])
@@ -290,7 +433,6 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
 
         final_df = pd.concat([portfolio_return, benchmark_returns], axis=1).reset_index().rename(columns={'index': 'Date'})
         final_df = final_df.melt(id_vars='Date', var_name='Type', value_name='Return %').dropna()
-
         return final_df
     except Exception as e:
         logging.error(f"Failed to generate benchmark data: {e}", exc_info=True)
@@ -342,39 +484,57 @@ def render_asset_page(config):
             with st.sidebar.form(f"{key_prefix}_add_details_form"):
                 symbol = st.session_state[f"{key_prefix}_selected_symbol"]
                 st.write(f"Selected: **{symbol}**")
-                current_price = fetch_current_price(symbol)
+
+                stock_info = fetch_stock_info(symbol)
+                current_price = stock_info['price']
+                sector = stock_info['sector']
+                market_cap = stock_info['market_cap']
+
                 currency = "₹" if ".NS" in symbol else "$"
                 if current_price:
                     st.info(f"Current Price: {currency}{current_price:,.2f}")
                 else:
                     st.warning("Could not fetch current price.")
+
                 buy_price = st.number_input(f"Buy Price ({currency})", min_value=0.01, format="%.2f", key=f"{key_prefix}_buy_price")
                 buy_date = st.date_input("Buy Date", max_value=datetime.date.today(), key=f"{key_prefix}_buy_date")
                 quantity = st.number_input("Quantity", min_value=1, step=1, key=f"{key_prefix}_buy_quantity")
+                transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_buy_transaction_fee")
+
+                if not is_trading_section:
+                    st.text_input("Sector", value=sector, key=f"{key_prefix}_sector")
+                    st.text_input("Market Cap", value=market_cap, key=f"{key_prefix}_market_cap")
                 if is_trading_section:
                     target_price = st.number_input("Target Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_target_price")
                     stop_loss_price = st.number_input("Stop Loss Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_stop_loss_price")
+
                 add_button = st.form_submit_button(f"Add to {config['asset_name_plural']}")
+
                 if add_button:
                     if not (buy_price > 0 and quantity > 0):
                         st.error("Buy Price and Quantity must be positive.")
                     elif update_stock_data(symbol):
+                        total_cost = (buy_price * quantity) + transaction_fee
                         c.execute(f"SELECT * FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol,))
                         existing = c.fetchone()
+
                         if existing:
                             old_buy_price, old_quantity = existing[1], existing[3]
+                            old_total_cost = old_buy_price * old_quantity
                             new_quantity = old_quantity + quantity
-                            new_avg_price = ((old_buy_price * old_quantity) + (buy_price * quantity)) / new_quantity
+                            new_avg_price = (old_total_cost + total_cost - transaction_fee) / new_quantity
                             if is_trading_section:
                                 c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, target_price=?, stop_loss_price=? WHERE {config['asset_col']}=?", (new_avg_price, new_quantity, target_price, stop_loss_price, symbol))
                             else:
-                                c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=? WHERE {config['asset_col']}=?", (new_avg_price, new_quantity, symbol))
+                                c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, sector=?, market_cap=? WHERE {config['asset_col']}=?", (new_avg_price, new_quantity, sector, market_cap, symbol))
+                            update_funds_on_transaction("Withdrawal", total_cost, f"Purchase {quantity} more units of {symbol}", buy_date.strftime("%Y-%m-%d"))
                             st.success(f"Updated {symbol}. New quantity: {new_quantity}, New avg. price: {currency}{new_avg_price:,.2f}")
                         else:
                             if is_trading_section:
                                 c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?)", (symbol, buy_price, buy_date.strftime("%Y-%m-%d"), quantity, target_price, stop_loss_price))
                             else:
-                                c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity) VALUES (?, ?, ?, ?)", (symbol, buy_price, buy_date.strftime("%Y-%m-%d"), quantity))
+                                c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, sector, market_cap) VALUES (?, ?, ?, ?, ?, ?)", (symbol, buy_price, buy_date.strftime("%Y-%m-%d"), quantity, sector, market_cap))
+                            update_funds_on_transaction("Withdrawal", total_cost, f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
                             st.success(f"{symbol} added successfully!")
                         DB_CONN.commit()
                         for key in st.session_state:
@@ -399,6 +559,7 @@ def render_asset_page(config):
             sell_qty = st.number_input("Quantity to Sell", min_value=1, max_value=available_qty, step=1, key=f"{key_prefix}_sell_qty", disabled=is_disabled)
             sell_price = st.number_input("Sell Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_sell_price", disabled=is_disabled)
             sell_date = st.date_input("Sell Date", max_value=datetime.date.today(), key=f"{key_prefix}_sell_date", disabled=is_disabled)
+            sell_transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_sell_transaction_fee", disabled=is_disabled)
             sell_button = st.form_submit_button(f"Sell {config['asset_name']}")
             if sell_button:
                 if not symbol_to_sell:
@@ -418,6 +579,7 @@ def render_asset_page(config):
                         c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (transaction_id, symbol_to_sell, buy_price, buy_date, sell_qty, sell_price, sell_date.strftime("%Y-%m-%d"), realized_return, target_price, stop_loss_price))
                     else:
                         c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (transaction_id, symbol_to_sell, buy_price, buy_date, sell_qty, sell_price, sell_date.strftime("%Y-%m-%d"), realized_return))
+                    update_funds_on_transaction("Deposit", (sell_price * sell_qty) - sell_transaction_fee, f"Sale of {sell_qty} units of {symbol_to_sell}", sell_date.strftime("%Y-%m-%d"))
                     if sell_qty == current_qty:
                         c.execute(f"DELETE FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
                     else:
@@ -428,7 +590,9 @@ def render_asset_page(config):
     else:
         st.sidebar.info(f"No open {config['asset_name_plural'].lower()}.")
     st.header("Overview")
-    if not is_trading_section:
+    view_options = ["Current Stocks", "Realized Stocks"]
+    table_view = st.selectbox("View", view_options, key=f"{key_prefix}_table_view")
+    if table_view == "Current Stocks" and not is_trading_section:
         holdings_summary_df = get_holdings_df(config['asset_table'])
         if not holdings_summary_df.empty:
             total_invested, total_current = holdings_summary_df['invested_value'].sum(), holdings_summary_df['current_value'].sum()
@@ -448,14 +612,12 @@ def render_asset_page(config):
                 update_stock_data(symbol)
         st.success("Data refreshed!")
         st.rerun()
-    view_options = [f"Current {config['asset_name_plural']}", f"Realized {config['asset_name_plural']}"]
-    table_view = st.selectbox("View", view_options, key=f"{key_prefix}_table_view")
-    df = get_holdings_df(config['asset_table']) if table_view == view_options[0] else get_realized_df(config['realized_table'])
+    df = get_holdings_df(config['asset_table']) if table_view == "Current Stocks" else get_realized_df(config['realized_table'])
     if not df.empty:
         st.dataframe(df, use_container_width=True)
     else:
         st.info("No data to display.")
-    if table_view == view_options[1]:
+    if table_view == "Realized Stocks":
         st.header(f"Realized {config['asset_name']} Analysis")
         if not df.empty:
             asset_col = config['asset_col']
@@ -466,7 +628,7 @@ def render_asset_page(config):
                 currency = "₹" if ".NS" in row[asset_col] else "$"
                 return f"{row['realized_return_pct']:.1f}% ({currency}{row['realized_profit_loss']:.2f})"
             chart_df['bar_top_label'] = chart_df.apply(create_bar_label, axis=1)
-            bars = alt.Chart(chart_df).mark_bar().encode(x=alt.X('trade_label:N', title='Individual Sale', sort=None), y=alt.Y('realized_return_pct:Q', title='Return %'), color=alt.Color('color:N', scale=alt.Scale(domain=['Profit', 'Loss'], range=['#2ca02c', '#d62728']), legend=None), tooltip=[asset_col, 'buy_date', 'sell_date', 'realized_return_pct', 'realized_profit_loss'])
+            bars = alt.Chart(chart_df).mark_bar().encode(x=alt.X('trade_label:N', title='Individual Sale', sort=None), y=alt.Y('realized_return_pct:Q', title='Return %'), color=alt.Color('color:N', scale=alt.Scale(domain=['Profit', 'Loss'], range=['#2ca02c', '#d62728']), legend=None), tooltip=[alt.Tooltip(asset_col), 'buy_date', 'sell_date', 'realized_return_pct', 'realized_profit_loss'])
             text = bars.mark_text(align='center', baseline='bottom', dy=-5).encode(text='bar_top_label:N')
             st.altair_chart((bars + text).interactive(), use_container_width=True)
     else:
@@ -489,7 +651,6 @@ def render_asset_page(config):
                     chart = alt.Chart(full_chart_df).mark_line().encode(x=alt.X('date:T', title='Date'), y=alt.Y('return_%:Q', title='Return %'), color='symbol:N', tooltip=['symbol', 'date', 'return_%']).interactive()
                     zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
                     st.altair_chart(chart + zero_line, use_container_width=True)
-
         if not is_trading_section and not df.empty:
             st.divider()
             benchmark_choice = st.selectbox("Select Benchmark", ['Nifty 50', 'Nifty 500'], key=f"{key_prefix}_benchmark_choice")
@@ -586,7 +747,7 @@ def expense_tracker_page():
                 st.subheader("Budget vs. Actual Spending")
                 spending_by_cat = expenses_df.groupby('category')['amount'].sum().rename('actual')
                 budget_analysis_df = pd.concat([budgets_df, spending_by_cat], axis=1).fillna(0).rename(columns={'amount':'budget'}).reset_index().melt(id_vars='category', value_vars=['budget', 'actual'], var_name='Type', value_name='Amount')
-                bar_chart = alt.Chart(budget_analysis_df).mark_bar(opacity=0.8).encode(x=alt.X('Amount:Q', title='Amount (₹)'), y=alt.Y('category:N', title='Category', sort='-x'), color='Type:N', xOffset='Type:N').properties(height=350)
+                bar_chart = alt.Chart(budget_analysis_df).mark_bar(opacity=0.8).encode(x=alt.X('Amount:Q', title='Amount (₹)'), y=alt.Y('category:N', title='Category', sort='-x'), color='Type:N').properties(height=350)
                 st.altair_chart(bar_chart, use_container_width=True)
         else:
             st.info("No expenses logged for this month to display charts.")
@@ -604,7 +765,7 @@ def expense_tracker_page():
             budget_df = budget_df.set_index('category')
             budget_df.update(existing_budgets.set_index('category'))
             budget_df = budget_df.reset_index()
-        edited_budgets = st.data_editor(budget_df, num_rows="dynamic", use_container_width=True)
+        edited_budgets = st.data_editor(budget_df, num_rows="dynamic", use_container_width=True, column_config={"day_of_month": st.column_config.NumberColumn("Day of Month (1-31)", min_value=1, max_value=31, step=1, required=True)})
         if st.button("Save Budgets"):
             for _, row in edited_budgets.iterrows():
                 if row['amount'] >= 0 and row['category']:
@@ -631,36 +792,82 @@ def mutual_fund_page():
     c = DB_CONN.cursor()
     _process_mf_sips()
 
+    key_prefix = "mf"
     st.sidebar.header("Add Transaction")
-    with st.sidebar.form("mf_transaction_form", clear_on_submit=True):
-        st.subheader("Log a Transaction")
-        mf_date = st.date_input("Date", max_value=datetime.date.today())
-        mf_scheme = st.text_input("Scheme Name (e.g., Axis Bluechip Fund)")
-        mf_symbol = st.text_input("Yahoo Finance Symbol (e.g., 0P0000XWJ5.BO)")
-        mf_type = st.selectbox("Type", ["Purchase", "Redemption"])
-        mf_units = st.number_input("Units", min_value=0.001, format="%.4f")
-        mf_nav = st.number_input("NAV (Net Asset Value)", min_value=0.01, format="%.4f")
-        if st.form_submit_button("Add Transaction"):
-            if mf_scheme and mf_symbol and mf_units > 0 and mf_nav > 0:
-                c.execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), mf_date.strftime('%Y-%m-%d'), mf_scheme, mf_symbol, mf_type, mf_units, mf_nav))
-                DB_CONN.commit()
-                st.success(f"{mf_type} of {mf_scheme} logged!")
-                st.rerun()
-            else:
-                st.warning("Please fill all fields.")
+    for key in ['all_schemes', 'search_results', 'selected_scheme_code', 'search_term']:
+        session_key = f"{key_prefix}_{key}"
+        if session_key not in st.session_state:
+            st.session_state[session_key] = {} if key == 'all_schemes' else [] if key == 'search_results' else None
 
+    if not st.session_state[f"{key_prefix}_all_schemes"]:
+        with st.spinner("Loading mutual fund scheme list... This may take a moment."):
+            st.session_state[f"{key_prefix}_all_schemes"] = fetch_mf_schemes()
+        st.info("Mutual Fund scheme list loaded. You can now search by name.")
+
+    with st.sidebar.form(f"{key_prefix}_search_form"):
+        search_term = st.text_input("Search Fund Name", value="", key=f"{key_prefix}_search_term_input")
+        search_button = st.form_submit_button("Search")
+        if search_button and search_term:
+            filtered_schemes = {name: code for name, code in st.session_state[f"{key_prefix}_all_schemes"].items() if search_term.lower() in name.lower()}
+            st.session_state[f"{key_prefix}_search_results"] = [f"{name} ({code})" for name, code in filtered_schemes.items()]
+            st.session_state[f"{key_prefix}_selected_scheme_code"] = None
+
+    if st.session_state[f"{key_prefix}_search_results"]:
+        selected_result = st.sidebar.selectbox("Select Mutual Fund", st.session_state[f"{key_prefix}_search_results"], key=f"{key_prefix}_select_mf")
+        if selected_result:
+            selected_name = selected_result.split(" (")[0]
+            selected_code = selected_result.split(" (")[-1].replace(")", "")
+            st.session_state[f"{key_prefix}_selected_scheme_code"] = selected_code
+
+            with st.sidebar.form(f"{key_prefix}_add_details_form"):
+                st.write(f"Selected: **{selected_name}**")
+                mf_date = st.date_input("Date", max_value=datetime.date.today())
+                mf_type = st.selectbox("Type", ["Purchase", "Redemption"])
+                mf_units = st.number_input("Units", min_value=0.001, format="%.4f")
+                mf_nav = st.number_input("NAV (Net Asset Value)", min_value=0.01, format="%.4f")
+                mf_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key="mf_transaction_fee")
+                if st.form_submit_button("Add Transaction"):
+                    if selected_name and selected_code and mf_units > 0 and mf_nav > 0:
+                        amount = mf_units * mf_nav
+                        if mf_type == "Purchase":
+                            update_funds_on_transaction("Withdrawal", amount + mf_fee, f"MF Purchase: {selected_name} (including fees)", mf_date.strftime("%Y-%m-%d"))
+                        else: # Redemption
+                            update_funds_on_transaction("Deposit", amount - mf_fee, f"MF Redemption: {selected_name} (after fees)", mf_date.strftime("%Y-%m-%d"))
+
+                        c.execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid.uuid4()), mf_date.strftime('%Y-%m-%d'), selected_name, selected_code, mf_type, mf_units, mf_nav))
+                        DB_CONN.commit()
+                        st.success(f"{mf_type} of {selected_name} logged!")
+                        for key in st.session_state:
+                            if key.startswith(key_prefix):
+                                del st.session_state[key]
+                        st.rerun()
+                    else:
+                        st.warning("Please fill all fields.")
+
+    st.divider()
     view = st.radio("Select View", ["Dashboard", "All Transactions", "Manage SIPs"], horizontal=True)
 
     if view == "Dashboard":
         st.header("Portfolio Dashboard")
+
+        if st.button("Refresh Live NAV Data"):
+            with st.spinner("Fetching latest NAVs..."):
+                mf_symbols = pd.read_sql("SELECT DISTINCT yfinance_symbol FROM mf_transactions", DB_CONN)['yfinance_symbol'].tolist()
+                for symbol in mf_symbols:
+                    fetch_latest_mf_nav(symbol)
+            st.success("NAV data refreshed!")
+            st.rerun()
+
         transactions_df = pd.read_sql("SELECT * FROM mf_transactions", DB_CONN)
         if transactions_df.empty:
             st.info("No mutual fund transactions logged yet. Add one from the sidebar.")
         else:
+            # 1. Total Value (moved to first position)
             holdings = []
             unique_schemes = transactions_df['scheme_name'].unique()
-            symbols = transactions_df['yfinance_symbol'].unique()
-            latest_navs = {sym: fetch_current_price(sym) for sym in symbols}
+            scheme_codes = transactions_df['yfinance_symbol'].unique()
+            latest_navs = {code: fetch_latest_mf_nav(code) for code in scheme_codes}
+
             for scheme in unique_schemes:
                 scheme_tx = transactions_df[transactions_df['scheme_name'] == scheme]
                 purchases = scheme_tx[scheme_tx['type'] == 'Purchase']
@@ -669,16 +876,18 @@ def mutual_fund_page():
                 if total_units > 0.001:
                     total_investment = (purchases['units'] * purchases['nav']).sum() - (redemptions['units'] * redemptions['nav']).sum()
                     avg_nav = total_investment / total_units if total_units > 0 else 0
-                    symbol = scheme_tx['yfinance_symbol'].iloc[0]
-                    latest_nav = latest_navs.get(symbol) or 0
+                    code = scheme_tx['yfinance_symbol'].iloc[0]
+                    latest_nav = latest_navs.get(code) or 0
                     current_value = total_units * latest_nav
                     pnl = current_value - total_investment
                     pnl_pct = (pnl / total_investment) * 100 if total_investment > 0 else 0
                     xirr = _calculate_xirr(scheme_tx, latest_nav)
-                    holdings.append({"Scheme": scheme, "Units": total_units, "Avg NAV": avg_nav, "Latest NAV": latest_nav, "Investment": total_investment, "Current Value": current_value, "P&L": pnl, "P&L %": pnl_pct, "XIRR %": xirr})
+                    holdings.append({"Scheme": scheme, "Units": total_units, "Avg NAV": avg_nav, "Latest NAV": latest_nav, "Investment": total_investment, "Current Value": current_value, "P&L": pnl, "P&L %": pnl_pct, "XIRR %": xirr, "yfinance_symbol": code})
 
-            if holdings:
-                holdings_df = pd.DataFrame(holdings)
+            holdings_df = pd.DataFrame(holdings)
+
+            if not holdings_df.empty:
+                st.subheader("Total Value")
                 total_mf_investment = holdings_df['Investment'].sum()
                 total_mf_current_value = holdings_df['Current Value'].sum()
                 total_mf_pnl = total_mf_current_value - total_mf_investment
@@ -687,10 +896,56 @@ def mutual_fund_page():
                 col2.metric("Current Value", f"₹{total_mf_current_value:,.2f}")
                 col3.metric("Overall P&L", f"₹{total_mf_pnl:,.2f}")
                 st.divider()
+
+            # 2. Holdings Summary (moved to second position)
+            if not holdings_df.empty:
                 st.subheader("Holdings Summary")
                 st.dataframe(holdings_df, use_container_width=True, column_config={"XIRR %": st.column_config.ProgressColumn("XIRR %", format="%.2f%%", min_value=-25, max_value=50)})
+
+            # 3. Performance Chart (new section)
+            st.subheader("Performance Chart")
+            if not holdings_df.empty:
+                all_schemes_list = holdings_df["Scheme"].tolist()
+                selected_schemes = st.multiselect("Select funds for chart", all_schemes_list, default=all_schemes_list, key="mf_perf_schemes")
+                if selected_schemes:
+                    chart_data = []
+                    for scheme in selected_schemes:
+                        scheme_info = holdings_df.loc[holdings_df["Scheme"] == scheme].iloc[0]
+                        code = scheme_info["yfinance_symbol"]
+                        scheme_tx = transactions_df[transactions_df['scheme_name'] == scheme]
+                        start_date = pd.to_datetime(scheme_tx[scheme_tx['type'] == 'Purchase']['date'].min())
+                        history_df = get_mf_historical_data(code)
+                        if not history_df.empty:
+                            history_df = history_df.reset_index()
+                            history_df = history_df[history_df['Date'] >= start_date]
+                            history_df["return_%"] = (history_df["NAV"] - scheme_info["Avg NAV"]) / scheme_info["Avg NAV"] * 100
+                            history_df["Scheme"] = scheme
+                            chart_data.append(history_df)
+                    if chart_data:
+                        full_chart_df = pd.concat(chart_data)
+                        full_chart_df["Date"] = pd.to_datetime(full_chart_df["Date"])
+                        chart = alt.Chart(full_chart_df).mark_line().encode(
+                            x=alt.X('Date:T', title='Date'),
+                            y=alt.Y('return_%:Q', title='Return %'),
+                            color='Scheme:N',
+                            tooltip=['Scheme', 'Date', 'return_%']
+                        ).interactive()
+                        zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                        st.altair_chart(chart + zero_line, use_container_width=True)
+                else:
+                    st.info("No data to display for selected funds.")
+
+            # 4. Portfolio Allocation (moved to fourth position)
+            if not holdings_df.empty:
+                st.divider()
                 st.subheader("Portfolio Allocation")
-                pie_chart = alt.Chart(holdings_df).mark_arc(innerRadius=50).encode(theta=alt.Theta(field="Current Value", type="quantitative"), color=alt.Color(field="Scheme", type="nominal"), tooltip=['Scheme', 'Current Value']).properties(height=400)
+                total_value = holdings_df['Current Value'].sum()
+                holdings_df['Percentage'] = (holdings_df['Current Value'] / total_value * 100).round(2)
+                pie_chart = alt.Chart(holdings_df).mark_arc(innerRadius=50).encode(
+                    theta=alt.Theta(field="Current Value", type="quantitative"),
+                    color=alt.Color(field="Scheme", type="nominal"),
+                    tooltip=['Scheme', 'Current Value', 'Percentage']
+                ).properties(height=400)
                 st.altair_chart(pie_chart, use_container_width=True)
             else:
                 st.info("You have no current mutual fund holdings.")
@@ -724,6 +979,9 @@ def set_page(page):
 def home_page():
     st.title("Finance Dashboard")
     st.write("Select a section to manage your finances:")
+
+    # Run the update function at the start of the app's main page
+    _update_existing_portfolio_info()
 
     st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
     st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
