@@ -5,3 +5,4 @@ requests
 altair
 numpy
 numpy-financial
+mftool
