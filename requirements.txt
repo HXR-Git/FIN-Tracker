@@ -6,3 +6,4 @@ altair
 numpy
 numpy-financial
 mftool
+deprecated
