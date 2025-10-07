@@ -1,7 +1,6 @@
 streamlit
 yfinance
 mftool
-sqlite3
 pandas
 numpy
 altair
