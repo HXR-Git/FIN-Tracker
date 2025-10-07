@@ -798,13 +798,20 @@ def expense_tracker_page():
             trans_cat = st.selectbox("Category", sorted(expense_categories), index=None)
             trans_pm = st.selectbox("Payment Method", PAYMENT_METHODS, index=None)
 
+        if trans_cat == 'Other':
+            custom_category = st.text_input("Enter New Category Name", key="custom_cat_input")
+            if custom_category:
+                final_cat = custom_category
+            else:
+                final_cat = 'Other'
+        else:
+            final_cat = trans_cat
+
         trans_desc = st.text_input("Description", value="")
         if st.form_submit_button("Add Transaction"):
-            if trans_amount and trans_cat and (trans_pm or trans_type == "Income"):
+            if trans_amount and final_cat and (trans_pm or trans_type == "Income"):
                 c.execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (str(uuid.uuid4()), trans_date.strftime("%Y-%m-%d"), trans_type, round(trans_amount, 2), trans_cat, trans_pm, trans_desc))
-                funds_type = "Deposit" if trans_type == "Income" else "Withdrawal"
-                update_funds_on_transaction(funds_type, round(trans_amount, 2), f"From Expense Tracker: {trans_desc}", trans_date.strftime("%Y-%m-%d"))
+                          (str(uuid.uuid4()), trans_date.strftime("%Y-%m-%d"), trans_type, round(trans_amount, 2), final_cat, trans_pm, trans_desc))
                 DB_CONN.commit()
                 st.success(f"{trans_type} added!")
                 st.rerun()
@@ -1048,29 +1055,41 @@ def mutual_fund_page():
 
             if selected_options:
                 chart_data = []
-                earliest_tx_date = pd.to_datetime(transactions_df['date']).min()
-
                 for option in selected_options:
-                    scheme_info = holdings_df.loc[holdings_df["Scheme"] == option].iloc[0]
-                    code = scheme_info["yfinance_symbol"]
+                    scheme_tx = transactions_df[transactions_df['scheme_name'] == option].copy()
+                    if scheme_tx.empty:
+                        continue
+
+                    code = scheme_tx["yfinance_symbol"].iloc[0]
                     history_df = get_mf_historical_data(code)
+
                     if not history_df.empty:
-                        history_df = history_df.reset_index()
-                        history_df = history_df[history_df['Date'] >= earliest_tx_date]
-                        history_df["return_%"] = ((history_df["NAV"] - history_df["NAV"].iloc[0]) / history_df["NAV"].iloc[0] * 100).round(2)
-                        history_df["type"] = str(option)
-                        chart_data.append(history_df[['Date', 'return_%', 'type']].rename(columns={'Date': 'date'}))
+                        # Ensure transaction dates are within the historical data range
+                        start_date = pd.to_datetime(scheme_tx['date'].min())
+                        historical_df_filtered = history_df[history_df.index >= start_date]
+
+                        if not historical_df_filtered.empty:
+                            cumulative_returns = _calculate_mf_cumulative_return(scheme_tx, historical_df_filtered)
+                            if not cumulative_returns.empty:
+                                cumulative_returns['type'] = str(option)
+                                chart_data.append(cumulative_returns)
+                        else:
+                            st.warning(f"No historical data available for {option} after the first transaction date.")
 
                 if chart_data:
                     full_chart_df = pd.concat(chart_data)
-                    full_chart_df = full_chart_df.dropna(subset=['date', 'return_%', 'type'])
+                    full_chart_df = full_chart_df.dropna(subset=['date', 'cumulative_return', 'type'])
                     if not full_chart_df.empty:
                         chart = alt.Chart(full_chart_df).mark_line().encode(
                             x=alt.X('date:T', title='Date'),
-                            y=alt.Y('return_%:Q', title='Total Return (%)'),
-                            color=alt.Color('type:N', title='Legend'),
-                            tooltip=['type:N', alt.Tooltip('date:T', format='%Y-%m-%d'), alt.Tooltip('return_%:Q', format=".2f")]
-                        ).properties(height=300).interactive()
+                            y=alt.Y('cumulative_return:Q', title='Cumulative Return (%)'),
+                            color=alt.Color('type:N', title='Fund Name'),
+                            tooltip=[
+                                alt.Tooltip('type:N', title='Fund Name'),
+                                alt.Tooltip('date:T', format='%Y-%m-%d'),
+                                alt.Tooltip('cumulative_return:Q', title='Return %', format=".2f")
+                            ]
+                        ).properties(height=300, title="Mutual Fund Cumulative Returns").interactive()
                         zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
                         st.altair_chart(chart + zero_line, use_container_width=True)
                     else:
@@ -1117,6 +1136,179 @@ def mutual_fund_page():
             DB_CONN.commit()
             st.success("SIP rules saved!")
             st.rerun()
+
+def home_page():
+    """Renders the main home page."""
+    st.title("Finance Dashboard")
+    _update_existing_portfolio_info()
+
+    # Calculate and display new metrics
+    returns_data = get_combined_returns()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            label="Return (Investment + Trading)",
+            value=f"₹{returns_data['inv_trade_return_amount']:,.2f}",
+            delta=f"{returns_data['inv_trade_return_pct']:.2f}%"
+        )
+    with col2:
+        st.metric(
+            label="Return(Investment+Trading+Mutual Fund)",
+            value=f"₹{returns_data['total_return_amount']:,.2f}",
+            delta=f"{returns_data['total_return_pct']:.2f}%"
+        )
+
+    col3, col4 = st.columns(2)
+    with col3:
+        st.metric("Total Investment Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_invested_value']:,.2f}")
+    with col4:
+        st.metric("Current Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_current_value']:,.2f}")
+
+    st.divider()
+
+    st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
+    st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
+    st.button("💰 Funds", use_container_width=True, on_click=set_page, args=("funds",))
+    st.button("💸 Expense Tracker", use_container_width=True, on_click=set_page, args=("expense_tracker",))
+    st.button("📚 Mutual Fund", use_container_width=True, on_click=set_page, args=("mutual_fund",))
+
+def set_page(page):
+    """Sets the current page in session state."""
+    st.session_state.page = page
+
+# New function to get combined returns
+def get_combined_returns():
+    """Calculates and returns combined returns for all asset types."""
+    # Get Investment Holdings
+    inv_df = get_holdings_df("portfolio")
+    inv_invested = inv_df['invested_value'].sum() if not inv_df.empty else 0
+    inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
+
+    # Get Trading Holdings
+    trade_df = get_holdings_df("trades")
+    trade_invested = trade_df['invested_value'].sum() if not trade_df.empty else 0
+    trade_current = trade_df['current_value'].sum() if not trade_df.empty else 0
+
+    # Get Mutual Fund Holdings
+    mf_df = get_mf_holdings_df()
+    mf_invested = mf_df['Investment'].sum() if not mf_df.empty else 0
+    mf_current = mf_df['Current Value'].sum() if not mf_df.empty else 0
+
+    # Calculate combined returns for Investment and Trading
+    inv_trade_invested = inv_invested + trade_invested
+    inv_trade_current = inv_current + trade_current
+    inv_trade_return_amount = (inv_trade_current - inv_trade_invested).round(2)
+    inv_trade_return_pct = (inv_trade_return_amount / inv_trade_invested * 100).round(2) if inv_trade_invested > 0 else 0
+
+    # Calculate combined returns for all assets
+    total_invested = inv_trade_invested + mf_invested
+    total_current = inv_trade_current + mf_current
+    total_return_amount = (total_current - total_invested).round(2)
+    total_return_pct = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
+
+    return {
+        "inv_trade_return_amount": inv_trade_return_amount,
+        "inv_trade_return_pct": inv_trade_return_pct,
+        "total_invested_value": total_invested,
+        "total_current_value": total_current,
+        "total_return_amount": total_return_amount,
+        "total_return_pct": total_return_pct,
+    }
+
+# New function for mutual fund holdings to be used in get_combined_returns
+def get_mf_holdings_df():
+    """Calculates current mutual fund holdings from transaction data."""
+    transactions_df = pd.read_sql("SELECT * FROM mf_transactions", DB_CONN)
+    if transactions_df.empty:
+        return pd.DataFrame()
+
+    holdings = []
+    unique_schemes = transactions_df['scheme_name'].unique()
+    latest_navs = {code: fetch_latest_mf_nav(code) for code in transactions_df['yfinance_symbol'].unique()}
+
+    for scheme in unique_schemes:
+        scheme_tx = transactions_df[transactions_df['scheme_name'] == scheme].copy()
+        purchases = scheme_tx[scheme_tx['type'] == 'Purchase']
+        redemptions = scheme_tx[scheme_tx['type'] == 'Redemption']
+
+        total_units = purchases['units'].sum() - redemptions['units'].sum()
+        if total_units > 0.001:
+            total_investment = (purchases['units'] * purchases['nav']).sum() - (redemptions['units'] * redemptions['nav']).sum()
+            avg_nav = total_investment / total_units if total_units > 0 else 0
+            code = scheme_tx['yfinance_symbol'].iloc[0]
+            latest_nav = latest_navs.get(code) or 0
+            current_value = total_units * latest_nav
+            pnl = current_value - total_investment
+            pnl_pct = (pnl / total_investment) * 100 if total_investment > 0 else 0
+
+            holdings.append({
+                "Scheme": scheme, "Units": round(total_units, 4), "Avg NAV": round(avg_nav, 4),
+                "Latest NAV": round(latest_nav, 4), "Investment": round(total_investment, 2),
+                "Current Value": round(current_value, 2), "P&L": round(pnl, 2), "P&L %": round(pnl_pct, 2),
+                "yfinance_symbol": code
+            })
+    return pd.DataFrame(holdings)
+
+def _calculate_mf_cumulative_return(transactions_df, historical_df):
+    """
+    Calculates the cumulative return of a mutual fund portfolio over time.
+
+    Args:
+        transactions_df (pd.DataFrame): A DataFrame of fund transactions for a single fund.
+        historical_df (pd.DataFrame): A DataFrame of historical NAV data for the fund.
+
+    Returns:
+        pd.DataFrame: A DataFrame with the daily cumulative return percentage.
+    """
+    if transactions_df.empty or historical_df.empty:
+        return pd.DataFrame()
+
+    transactions_df['date'] = pd.to_datetime(transactions_df['date'])
+    transactions_df = transactions_df.sort_values('date').reset_index(drop=True)
+
+    # Use the min and max dates from the transactions and historical data
+    start_date = transactions_df['date'].min()
+    end_date = historical_df.index.max()
+    all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+
+    # Initialize daily tracking variables
+    units = 0
+    invested_amount = 0
+    daily_df = []
+
+    # Process transactions and NAV data day by day
+    for date in all_dates:
+        # Check if there is an NAV value for this date
+        if date in historical_df.index:
+            nav = historical_df.loc[date]['NAV']
+
+            # Process transactions for this date
+            todays_tx = transactions_df[transactions_df['date'] == date]
+            for _, tx_row in todays_tx.iterrows():
+                if tx_row['type'] == 'Purchase':
+                    units += tx_row['units']
+                    invested_amount += (tx_row['units'] * tx_row['nav'])
+                elif tx_row['type'] == 'Redemption':
+                    units -= tx_row['units']
+                    invested_amount -= (tx_row['units'] * tx_row['nav'])
+
+            # Calculate current value and return for the day
+            current_value = units * nav if units > 0 else 0
+
+            if invested_amount > 0:
+                cumulative_return = ((current_value - invested_amount) / invested_amount) * 100
+            else:
+                cumulative_return = 0
+
+            daily_df.append({
+                'date': date,
+                'cumulative_return': cumulative_return,
+            })
+
+    return_df = pd.DataFrame(daily_df)
+    return return_df
+
 
 def home_page():
     """Renders the main home page."""
