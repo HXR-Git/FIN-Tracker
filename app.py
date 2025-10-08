@@ -337,7 +337,7 @@ def _process_mf_sips():
 
             if datetime.datetime.strptime(sip_date_this_month, '%Y-%m-%d').date() <= today:
                 existing_sip_tx = pd.read_sql("SELECT * FROM mf_transactions WHERE scheme_name = ? AND date LIKE ?",
-                                              (sip['scheme_name'], f"{month_year}-%"))
+                                             (sip['scheme_name'], f"{month_year}-%"))
                 if existing_sip_tx.empty:
                     try:
                         nav = fetch_latest_mf_nav(sip['yfinance_symbol'])
@@ -399,6 +399,137 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     except Exception as e:
         logging.error(f"Failed to generate benchmark data: {e}", exc_info=True)
         return pd.DataFrame()
+
+# --- NEW METRICS CALCULATION FUNCTIONS ---
+
+def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
+    """Calculates alpha, beta, max drawdown, and annualized return."""
+    metrics = {
+        'alpha': 'N/A', 'beta': 'N/A', 'max_drawdown': 'N/A',
+        'annualized_return': 'N/A'
+    }
+
+    if holdings_df.empty:
+        return metrics
+
+    # Get portfolio historical value
+    start_date = holdings_df['buy_date'].min() if not holdings_df.empty else datetime.date.today().strftime('%Y-%m-%d')
+    end_date = datetime.date.today().strftime('%Y-%m-%d')
+
+    all_tickers = holdings_df['symbol'].unique().tolist()
+    price_data_query = f"""SELECT date, ticker, close_price FROM price_history WHERE ticker IN ({','.join(['?']*len(all_tickers))}) AND date >= ?"""
+    all_prices = pd.read_sql(price_data_query, DB_CONN, params=[*all_tickers, start_date])
+    all_prices['date'] = pd.to_datetime(all_prices['date'])
+    price_pivot = all_prices.pivot(index='date', columns='ticker', values='close_price').ffill()
+
+    daily_units = pd.DataFrame(0.0, index=price_pivot.index, columns=all_tickers)
+    for _, row in holdings_df.iterrows():
+        buy_date = pd.to_datetime(row['buy_date'])
+        # Fix: Use searchsorted to find the index to avoid TypeError on older pandas versions
+        buy_date_index = price_pivot.index.searchsorted(buy_date, side='left')
+        # Assign quantity from the buy date forward
+        daily_units.iloc[buy_date_index:, daily_units.columns.get_loc(row['symbol'])] = row['quantity']
+
+    portfolio_value = (price_pivot * daily_units).sum(axis=1).ffill().dropna()
+
+    if portfolio_value.empty or len(portfolio_value) < 2:
+        return metrics
+
+    # Calculate Daily Returns
+    portfolio_returns = portfolio_value.pct_change().dropna()
+
+    # Max Drawdown
+    cumulative_returns = (1 + portfolio_returns).cumprod()
+    peak = cumulative_returns.expanding(min_periods=1).max()
+    drawdown = (cumulative_returns / peak) - 1
+    max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0
+    metrics['max_drawdown'] = round(max_drawdown, 2)
+
+    # Annualized Return
+    total_days = (portfolio_value.index[-1] - portfolio_value.index[0]).days
+    if total_days > 0:
+        annualized_return = ((portfolio_value.iloc[-1] / portfolio_value.iloc[0]) ** (365.25 / total_days) - 1) * 100
+        metrics['annualized_return'] = round(annualized_return, 2)
+
+    # Alpha and Beta
+    benchmark_map = {'Nifty 50': '^NSEI', 'Nifty 100': '^CNX100', 'Nifty 200': '^CNX200', 'Nifty 500': '^CRSLDX'}
+    selected_ticker = benchmark_map.get(benchmark_choice)
+    if selected_ticker:
+        try:
+            benchmark_df = yf.download(selected_ticker, start=portfolio_value.index.min(), end=portfolio_value.index.max(), progress=False, auto_adjust=True)
+            if not benchmark_df.empty:
+                benchmark_returns = benchmark_df['Close'].pct_change().dropna()
+
+                # Align dataframes and drop any missing values from either series
+                combined_returns = pd.DataFrame({
+                    'portfolio': portfolio_returns,
+                    'benchmark': benchmark_returns
+                }).dropna()
+
+                if len(combined_returns) > 1:
+                    aligned_portfolio_returns = combined_returns['portfolio']
+                    aligned_benchmark_returns = combined_returns['benchmark']
+
+                    # Beta calculation
+                    cov_matrix = np.cov(aligned_portfolio_returns, aligned_benchmark_returns)
+                    beta = cov_matrix[0, 1] / cov_matrix[1, 1]
+                    metrics['beta'] = round(beta, 2)
+
+                    # Alpha calculation
+                    excess_portfolio_return = aligned_portfolio_returns.mean()
+                    excess_benchmark_return = aligned_benchmark_returns.mean()
+                    risk_free_rate = 0 # Assuming 0 for simplicity, could be from a data source
+                    alpha = excess_portfolio_return - (risk_free_rate + beta * (excess_benchmark_return - risk_free_rate))
+                    metrics['alpha'] = round(alpha * 252 * 100, 2) # Annualize Alpha
+        except Exception as e:
+            logging.error(f"Failed to calculate Alpha/Beta for {selected_ticker}: {e}", exc_info=True)
+
+    return metrics
+
+def calculate_trading_metrics(realized_df):
+    """Calculates win ratio, profit factor, and expectancy."""
+    metrics = {
+        'win_ratio': 'N/A', 'profit_factor': 'N/A', 'expectancy': 'N/A',
+        'max_drawdown': 'N/A'
+    }
+
+    if realized_df.empty:
+        return metrics
+
+    # Win Ratio
+    winning_trades = realized_df[realized_df['realized_profit_loss'] > 0]
+    losing_trades = realized_df[realized_df['realized_profit_loss'] <= 0]
+    total_trades = len(realized_df)
+    if total_trades > 0:
+        win_ratio = (len(winning_trades) / total_trades) * 100
+        metrics['win_ratio'] = round(win_ratio, 2)
+
+    # Profit Factor
+    gross_profit = winning_trades['realized_profit_loss'].sum()
+    gross_loss = abs(losing_trades['realized_profit_loss'].sum())
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+        metrics['profit_factor'] = round(profit_factor, 2)
+
+    # Expectancy
+    if total_trades > 0:
+        avg_win = winning_trades['realized_profit_loss'].mean() if not winning_trades.empty else 0
+        avg_loss = losing_trades['realized_profit_loss'].mean() if not losing_trades.empty else 0
+        expectancy = (win_ratio / 100 * avg_win) + ((1 - win_ratio / 100) * avg_loss)
+        metrics['expectancy'] = round(expectancy, 2)
+
+    # Maximum Drawdown on Realized Trades
+    realized_df['date_dt'] = pd.to_datetime(realized_df['sell_date'])
+    realized_df = realized_df.sort_values('date_dt')
+    realized_df['cumulative_profit'] = realized_df['realized_profit_loss'].cumsum()
+    peak = realized_df['cumulative_profit'].expanding(min_periods=1).max()
+    drawdown = (realized_df['cumulative_profit'] - peak) / peak.abs()
+    if not drawdown.empty:
+        max_drawdown = drawdown.min() * 100
+        metrics['max_drawdown'] = round(max_drawdown, 2)
+
+    return metrics
+
 
 # --- PAGE RENDERERS ---
 PAGE_CONFIGS = {
@@ -609,7 +740,6 @@ def render_asset_page(config):
             total_return_amount = (total_current - total_invested).round(2)
             total_return_percent = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
 
-            # Responsive columns for metrics
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Total Investment", f"₹{total_invested:,.2f}")
@@ -618,6 +748,22 @@ def render_asset_page(config):
             with col3:
                 st.metric("Total Return", f"₹{total_return_amount:,.2f}", f"{total_return_percent:.2f}%")
             st.divider()
+
+            if not is_trading_section:
+                # New layout for portfolio metrics
+                benchmark_choice = 'Nifty 50'
+                metrics = calculate_portfolio_metrics(holdings_df, pd.DataFrame(), benchmark_choice)
+
+                col_alpha, col_beta, col_drawdown, col_annual_return = st.columns(4)
+                with col_alpha:
+                    st.metric("Alpha", f"{metrics['alpha']}%")
+                with col_beta:
+                    st.metric("Beta", f"{metrics['beta']}")
+                with col_drawdown:
+                    st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
+                with col_annual_return:
+                    st.metric("Annualized Return", f"{metrics['annualized_return']}%")
+                st.divider()
 
             # Responsive Dataframe display
             with st.expander("View Detailed Holdings"):
@@ -670,6 +816,18 @@ def render_asset_page(config):
     elif table_view == view_options[1]:
         realized_df = get_realized_df(config['realized_table'])
         if not realized_df.empty:
+
+            # Display Trading Metrics for Realized Trades
+            if is_trading_section:
+                st.subheader("Key Trading Metrics")
+                trading_metrics = calculate_trading_metrics(realized_df)
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Win Ratio", f"{trading_metrics['win_ratio']}%")
+                col2.metric("Profit Factor", f"{trading_metrics['profit_factor']}")
+                col3.metric("Expectancy", f"₹{trading_metrics['expectancy']}")
+                col4.metric("Max Drawdown", f"{trading_metrics['max_drawdown']}%")
+                st.divider()
+
             with st.expander("View Detailed Realized Positions"):
                 df_to_style = realized_df.drop(columns=['transaction_id'], errors='ignore')
                 column_rename = {
@@ -702,23 +860,33 @@ def render_asset_page(config):
         else:
             st.info(f"No {view_options[1].lower()} to display.")
 
-    if not is_trading_section and table_view == view_options[0]:
+    if table_view == view_options[0] or (is_trading_section and table_view == view_options[1]):
         st.divider()
-        st.header("Portfolio vs Benchmark")
-        benchmark_choice = st.selectbox("Select Benchmark", ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500'], key=f"{key_prefix}_benchmark_choice", label_visibility="hidden")
+        st.header("Performance vs Benchmark")
+        # For trading section, we still need a benchmark choice
+        benchmark_choice = st.selectbox("Select Benchmark", ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500'], key=f"{key_prefix}_benchmark_choice")
         with st.spinner("Loading Benchmark Data..."):
-            holdings_df = get_holdings_df(config['asset_table'])
+            # Load data based on whether it's an open position or exited position
+            if table_view == view_options[0]:
+                holdings_df = get_holdings_df(config['asset_table'])
+            else:
+                realized_df = get_realized_df(config['realized_table'])
+                holdings_df = realized_df.rename(columns={'symbol': 'ticker', 'realized_value': 'current_value', 'realized_profit_loss': 'return_amount', 'realized_return_pct': 'return_%'})
+                holdings_df['buy_price'] = holdings_df['invested_value'] / holdings_df['quantity']
+                holdings_df['symbol'] = holdings_df['ticker']
+
             benchmark_data = get_benchmark_comparison_data(holdings_df, benchmark_choice)
             if not benchmark_data.empty:
                 benchmark_chart = alt.Chart(benchmark_data).mark_line().encode(
                     x=alt.X('Date:T', title='Date'),
                     y=alt.Y('Return %:Q', title='Total Return %'),
                     color=alt.Color('Type:N', title='Legend')
-                ).properties(height=300).interactive() # Adjusted height for mobile
+                ).properties(height=300).interactive()
                 zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
                 st.altair_chart(benchmark_chart + zero_line, use_container_width=True)
             else:
-                st.warning("Could not generate benchmark data. Ensure you have at least one investment.")
+                st.warning("Could not generate benchmark data. Ensure you have at least one position.")
+
 
 def funds_page():
     """Renders the Funds Management page."""
@@ -840,6 +1008,21 @@ def expense_tracker_page():
         st.divider()
 
         if not expenses_df.empty:
+
+            # --- New: Category-wise spending pie chart ---
+            st.subheader("Category-wise Spending")
+            spending_by_category = outflows_df.groupby('category')['amount'].sum().reset_index()
+            if not spending_by_category.empty:
+                pie_chart = alt.Chart(spending_by_category).mark_arc(outerRadius=120).encode(
+                    theta=alt.Theta("amount", stack=True),
+                    color=alt.Color("category"),
+                    tooltip=["category", "amount"]
+                ).properties(height=350)
+                st.altair_chart(pie_chart, use_container_width=True)
+            else:
+                st.info("No expenses logged for this month to plot.")
+            st.divider()
+
             col1, col2 = st.columns(2)
 
             with col1:
@@ -1310,119 +1493,7 @@ def _calculate_mf_cumulative_return(transactions_df, historical_df):
     return return_df
 
 
-def home_page():
-    """Renders the main home page."""
-    st.title("Finance Dashboard")
-    _update_existing_portfolio_info()
-
-    # Calculate and display new metrics
-    returns_data = get_combined_returns()
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(
-            label="Return (Investment + Trading)",
-            value=f"₹{returns_data['inv_trade_return_amount']:,.2f}",
-            delta=f"{returns_data['inv_trade_return_pct']:.2f}%"
-        )
-    with col2:
-        st.metric(
-            label="Return(Investment+Trading+Mutual Fund)",
-            value=f"₹{returns_data['total_return_amount']:,.2f}",
-            delta=f"{returns_data['total_return_pct']:.2f}%"
-        )
-
-    col3, col4 = st.columns(2)
-    with col3:
-        st.metric("Total Investment Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_invested_value']:,.2f}")
-    with col4:
-        st.metric("Current Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_current_value']:,.2f}")
-
-    st.divider()
-
-    st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
-    st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
-    st.button("💰 Funds", use_container_width=True, on_click=set_page, args=("funds",))
-    st.button("💸 Expense Tracker", use_container_width=True, on_click=set_page, args=("expense_tracker",))
-    st.button("📚 Mutual Fund", use_container_width=True, on_click=set_page, args=("mutual_fund",))
-
-def set_page(page):
-    """Sets the current page in session state."""
-    st.session_state.page = page
-
-# New function to get combined returns
-def get_combined_returns():
-    """Calculates and returns combined returns for all asset types."""
-    # Get Investment Holdings
-    inv_df = get_holdings_df("portfolio")
-    inv_invested = inv_df['invested_value'].sum() if not inv_df.empty else 0
-    inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
-
-    # Get Trading Holdings
-    trade_df = get_holdings_df("trades")
-    trade_invested = trade_df['invested_value'].sum() if not trade_df.empty else 0
-    trade_current = trade_df['current_value'].sum() if not trade_df.empty else 0
-
-    # Get Mutual Fund Holdings
-    mf_df = get_mf_holdings_df()
-    mf_invested = mf_df['Investment'].sum() if not mf_df.empty else 0
-    mf_current = mf_df['Current Value'].sum() if not mf_df.empty else 0
-
-    # Calculate combined returns for Investment and Trading
-    inv_trade_invested = inv_invested + trade_invested
-    inv_trade_current = inv_current + trade_current
-    inv_trade_return_amount = (inv_trade_current - inv_trade_invested).round(2)
-    inv_trade_return_pct = (inv_trade_return_amount / inv_trade_invested * 100).round(2) if inv_trade_invested > 0 else 0
-
-    # Calculate combined returns for all assets
-    total_invested = inv_trade_invested + mf_invested
-    total_current = inv_trade_current + mf_current
-    total_return_amount = (total_current - total_invested).round(2)
-    total_return_pct = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
-
-    return {
-        "inv_trade_return_amount": inv_trade_return_amount,
-        "inv_trade_return_pct": inv_trade_return_pct,
-        "total_invested_value": total_invested,
-        "total_current_value": total_current,
-        "total_return_amount": total_return_amount,
-        "total_return_pct": total_return_pct,
-    }
-
-# New function for mutual fund holdings to be used in get_combined_returns
-def get_mf_holdings_df():
-    """Calculates current mutual fund holdings from transaction data."""
-    transactions_df = pd.read_sql("SELECT * FROM mf_transactions", DB_CONN)
-    if transactions_df.empty:
-        return pd.DataFrame()
-
-    holdings = []
-    unique_schemes = transactions_df['scheme_name'].unique()
-    latest_navs = {code: fetch_latest_mf_nav(code) for code in transactions_df['yfinance_symbol'].unique()}
-
-    for scheme in unique_schemes:
-        scheme_tx = transactions_df[transactions_df['scheme_name'] == scheme].copy()
-        purchases = scheme_tx[scheme_tx['type'] == 'Purchase']
-        redemptions = scheme_tx[scheme_tx['type'] == 'Redemption']
-
-        total_units = purchases['units'].sum() - redemptions['units'].sum()
-        if total_units > 0.001:
-            total_investment = (purchases['units'] * purchases['nav']).sum() - (redemptions['units'] * redemptions['nav']).sum()
-            avg_nav = total_investment / total_units if total_units > 0 else 0
-            code = scheme_tx['yfinance_symbol'].iloc[0]
-            latest_nav = latest_navs.get(code) or 0
-            current_value = total_units * latest_nav
-            pnl = current_value - total_investment
-            pnl_pct = (pnl / total_investment) * 100 if total_investment > 0 else 0
-
-            holdings.append({
-                "Scheme": scheme, "Units": round(total_units, 4), "Avg NAV": round(avg_nav, 4),
-                "Latest NAV": round(latest_nav, 4), "Investment": round(total_investment, 2),
-                "Current Value": round(current_value, 2), "P&L": round(pnl, 2), "P&L %": round(pnl_pct, 2),
-                "yfinance_symbol": code
-            })
-    return pd.DataFrame(holdings)
-
+# --- MAIN APP LOGIC ---
 if "page" not in st.session_state:
     st.session_state.page = "home"
 
