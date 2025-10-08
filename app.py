@@ -489,8 +489,7 @@ def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
 def calculate_trading_metrics(realized_df):
     """Calculates win ratio, profit factor, and expectancy."""
     metrics = {
-        'win_ratio': 'N/A', 'profit_factor': 'N/A', 'expectancy': 'N/A',
-        'max_drawdown': 'N/A'
+        'win_ratio': 'N/A', 'profit_factor': 'N/A', 'expectancy': 'N/A'
     }
 
     if realized_df.empty:
@@ -517,16 +516,6 @@ def calculate_trading_metrics(realized_df):
         avg_loss = losing_trades['realized_profit_loss'].mean() if not losing_trades.empty else 0
         expectancy = (win_ratio / 100 * avg_win) + ((1 - win_ratio / 100) * avg_loss)
         metrics['expectancy'] = round(expectancy, 2)
-
-    # Maximum Drawdown on Realized Trades
-    realized_df['date_dt'] = pd.to_datetime(realized_df['sell_date'])
-    realized_df = realized_df.sort_values('date_dt')
-    realized_df['cumulative_profit'] = realized_df['realized_profit_loss'].cumsum()
-    peak = realized_df['cumulative_profit'].expanding(min_periods=1).max()
-    drawdown = (realized_df['cumulative_profit'] - peak) / peak.abs()
-    if not drawdown.empty:
-        max_drawdown = drawdown.min() * 100
-        metrics['max_drawdown'] = round(max_drawdown, 2)
 
     return metrics
 
@@ -806,7 +795,7 @@ def render_asset_page(config):
                     y=alt.Y('return_%:Q', title='Return %'),
                     color='symbol:N',
                     tooltip=['symbol', 'date', alt.Tooltip('return_%', format=".2f")]
-                ).properties(height=300).interactive() # Adjusted height for mobile
+                ).properties(height=300).interactive()
                 zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
                 st.altair_chart(chart + zero_line, use_container_width=True)
             else:
@@ -821,11 +810,10 @@ def render_asset_page(config):
             if is_trading_section:
                 st.subheader("Key Trading Metrics")
                 trading_metrics = calculate_trading_metrics(realized_df)
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3 = st.columns(3)
                 col1.metric("Win Ratio", f"{trading_metrics['win_ratio']}%")
                 col2.metric("Profit Factor", f"{trading_metrics['profit_factor']}")
                 col3.metric("Expectancy", f"₹{trading_metrics['expectancy']}")
-                col4.metric("Max Drawdown", f"{trading_metrics['max_drawdown']}%")
                 st.divider()
 
             with st.expander("View Detailed Realized Positions"):
@@ -860,13 +848,12 @@ def render_asset_page(config):
         else:
             st.info(f"No {view_options[1].lower()} to display.")
 
+    # Performance vs Benchmark section
     if table_view == view_options[0] or (is_trading_section and table_view == view_options[1]):
         st.divider()
         st.header("Performance vs Benchmark")
-        # For trading section, we still need a benchmark choice
         benchmark_choice = st.selectbox("Select Benchmark", ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500'], key=f"{key_prefix}_benchmark_choice")
         with st.spinner("Loading Benchmark Data..."):
-            # Load data based on whether it's an open position or exited position
             if table_view == view_options[0]:
                 holdings_df = get_holdings_df(config['asset_table'])
             else:
@@ -887,6 +874,539 @@ def render_asset_page(config):
             else:
                 st.warning("Could not generate benchmark data. Ensure you have at least one position.")
 
+
+# --- CORE APP FUNCTIONS ---
+def home_page():
+    """Renders the main home page."""
+    st.title("Finance Dashboard")
+    _update_existing_portfolio_info()
+
+    # Calculate and display new metrics
+    returns_data = get_combined_returns()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            label="Return (Investment + Trading)",
+            value=f"₹{returns_data['inv_trade_return_amount']:,.2f}",
+            delta=f"{returns_data['inv_trade_return_pct']:.2f}%"
+        )
+    with col2:
+        st.metric(
+            label="Return(Investment+Trading+Mutual Fund)",
+            value=f"₹{returns_data['total_return_amount']:,.2f}",
+            delta=f"{returns_data['total_return_pct']:.2f}%"
+        )
+
+    col3, col4 = st.columns(2)
+    with col3:
+        st.metric("Total Investment Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_invested_value']:,.2f}")
+    with col4:
+        st.metric("Current Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_current_value']:,.2f}")
+
+    st.divider()
+
+    st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
+    st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
+    st.button("💰 Funds", use_container_width=True, on_click=set_page, args=("funds",))
+    st.button("💸 Expense Tracker", use_container_width=True, on_click=set_page, args=("expense_tracker",))
+    st.button("📚 Mutual Fund", use_container_width=True, on_click=set_page, args=("mutual_fund",))
+
+def set_page(page):
+    """Sets the current page in session state."""
+    st.session_state.page = page
+
+# New function to get combined returns
+def get_combined_returns():
+    """Calculates and returns combined returns for all asset types."""
+    # Get Investment Holdings
+    inv_df = get_holdings_df("portfolio")
+    inv_invested = inv_df['invested_value'].sum() if not inv_df.empty else 0
+    inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
+
+    # Get Trading Holdings
+    trade_df = get_holdings_df("trades")
+    trade_invested = trade_df['invested_value'].sum() if not trade_df.empty else 0
+    trade_current = trade_df['current_value'].sum() if not trade_df.empty else 0
+
+    # Get Mutual Fund Holdings
+    mf_df = get_mf_holdings_df()
+    mf_invested = mf_df['Investment'].sum() if not mf_df.empty else 0
+    mf_current = mf_df['Current Value'].sum() if not mf_df.empty else 0
+
+    # Calculate combined returns for Investment and Trading
+    inv_trade_invested = inv_invested + trade_invested
+    inv_trade_current = inv_current + trade_current
+    inv_trade_return_amount = (inv_trade_current - inv_trade_invested).round(2)
+    inv_trade_return_pct = (inv_trade_return_amount / inv_trade_invested * 100).round(2) if inv_trade_invested > 0 else 0
+
+    # Calculate combined returns for all assets
+    total_invested = inv_trade_invested + mf_invested
+    total_current = inv_trade_current + mf_current
+    total_return_amount = (total_current - total_invested).round(2)
+    total_return_pct = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
+
+    return {
+        "inv_trade_return_amount": inv_trade_return_amount,
+        "inv_trade_return_pct": inv_trade_return_pct,
+        "total_invested_value": total_invested,
+        "total_current_value": total_current,
+        "total_return_amount": total_return_amount,
+        "total_return_pct": total_return_pct,
+    }
+
+# New function for mutual fund holdings to be used in get_combined_returns
+def get_mf_holdings_df():
+    """Calculates current mutual fund holdings from transaction data."""
+    transactions_df = pd.read_sql("SELECT * FROM mf_transactions", DB_CONN)
+    if transactions_df.empty:
+        return pd.DataFrame()
+
+    holdings = []
+    unique_schemes = transactions_df['scheme_name'].unique()
+    latest_navs = {code: fetch_latest_mf_nav(code) for code in transactions_df['yfinance_symbol'].unique()}
+
+    for scheme in unique_schemes:
+        scheme_tx = transactions_df[transactions_df['scheme_name'] == scheme].copy()
+        purchases = scheme_tx[scheme_tx['type'] == 'Purchase']
+        redemptions = scheme_tx[scheme_tx['type'] == 'Redemption']
+
+        total_units = purchases['units'].sum() - redemptions['units'].sum()
+        if total_units > 0.001:
+            total_investment = (purchases['units'] * purchases['nav']).sum() - (redemptions['units'] * redemptions['nav']).sum()
+            avg_nav = total_investment / total_units if total_units > 0 else 0
+            code = scheme_tx['yfinance_symbol'].iloc[0]
+            latest_nav = latest_navs.get(code) or 0
+            current_value = total_units * latest_nav
+            pnl = current_value - total_investment
+            pnl_pct = (pnl / total_investment) * 100 if total_investment > 0 else 0
+
+            holdings.append({
+                "Scheme": scheme, "Units": round(total_units, 4), "Avg NAV": round(avg_nav, 4),
+                "Latest NAV": round(latest_nav, 4), "Investment": round(total_investment, 2),
+                "Current Value": round(current_value, 2), "P&L": round(pnl, 2), "P&L %": round(pnl_pct, 2),
+                "yfinance_symbol": code
+            })
+    return pd.DataFrame(holdings)
+
+def _calculate_mf_cumulative_return(transactions_df, historical_df):
+    """
+    Calculates the cumulative return of a mutual fund portfolio over time.
+
+    Args:
+        transactions_df (pd.DataFrame): A DataFrame of fund transactions for a single fund.
+        historical_df (pd.DataFrame): A DataFrame of historical NAV data for the fund.
+
+    Returns:
+        pd.DataFrame: A DataFrame with the daily cumulative return percentage.
+    """
+    if transactions_df.empty or historical_df.empty:
+        return pd.DataFrame()
+
+    transactions_df['date'] = pd.to_datetime(transactions_df['date'])
+    transactions_df = transactions_df.sort_values('date').reset_index(drop=True)
+
+    # Use the min and max dates from the transactions and historical data
+    start_date = transactions_df['date'].min()
+    end_date = historical_df.index.max()
+    all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+
+    # Initialize daily tracking variables
+    units = 0
+    invested_amount = 0
+    daily_df = []
+
+    # Process transactions and NAV data day by day
+    for date in all_dates:
+        # Check if there is an NAV value for this date
+        if date in historical_df.index:
+            nav = historical_df.loc[date]['NAV']
+
+            # Process transactions for this date
+            todays_tx = transactions_df[transactions_df['date'] == date]
+            for _, tx_row in todays_tx.iterrows():
+                if tx_row['type'] == 'Purchase':
+                    units += tx_row['units']
+                    invested_amount += (tx_row['units'] * tx_row['nav'])
+                elif tx_row['type'] == 'Redemption':
+                    units -= tx_row['units']
+                    invested_amount -= (tx_row['units'] * tx_row['nav'])
+
+            # Calculate current value and return for the day
+            current_value = units * nav if units > 0 else 0
+
+            if invested_amount > 0:
+                cumulative_return = ((current_value - invested_amount) / invested_amount) * 100
+            else:
+                cumulative_return = 0
+
+            daily_df.append({
+                'date': date,
+                'cumulative_return': cumulative_return,
+            })
+
+    return_df = pd.DataFrame(daily_df)
+    return return_df
+
+
+# --- PAGE RENDERERS ---
+PAGE_CONFIGS = {
+    "investment": {
+        "title": "📈 Investment Portfolio",
+        "asset_table": "portfolio",
+        "realized_table": "realized_stocks",
+        "asset_col": "ticker",
+        "asset_name": "Stock",
+        "asset_name_plural": "Stocks",
+        "key_prefix": "inv"
+    },
+    "trading": {
+        "title": "📊 Trading Book",
+        "asset_table": "trades",
+        "realized_table": "exits",
+        "asset_col": "symbol",
+        "asset_name": "Trade",
+        "asset_name_plural": "Trades",
+        "key_prefix": "trade"
+    }
+}
+
+def color_return_value(val):
+    """Applies color to a cell based on its numerical value."""
+    if val is None or not isinstance(val, (int, float)):
+        return ''
+    return 'color: green' if val >= 0 else 'color: red'
+
+def render_asset_page(config):
+    """Renders the Investment and Trading pages."""
+    c = DB_CONN.cursor()
+    key_prefix = config['key_prefix']
+    is_trading_section = key_prefix == 'trade'
+
+    col_title, col_refresh = st.columns([0.8, 0.2])
+    with col_title:
+        st.title(config["title"])
+    with col_refresh:
+        st.write("")
+        st.write("")
+        if st.button("Refresh Live Data", key=f"{key_prefix}_refresh_data"):
+            with st.spinner("Fetching latest prices..."):
+                df_symbols = pd.read_sql(f"SELECT {config['asset_col']} FROM {config['asset_table']}", DB_CONN)
+                all_symbols = df_symbols[config['asset_col']].tolist()
+                for symbol in all_symbols:
+                    update_stock_data(symbol)
+            st.success("Data refreshed!")
+            st.rerun()
+
+    st.sidebar.header(f"Add {config['asset_name']}")
+
+    with st.sidebar.form(f"{key_prefix}_add_form"):
+        company_name = st.text_input(f"{config['asset_name']} Name", value="", key=f"{key_prefix}_add_company_name")
+        search_button = st.form_submit_button("Search")
+
+    if search_button and company_name:
+        st.session_state[f"{key_prefix}_search_results"] = search_for_ticker(company_name)
+        st.session_state[f"{key_prefix}_selected_symbol"] = None
+        st.rerun()
+
+    if st.session_state.get(f"{key_prefix}_search_results"):
+        results = st.session_state[f"{key_prefix}_search_results"]
+        symbols_only = [res.split(" - ")[0] for res in results]
+        selected_symbol_from_search = st.sidebar.selectbox(
+            f"Select {config['asset_name']} Symbol",
+            options=[None] + symbols_only,
+            index=0,
+            key=f"{key_prefix}_select_symbol",
+            format_func=lambda x: "Select a stock..." if x is None else x
+        )
+        if selected_symbol_from_search and selected_symbol_from_search != st.session_state.get(f"{key_prefix}_selected_symbol"):
+            st.session_state[f"{key_prefix}_selected_symbol"] = selected_symbol_from_search
+            st.rerun()
+
+    if st.session_state.get(f"{key_prefix}_selected_symbol"):
+        with st.sidebar.form(f"{key_prefix}_add_details_form"):
+            symbol = st.session_state[f"{key_prefix}_selected_symbol"]
+            st.write(f"Selected: **{symbol}**")
+            stock_info = fetch_stock_info(symbol)
+            current_price = stock_info['price']
+            sector = stock_info['sector']
+            market_cap = stock_info['market_cap']
+            currency = "₹" if ".NS" in symbol else "$"
+
+            if current_price:
+                st.info(f"Current Price: {currency}{current_price:,.2f}")
+            else:
+                st.warning("Could not fetch current price.")
+
+            buy_price = st.number_input(f"Buy Price ({currency})", min_value=0.01, format="%.2f", key=f"{key_prefix}_buy_price")
+            buy_date = st.date_input("Buy Date", max_value=datetime.date.today(), key=f"{key_prefix}_buy_date")
+            quantity = st.number_input("Quantity", min_value=1, step=1, key=f"{key_prefix}_buy_quantity")
+            transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_buy_transaction_fee", value=0.0)
+
+            if not is_trading_section:
+                st.text_input("Sector", value=sector, key=f"{key_prefix}_sector", disabled=True)
+                st.text_input("Market Cap", value=_categorize_market_cap(market_cap) if market_cap != 'N/A' else 'N/A', key=f"{key_prefix}_market_cap", disabled=True)
+            else:
+                target_price = st.number_input("Target Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_target_price")
+                stop_loss_price = st.number_input("Stop Loss Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_stop_loss_price")
+
+            add_button = st.form_submit_button(f"Add to {config['asset_name_plural']}")
+            if add_button:
+                if not (buy_price and buy_price > 0 and quantity and quantity > 0):
+                    st.error("Buy Price and Quantity must be positive.")
+                elif update_stock_data(symbol):
+                    total_cost = (buy_price * quantity) + transaction_fee
+                    c.execute(f"SELECT * FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol,))
+                    existing = c.fetchone()
+                    if existing:
+                        old_buy_price, old_quantity = existing[1], existing[3]
+                        old_total_cost = old_buy_price * old_quantity
+                        new_quantity = old_quantity + quantity
+                        new_avg_price = (old_total_cost + total_cost - transaction_fee) / new_quantity
+                        if is_trading_section:
+                            c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, target_price=?, stop_loss_price=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, round(target_price, 2), round(stop_loss_price, 2), symbol))
+                        else:
+                            c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, sector=?, market_cap=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, sector, _categorize_market_cap(market_cap), symbol))
+                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} more units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        st.success(f"Updated {symbol}. New quantity: {new_quantity}, New avg. price: {currency}{new_avg_price:,.2f}")
+                    else:
+                        if is_trading_section:
+                            c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, round(target_price, 2), round(stop_loss_price, 2)))
+                        else:
+                            c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, sector, market_cap) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, sector, _categorize_market_cap(market_cap)))
+                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        st.success(f"{symbol} added successfully!")
+                    DB_CONN.commit()
+                    st.rerun()
+                else:
+                    st.error(f"Failed to fetch historical data for {symbol}. Cannot add.")
+
+    st.sidebar.header(f"Sell {config['asset_name']}")
+    all_symbols = pd.read_sql(f"SELECT {config['asset_col']} FROM {config['asset_table']}", DB_CONN)[config['asset_col']].tolist()
+
+    if all_symbols:
+        selected_option = st.sidebar.selectbox(
+            f"Select {config['asset_name']} to Sell",
+            options=[None] + all_symbols,
+            index=0,
+            key=f"{key_prefix}_sell_symbol_selector",
+            format_func=lambda x: "Select a stock..." if x is None else x
+        )
+        available_qty = 1
+        if selected_option:
+            symbol_to_sell = selected_option
+            c.execute(f"SELECT quantity FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+            result = c.fetchone()
+            if result:
+                available_qty = result[0]
+                st.sidebar.info(f"Available to sell: {available_qty} units of {symbol_to_sell}")
+        else:
+            symbol_to_sell = None
+
+        with st.sidebar.form(f"{key_prefix}_sell_form"):
+            is_disabled = not symbol_to_sell
+            sell_qty = st.number_input("Quantity to Sell", min_value=1, max_value=available_qty, step=1, key=f"{key_prefix}_sell_qty", disabled=is_disabled)
+            sell_price = st.number_input("Sell Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_sell_price", disabled=is_disabled)
+            sell_date = st.date_input("Sell Date", max_value=datetime.date.today(), key=f"{key_prefix}_sell_date", disabled=is_disabled)
+            sell_transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_sell_transaction_fee", disabled=is_disabled, value=0.0)
+            sell_button = st.form_submit_button(f"Sell {config['asset_name']}")
+            if sell_button:
+                if not symbol_to_sell:
+                    st.warning(f"Please select a {config['asset_name']} to sell.")
+                elif not (sell_price and sell_price > 0):
+                    st.error("Sell price must be greater than zero.")
+                elif not (sell_qty and sell_qty > 0):
+                    st.error("Quantity to sell must be positive.")
+                else:
+                    if is_trading_section:
+                        c.execute(f"SELECT buy_price, buy_date, quantity, target_price, stop_loss_price FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+                        buy_price, buy_date, current_qty, target_price, stop_loss_price = c.fetchone()
+                    else:
+                        c.execute(f"SELECT buy_price, buy_date, quantity FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+                        buy_price, buy_date, current_qty = c.fetchone()
+
+                    realized_return = ((sell_price - buy_price) / buy_price * 100)
+                    transaction_id = str(uuid.uuid4())
+
+                    if is_trading_section:
+                        c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                  (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2), round(target_price, 2), round(stop_loss_price, 2)))
+                    else:
+                        c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                  (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2)))
+
+                    update_funds_on_transaction("Deposit", round((sell_price * sell_qty) - sell_transaction_fee, 2), f"Sale of {sell_qty} units of {symbol_to_sell}", sell_date.strftime("%Y-%m-%d"))
+
+                    if sell_qty == current_qty:
+                        c.execute(f"DELETE FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+                    else:
+                        c.execute(f"UPDATE {config['asset_table']} SET quantity=? WHERE {config['asset_col']}=?", (current_qty - sell_qty, symbol_to_sell))
+
+                    DB_CONN.commit()
+                    st.success(f"Sold {sell_qty} units of {symbol_to_sell}.")
+                    st.rerun()
+    else:
+        st.sidebar.info(f"No open {config['asset_name_plural'].lower()}.")
+
+    view_options = ["Holdings", "Exited Positions"] if not is_trading_section else ["Open Trades", "Closed Trades"]
+    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view", label_visibility="hidden")
+
+    if table_view == view_options[0]:
+        holdings_df = get_holdings_df(config['asset_table'])
+        if not holdings_df.empty:
+            total_invested, total_current = holdings_df['invested_value'].sum(), holdings_df['current_value'].sum()
+            total_return_amount = (total_current - total_invested).round(2)
+            total_return_percent = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Investment", f"₹{total_invested:,.2f}")
+            with col2:
+                st.metric("Current Value", f"₹{total_current:,.2f}")
+            with col3:
+                st.metric("Total Return", f"₹{total_return_amount:,.2f}", f"{total_return_percent:.2f}%")
+            st.divider()
+
+            if not is_trading_section:
+                # New layout for portfolio metrics
+                benchmark_choice = 'Nifty 50'
+                metrics = calculate_portfolio_metrics(holdings_df, pd.DataFrame(), benchmark_choice)
+
+                col_alpha, col_beta, col_drawdown, col_annual_return = st.columns(4)
+                with col_alpha:
+                    st.metric("Alpha", f"{metrics['alpha']}%")
+                with col_beta:
+                    st.metric("Beta", f"{metrics['beta']}")
+                with col_drawdown:
+                    st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
+                with col_annual_return:
+                    st.metric("Annualized Return", f"{metrics['annualized_return']}%")
+                st.divider()
+
+            # Responsive Dataframe display
+            with st.expander("View Detailed Holdings"):
+                column_rename = {
+                    'symbol': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date', 'quantity': 'Quantity',
+                    'sector': 'Sector', 'market_cap': 'Market Cap', 'current_price': 'Current Price', 'return_%': 'Return (%)',
+                    'return_amount': 'Return (Amount)', 'invested_value': 'Investment Value', 'current_value': 'Current Value',
+                    'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
+                }
+                df_to_style = holdings_df.rename(columns=column_rename)
+                if not is_trading_section:
+                    df_to_style = df_to_style.drop(columns=['Target Price', 'Stop Loss', 'Expected RRR'], errors='ignore')
+
+                styled_holdings_df = df_to_style.style.map(color_return_value, subset=['Return (%)']).format({
+                    'Buy Price': '₹{:.2f}', 'Current Price': '₹{:.2f}', 'Return (Amount)': '₹{:.2f}',
+                    'Investment Value': '₹{:.2f}', 'Current Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
+                    'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Expected RRR': '{:.2f}'
+                })
+                st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
+
+            st.header("Return Chart")
+            all_symbols_list = holdings_df["symbol"].tolist()
+            selected_symbols = st.multiselect("Select assets for return chart", all_symbols_list, default=all_symbols_list, key=f"{key_prefix}_perf_symbols")
+
+            chart_data = []
+            for symbol in selected_symbols:
+                asset_info = holdings_df.loc[holdings_df["symbol"] == symbol].iloc[0]
+                history_df = pd.read_sql("SELECT date, close_price FROM price_history WHERE ticker=? AND date>=? ORDER BY date ASC", DB_CONN, params=(symbol, asset_info["buy_date"]))
+                if not history_df.empty:
+                    history_df["return_%"] = ((history_df["close_price"] - asset_info["buy_price"]) / asset_info["buy_price"] * 100).round(2)
+                    history_df["symbol"] = symbol
+                    history_df['date'] = pd.to_datetime(history_df['date'])
+                    chart_data.append(history_df)
+
+            if chart_data:
+                full_chart_df = pd.concat(chart_data)
+                chart = alt.Chart(full_chart_df).mark_line().encode(
+                    x=alt.X('date:T', title='Date'),
+                    y=alt.Y('return_%:Q', title='Return %'),
+                    color='symbol:N',
+                    tooltip=['symbol', 'date', alt.Tooltip('return_%', format=".2f")]
+                ).properties(height=300).interactive()
+                zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                st.altair_chart(chart + zero_line, use_container_width=True)
+            else:
+                st.info("No data to display for selected assets.")
+        else:
+            st.info(f"No {view_options[0].lower()} to display. Add a {config['asset_name'].lower()} from the sidebar.")
+    elif table_view == view_options[1]:
+        realized_df = get_realized_df(config['realized_table'])
+        if not realized_df.empty:
+
+            # Display Trading Metrics for Realized Trades
+            if is_trading_section:
+                st.subheader("Key Trading Metrics")
+                trading_metrics = calculate_trading_metrics(realized_df)
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Win Ratio", f"{trading_metrics['win_ratio']}%")
+                col2.metric("Profit Factor", f"{trading_metrics['profit_factor']}")
+                col3.metric("Expectancy", f"₹{trading_metrics['expectancy']}")
+                st.divider()
+
+            with st.expander("View Detailed Realized Positions"):
+                df_to_style = realized_df.drop(columns=['transaction_id'], errors='ignore')
+                column_rename = {
+                    'ticker': 'Stock Name', 'symbol': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date',
+                    'sell_price': 'Sell Price', 'sell_date': 'Sell Date', 'quantity': 'Quantity',
+                    'realized_return_pct': 'Return (%)', 'realized_profit_loss': 'P/L (Amount)',
+                    'invested_value': 'Investment Value', 'realized_value': 'Realized Value',
+                    'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
+                }
+                styled_realized_df = df_to_style.rename(columns=column_rename).style.map(color_return_value, subset=['Return (%)']).format({
+                    'Buy Price': '₹{:.2f}', 'Sell Price': '₹{:.2f}', 'P/L (Amount)': '₹{:.2f}',
+                    'Investment Value': '₹{:.2f}', 'Realized Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
+                    'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Sell Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Expected RRR': '{:.2f}', 'Actual RRR': '{:.2f}'
+                })
+                st.dataframe(styled_realized_df, use_container_width=True, hide_index=True)
+
+            st.header("Return Chart")
+            realized_df['color'] = realized_df['realized_return_pct'].apply(lambda x: 'Profit' if x >= 0 else 'Loss')
+            base = alt.Chart(realized_df).encode(
+                x=alt.X(config['asset_col'], sort=None, title="Stock Name"),
+                tooltip=[config['asset_col'], alt.Tooltip('realized_return_pct', title='Return %', format=".2f"), alt.Tooltip('realized_profit_loss', title='P/L (₹)', format=".2f")]
+            )
+            bars = base.mark_bar().encode(
+                y=alt.Y('realized_return_pct', title='Return (%)'),
+                color=alt.Color('color', scale=alt.Scale(domain=['Profit', 'Loss'], range=['#2ca02c', '#d62728']), legend=None)
+            )
+            st.altair_chart(bars, use_container_width=True)
+        else:
+            st.info(f"No {view_options[1].lower()} to display.")
+
+    # Performance vs Benchmark section
+    if table_view == view_options[0] or (is_trading_section and table_view == view_options[1]):
+        st.divider()
+        st.header("Performance vs Benchmark")
+        benchmark_choice = st.selectbox("Select Benchmark", ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500'], key=f"{key_prefix}_benchmark_choice")
+        with st.spinner("Loading Benchmark Data..."):
+            if table_view == view_options[0]:
+                holdings_df = get_holdings_df(config['asset_table'])
+            else:
+                realized_df = get_realized_df(config['realized_table'])
+                holdings_df = realized_df.rename(columns={'symbol': 'ticker', 'realized_value': 'current_value', 'realized_profit_loss': 'return_amount', 'realized_return_pct': 'return_%'})
+                holdings_df['buy_price'] = holdings_df['invested_value'] / holdings_df['quantity']
+                holdings_df['symbol'] = holdings_df['ticker']
+
+            benchmark_data = get_benchmark_comparison_data(holdings_df, benchmark_choice)
+            if not benchmark_data.empty:
+                benchmark_chart = alt.Chart(benchmark_data).mark_line().encode(
+                    x=alt.X('Date:T', title='Date'),
+                    y=alt.Y('Return %:Q', title='Total Return %'),
+                    color=alt.Color('Type:N', title='Legend')
+                ).properties(height=300).interactive()
+                zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                st.altair_chart(benchmark_chart + zero_line, use_container_width=True)
+            else:
+                st.warning("Could not generate benchmark data. Ensure you have at least one position.")
+
+
+# --- MAIN APP LOGIC ---
+if "page" not in st.session_state:
+    st.session_state.page = "home"
 
 def funds_page():
     """Renders the Funds Management page."""
@@ -1205,121 +1725,1131 @@ def mutual_fund_page():
                 "Current Value": round(current_value, 2), "P&L": round(pnl, 2), "P&L %": round(pnl_pct, 2),
                 "yfinance_symbol": code
             })
+    return pd.DataFrame(holdings)
 
-    holdings_df = pd.DataFrame(holdings)
+def _calculate_mf_cumulative_return(transactions_df, historical_df):
+    """
+    Calculates the cumulative return of a mutual fund portfolio over time.
 
-    if not holdings_df.empty:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Investment", f"₹{holdings_df['Investment'].sum():,.2f}")
-        with col2:
-            st.metric("Current Value", f"₹{holdings_df['Current Value'].sum():,.2f}")
-        with col3:
-            total_pnl = holdings_df['P&L'].sum()
-            total_investment = holdings_df['Investment'].sum()
-            total_pnl_pct = (total_pnl / total_investment * 100).round(2) if total_investment > 0 else 0
-            st.metric("Overall P&L", f"₹{total_pnl:,.2f}", f"{total_pnl_pct:.2f}%")
-        st.divider()
+    Args:
+        transactions_df (pd.DataFrame): A DataFrame of fund transactions for a single fund.
+        historical_df (pd.DataFrame): A DataFrame of historical NAV data for the fund.
 
-    view = st.radio("Select View", ["Dashboard", "All Transactions", "Manage SIPs"], horizontal=True, label_visibility="hidden")
+    Returns:
+        pd.DataFrame: A DataFrame with the daily cumulative return percentage.
+    """
+    if transactions_df.empty or historical_df.empty:
+        return pd.DataFrame()
 
-    if view == "Dashboard":
-        if not holdings_df.empty:
-            with st.expander("View Mutual Fund Holdings"):
-                st.dataframe(holdings_df.style.map(color_return_value, subset=['P&L %']).format({
-                    'Units': '{:.4f}', 'Avg NAV': '₹{:.4f}', 'Latest NAV': '₹{:.4f}', 'Investment': '₹{:.2f}',
-                    'Current Value': '₹{:.2f}', 'P&L': '₹{:.2f}', 'P&L %': '{:.2f}%'
-                }), use_container_width=True, hide_index=True)
+    transactions_df['date'] = pd.to_datetime(transactions_df['date'])
+    transactions_df = transactions_df.sort_values('date').reset_index(drop=True)
 
-            st.divider()
-            st.header("Return Chart")
-            all_schemes_list = holdings_df["Scheme"].tolist()
-            selected_options = st.multiselect("Select funds for chart", all_schemes_list, default=all_schemes_list, key="mf_perf_options")
+    # Use the min and max dates from the transactions and historical data
+    start_date = transactions_df['date'].min()
+    end_date = historical_df.index.max()
+    all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
 
-            if selected_options:
-                chart_data = []
-                for option in selected_options:
-                    scheme_tx = transactions_df[transactions_df['scheme_name'] == option].copy()
-                    if scheme_tx.empty:
-                        continue
+    # Initialize daily tracking variables
+    units = 0
+    invested_amount = 0
+    daily_df = []
 
-                    code = scheme_tx["yfinance_symbol"].iloc[0]
-                    history_df = get_mf_historical_data(code)
+    # Process transactions and NAV data day by day
+    for date in all_dates:
+        # Check if there is an NAV value for this date
+        if date in historical_df.index:
+            nav = historical_df.loc[date]['NAV']
 
-                    if not history_df.empty:
-                        # Ensure transaction dates are within the historical data range
-                        start_date = pd.to_datetime(scheme_tx['date'].min())
-                        historical_df_filtered = history_df[history_df.index >= start_date]
+            # Process transactions for this date
+            todays_tx = transactions_df[transactions_df['date'] == date]
+            for _, tx_row in todays_tx.iterrows():
+                if tx_row['type'] == 'Purchase':
+                    units += tx_row['units']
+                    invested_amount += (tx_row['units'] * tx_row['nav'])
+                elif tx_row['type'] == 'Redemption':
+                    units -= tx_row['units']
+                    invested_amount -= (tx_row['units'] * tx_row['nav'])
 
-                        if not historical_df_filtered.empty:
-                            cumulative_returns = _calculate_mf_cumulative_return(scheme_tx, historical_df_filtered)
-                            if not cumulative_returns.empty:
-                                cumulative_returns['type'] = str(option)
-                                chart_data.append(cumulative_returns)
-                        else:
-                            st.warning(f"No historical data available for {option} after the first transaction date.")
+            # Calculate current value and return for the day
+            current_value = units * nav if units > 0 else 0
 
-                if chart_data:
-                    full_chart_df = pd.concat(chart_data)
-                    full_chart_df = full_chart_df.dropna(subset=['date', 'cumulative_return', 'type'])
-                    if not full_chart_df.empty:
-                        chart = alt.Chart(full_chart_df).mark_line().encode(
-                            x=alt.X('date:T', title='Date'),
-                            y=alt.Y('cumulative_return:Q', title='Cumulative Return (%)'),
-                            color=alt.Color('type:N', title='Fund Name'),
-                            tooltip=[
-                                alt.Tooltip('type:N', title='Fund Name'),
-                                alt.Tooltip('date:T', format='%Y-%m-%d'),
-                                alt.Tooltip('cumulative_return:Q', title='Return %', format=".2f")
-                            ]
-                        ).properties(height=300, title="Mutual Fund Cumulative Returns").interactive()
-                        zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
-                        st.altair_chart(chart + zero_line, use_container_width=True)
-                    else:
-                        st.info("No valid data available to generate the chart for the selected options.")
-                else:
-                    st.info("No data available to generate the chart for the selected options.")
-
-            st.divider()
-            st.subheader("Portfolio Allocation")
-            total_value = holdings_df['Current Value'].sum()
-            if total_value > 0:
-                holdings_df['Percentage'] = (holdings_df['Current Value'] / total_value * 100).round(2)
-                pie_chart = alt.Chart(holdings_df).mark_arc(innerRadius=50).encode(
-                    theta=alt.Theta(field="Current Value", type="quantitative"),
-                    color=alt.Color(field="Scheme", type="nominal"),
-                    tooltip=['Scheme', alt.Tooltip("Current Value", format=".2f"), alt.Tooltip("Percentage", format=".2f")]
-                ).properties(height=300) # Adjusted height for mobile
-                st.altair_chart(pie_chart, use_container_width=True)
+            if invested_amount > 0:
+                cumulative_return = ((current_value - invested_amount) / invested_amount) * 100
             else:
-                st.info("You have no current mutual fund holdings with a positive value.")
-        else:
-            st.info("You have no current mutual fund holdings.")
-    elif view == "All Transactions":
-        st.header("All Transactions")
-        transactions_df = pd.read_sql("SELECT * FROM mf_transactions ORDER BY date DESC", DB_CONN)
-        if not transactions_df.empty:
-            transactions_df['date'] = pd.to_datetime(transactions_df['date']).dt.strftime('%d/%m/%Y')
-            st.dataframe(transactions_df.drop(columns=['transaction_id']), use_container_width=True, hide_index=True)
-        else:
-            st.info("No transaction history to display.")
-    elif view == "Manage SIPs":
-        st.header("Manage Your SIPs")
-        st.info("Set up your monthly SIPs. They will be auto-logged when you open this page after the SIP date.")
-        sips_df = pd.read_sql("SELECT sip_id, scheme_name, yfinance_symbol, amount, day_of_month FROM mf_sips", DB_CONN)
-        edited_sips = st.data_editor(sips_df, num_rows="dynamic", use_container_width=True, column_config={
-            "day_of_month": st.column_config.NumberColumn("Day of Month (1-31)", min_value=1, max_value=31, step=1, required=True)
-        })
-        if st.button("Save SIP Rules"):
-            c.execute("DELETE FROM mf_sips")
-            for _, row in edited_sips.iterrows():
-                if row['scheme_name'] and row['yfinance_symbol'] and row['amount'] > 0:
-                    c.execute("INSERT INTO mf_sips (scheme_name, yfinance_symbol, amount, day_of_month) VALUES (?, ?, ?, ?)",
-                              (row['scheme_name'], row['yfinance_symbol'], round(row['amount'], 2), row['day_of_month']))
-            DB_CONN.commit()
-            st.success("SIP rules saved!")
+                cumulative_return = 0
+
+            daily_df.append({
+                'date': date,
+                'cumulative_return': cumulative_return,
+            })
+
+    return_df = pd.DataFrame(daily_df)
+    return return_df
+
+
+# --- PAGE RENDERERS ---
+PAGE_CONFIGS = {
+    "investment": {
+        "title": "📈 Investment Portfolio",
+        "asset_table": "portfolio",
+        "realized_table": "realized_stocks",
+        "asset_col": "ticker",
+        "asset_name": "Stock",
+        "asset_name_plural": "Stocks",
+        "key_prefix": "inv"
+    },
+    "trading": {
+        "title": "📊 Trading Book",
+        "asset_table": "trades",
+        "realized_table": "exits",
+        "asset_col": "symbol",
+        "asset_name": "Trade",
+        "asset_name_plural": "Trades",
+        "key_prefix": "trade"
+    }
+}
+
+def color_return_value(val):
+    """Applies color to a cell based on its numerical value."""
+    if val is None or not isinstance(val, (int, float)):
+        return ''
+    return 'color: green' if val >= 0 else 'color: red'
+
+def render_asset_page(config):
+    """Renders the Investment and Trading pages."""
+    c = DB_CONN.cursor()
+    key_prefix = config['key_prefix']
+    is_trading_section = key_prefix == 'trade'
+
+    col_title, col_refresh = st.columns([0.8, 0.2])
+    with col_title:
+        st.title(config["title"])
+    with col_refresh:
+        st.write("")
+        st.write("")
+        if st.button("Refresh Live Data", key=f"{key_prefix}_refresh_data"):
+            with st.spinner("Fetching latest prices..."):
+                df_symbols = pd.read_sql(f"SELECT {config['asset_col']} FROM {config['asset_table']}", DB_CONN)
+                all_symbols = df_symbols[config['asset_col']].tolist()
+                for symbol in all_symbols:
+                    update_stock_data(symbol)
+            st.success("Data refreshed!")
             st.rerun()
 
+    st.sidebar.header(f"Add {config['asset_name']}")
+
+    with st.sidebar.form(f"{key_prefix}_add_form"):
+        company_name = st.text_input(f"{config['asset_name']} Name", value="", key=f"{key_prefix}_add_company_name")
+        search_button = st.form_submit_button("Search")
+
+    if search_button and company_name:
+        st.session_state[f"{key_prefix}_search_results"] = search_for_ticker(company_name)
+        st.session_state[f"{key_prefix}_selected_symbol"] = None
+        st.rerun()
+
+    if st.session_state.get(f"{key_prefix}_search_results"):
+        results = st.session_state[f"{key_prefix}_search_results"]
+        symbols_only = [res.split(" - ")[0] for res in results]
+        selected_symbol_from_search = st.sidebar.selectbox(
+            f"Select {config['asset_name']} Symbol",
+            options=[None] + symbols_only,
+            index=0,
+            key=f"{key_prefix}_select_symbol",
+            format_func=lambda x: "Select a stock..." if x is None else x
+        )
+        if selected_symbol_from_search and selected_symbol_from_search != st.session_state.get(f"{key_prefix}_selected_symbol"):
+            st.session_state[f"{key_prefix}_selected_symbol"] = selected_symbol_from_search
+            st.rerun()
+
+    if st.session_state.get(f"{key_prefix}_selected_symbol"):
+        with st.sidebar.form(f"{key_prefix}_add_details_form"):
+            symbol = st.session_state[f"{key_prefix}_selected_symbol"]
+            st.write(f"Selected: **{symbol}**")
+            stock_info = fetch_stock_info(symbol)
+            current_price = stock_info['price']
+            sector = stock_info['sector']
+            market_cap = stock_info['market_cap']
+            currency = "₹" if ".NS" in symbol else "$"
+
+            if current_price:
+                st.info(f"Current Price: {currency}{current_price:,.2f}")
+            else:
+                st.warning("Could not fetch current price.")
+
+            buy_price = st.number_input(f"Buy Price ({currency})", min_value=0.01, format="%.2f", key=f"{key_prefix}_buy_price")
+            buy_date = st.date_input("Buy Date", max_value=datetime.date.today(), key=f"{key_prefix}_buy_date")
+            quantity = st.number_input("Quantity", min_value=1, step=1, key=f"{key_prefix}_buy_quantity")
+            transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_buy_transaction_fee", value=0.0)
+
+            if not is_trading_section:
+                st.text_input("Sector", value=sector, key=f"{key_prefix}_sector", disabled=True)
+                st.text_input("Market Cap", value=_categorize_market_cap(market_cap) if market_cap != 'N/A' else 'N/A', key=f"{key_prefix}_market_cap", disabled=True)
+            else:
+                target_price = st.number_input("Target Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_target_price")
+                stop_loss_price = st.number_input("Stop Loss Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_stop_loss_price")
+
+            add_button = st.form_submit_button(f"Add to {config['asset_name_plural']}")
+            if add_button:
+                if not (buy_price and buy_price > 0 and quantity and quantity > 0):
+                    st.error("Buy Price and Quantity must be positive.")
+                elif update_stock_data(symbol):
+                    total_cost = (buy_price * quantity) + transaction_fee
+                    c.execute(f"SELECT * FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol,))
+                    existing = c.fetchone()
+                    if existing:
+                        old_buy_price, old_quantity = existing[1], existing[3]
+                        old_total_cost = old_buy_price * old_quantity
+                        new_quantity = old_quantity + quantity
+                        new_avg_price = (old_total_cost + total_cost - transaction_fee) / new_quantity
+                        if is_trading_section:
+                            c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, target_price=?, stop_loss_price=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, round(target_price, 2), round(stop_loss_price, 2), symbol))
+                        else:
+                            c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, sector=?, market_cap=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, sector, _categorize_market_cap(market_cap), symbol))
+                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} more units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        st.success(f"Updated {symbol}. New quantity: {new_quantity}, New avg. price: {currency}{new_avg_price:,.2f}")
+                    else:
+                        if is_trading_section:
+                            c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, round(target_price, 2), round(stop_loss_price, 2)))
+                        else:
+                            c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, sector, market_cap) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, sector, _categorize_market_cap(market_cap)))
+                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        st.success(f"{symbol} added successfully!")
+                    DB_CONN.commit()
+                    st.rerun()
+                else:
+                    st.error(f"Failed to fetch historical data for {symbol}. Cannot add.")
+
+    st.sidebar.header(f"Sell {config['asset_name']}")
+    all_symbols = pd.read_sql(f"SELECT {config['asset_col']} FROM {config['asset_table']}", DB_CONN)[config['asset_col']].tolist()
+
+    if all_symbols:
+        selected_option = st.sidebar.selectbox(
+            f"Select {config['asset_name']} to Sell",
+            options=[None] + all_symbols,
+            index=0,
+            key=f"{key_prefix}_sell_symbol_selector",
+            format_func=lambda x: "Select a stock..." if x is None else x
+        )
+        available_qty = 1
+        if selected_option:
+            symbol_to_sell = selected_option
+            c.execute(f"SELECT quantity FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+            result = c.fetchone()
+            if result:
+                available_qty = result[0]
+                st.sidebar.info(f"Available to sell: {available_qty} units of {symbol_to_sell}")
+        else:
+            symbol_to_sell = None
+
+        with st.sidebar.form(f"{key_prefix}_sell_form"):
+            is_disabled = not symbol_to_sell
+            sell_qty = st.number_input("Quantity to Sell", min_value=1, max_value=available_qty, step=1, key=f"{key_prefix}_sell_qty", disabled=is_disabled)
+            sell_price = st.number_input("Sell Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_sell_price", disabled=is_disabled)
+            sell_date = st.date_input("Sell Date", max_value=datetime.date.today(), key=f"{key_prefix}_sell_date", disabled=is_disabled)
+            sell_transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_sell_transaction_fee", disabled=is_disabled, value=0.0)
+            sell_button = st.form_submit_button(f"Sell {config['asset_name']}")
+            if sell_button:
+                if not symbol_to_sell:
+                    st.warning(f"Please select a {config['asset_name']} to sell.")
+                elif not (sell_price and sell_price > 0):
+                    st.error("Sell price must be greater than zero.")
+                elif not (sell_qty and sell_qty > 0):
+                    st.error("Quantity to sell must be positive.")
+                else:
+                    if is_trading_section:
+                        c.execute(f"SELECT buy_price, buy_date, quantity, target_price, stop_loss_price FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+                        buy_price, buy_date, current_qty, target_price, stop_loss_price = c.fetchone()
+                    else:
+                        c.execute(f"SELECT buy_price, buy_date, quantity FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+                        buy_price, buy_date, current_qty = c.fetchone()
+
+                    realized_return = ((sell_price - buy_price) / buy_price * 100)
+                    transaction_id = str(uuid.uuid4())
+
+                    if is_trading_section:
+                        c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                  (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2), round(target_price, 2), round(stop_loss_price, 2)))
+                    else:
+                        c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                  (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2)))
+
+                    update_funds_on_transaction("Deposit", round((sell_price * sell_qty) - sell_transaction_fee, 2), f"Sale of {sell_qty} units of {symbol_to_sell}", sell_date.strftime("%Y-%m-%d"))
+
+                    if sell_qty == current_qty:
+                        c.execute(f"DELETE FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+                    else:
+                        c.execute(f"UPDATE {config['asset_table']} SET quantity=? WHERE {config['asset_col']}=?", (current_qty - sell_qty, symbol_to_sell))
+
+                    DB_CONN.commit()
+                    st.success(f"Sold {sell_qty} units of {symbol_to_sell}.")
+                    st.rerun()
+    else:
+        st.sidebar.info(f"No open {config['asset_name_plural'].lower()}.")
+
+    view_options = ["Holdings", "Exited Positions"] if not is_trading_section else ["Open Trades", "Closed Trades"]
+    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view", label_visibility="hidden")
+
+    if table_view == view_options[0]:
+        holdings_df = get_holdings_df(config['asset_table'])
+        if not holdings_df.empty:
+            total_invested, total_current = holdings_df['invested_value'].sum(), holdings_df['current_value'].sum()
+            total_return_amount = (total_current - total_invested).round(2)
+            total_return_percent = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Investment", f"₹{total_invested:,.2f}")
+            with col2:
+                st.metric("Current Value", f"₹{total_current:,.2f}")
+            with col3:
+                st.metric("Total Return", f"₹{total_return_amount:,.2f}", f"{total_return_percent:.2f}%")
+            st.divider()
+
+            if not is_trading_section:
+                # New layout for portfolio metrics
+                benchmark_choice = 'Nifty 50'
+                metrics = calculate_portfolio_metrics(holdings_df, pd.DataFrame(), benchmark_choice)
+
+                col_alpha, col_beta, col_drawdown, col_annual_return = st.columns(4)
+                with col_alpha:
+                    st.metric("Alpha", f"{metrics['alpha']}%")
+                with col_beta:
+                    st.metric("Beta", f"{metrics['beta']}")
+                with col_drawdown:
+                    st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
+                with col_annual_return:
+                    st.metric("Annualized Return", f"{metrics['annualized_return']}%")
+                st.divider()
+
+            # Responsive Dataframe display
+            with st.expander("View Detailed Holdings"):
+                column_rename = {
+                    'symbol': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date', 'quantity': 'Quantity',
+                    'sector': 'Sector', 'market_cap': 'Market Cap', 'current_price': 'Current Price', 'return_%': 'Return (%)',
+                    'return_amount': 'Return (Amount)', 'invested_value': 'Investment Value', 'current_value': 'Current Value',
+                    'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
+                }
+                df_to_style = holdings_df.rename(columns=column_rename)
+                if not is_trading_section:
+                    df_to_style = df_to_style.drop(columns=['Target Price', 'Stop Loss', 'Expected RRR'], errors='ignore')
+
+                styled_holdings_df = df_to_style.style.map(color_return_value, subset=['Return (%)']).format({
+                    'Buy Price': '₹{:.2f}', 'Current Price': '₹{:.2f}', 'Return (Amount)': '₹{:.2f}',
+                    'Investment Value': '₹{:.2f}', 'Current Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
+                    'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Expected RRR': '{:.2f}'
+                })
+                st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
+
+            st.header("Return Chart")
+            all_symbols_list = holdings_df["symbol"].tolist()
+            selected_symbols = st.multiselect("Select assets for return chart", all_symbols_list, default=all_symbols_list, key=f"{key_prefix}_perf_symbols")
+
+            chart_data = []
+            for symbol in selected_symbols:
+                asset_info = holdings_df.loc[holdings_df["symbol"] == symbol].iloc[0]
+                history_df = pd.read_sql("SELECT date, close_price FROM price_history WHERE ticker=? AND date>=? ORDER BY date ASC", DB_CONN, params=(symbol, asset_info["buy_date"]))
+                if not history_df.empty:
+                    history_df["return_%"] = ((history_df["close_price"] - asset_info["buy_price"]) / asset_info["buy_price"] * 100).round(2)
+                    history_df["symbol"] = symbol
+                    history_df['date'] = pd.to_datetime(history_df['date'])
+                    chart_data.append(history_df)
+
+            if chart_data:
+                full_chart_df = pd.concat(chart_data)
+                chart = alt.Chart(full_chart_df).mark_line().encode(
+                    x=alt.X('date:T', title='Date'),
+                    y=alt.Y('return_%:Q', title='Return %'),
+                    color='symbol:N',
+                    tooltip=['symbol', 'date', alt.Tooltip('return_%', format=".2f")]
+                ).properties(height=300).interactive()
+                zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                st.altair_chart(chart + zero_line, use_container_width=True)
+            else:
+                st.info("No data to display for selected assets.")
+        else:
+            st.info(f"No {view_options[0].lower()} to display. Add a {config['asset_name'].lower()} from the sidebar.")
+    elif table_view == view_options[1]:
+        realized_df = get_realized_df(config['realized_table'])
+        if not realized_df.empty:
+
+            # Display Trading Metrics for Realized Trades
+            if is_trading_section:
+                st.subheader("Key Trading Metrics")
+                trading_metrics = calculate_trading_metrics(realized_df)
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Win Ratio", f"{trading_metrics['win_ratio']}%")
+                col2.metric("Profit Factor", f"{trading_metrics['profit_factor']}")
+                col3.metric("Expectancy", f"₹{trading_metrics['expectancy']}")
+                st.divider()
+
+            with st.expander("View Detailed Realized Positions"):
+                df_to_style = realized_df.drop(columns=['transaction_id'], errors='ignore')
+                column_rename = {
+                    'ticker': 'Stock Name', 'symbol': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date',
+                    'sell_price': 'Sell Price', 'sell_date': 'Sell Date', 'quantity': 'Quantity',
+                    'realized_return_pct': 'Return (%)', 'realized_profit_loss': 'P/L (Amount)',
+                    'invested_value': 'Investment Value', 'realized_value': 'Realized Value',
+                    'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
+                }
+                styled_realized_df = df_to_style.rename(columns=column_rename).style.map(color_return_value, subset=['Return (%)']).format({
+                    'Buy Price': '₹{:.2f}', 'Sell Price': '₹{:.2f}', 'P/L (Amount)': '₹{:.2f}',
+                    'Investment Value': '₹{:.2f}', 'Realized Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
+                    'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Sell Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Expected RRR': '{:.2f}', 'Actual RRR': '{:.2f}'
+                })
+                st.dataframe(styled_realized_df, use_container_width=True, hide_index=True)
+
+            st.header("Return Chart")
+            realized_df['color'] = realized_df['realized_return_pct'].apply(lambda x: 'Profit' if x >= 0 else 'Loss')
+            base = alt.Chart(realized_df).encode(
+                x=alt.X(config['asset_col'], sort=None, title="Stock Name"),
+                tooltip=[config['asset_col'], alt.Tooltip('realized_return_pct', title='Return %', format=".2f"), alt.Tooltip('realized_profit_loss', title='P/L (₹)', format=".2f")]
+            )
+            bars = base.mark_bar().encode(
+                y=alt.Y('realized_return_pct', title='Return (%)'),
+                color=alt.Color('color', scale=alt.Scale(domain=['Profit', 'Loss'], range=['#2ca02c', '#d62728']), legend=None)
+            )
+            st.altair_chart(bars, use_container_width=True)
+        else:
+            st.info(f"No {view_options[1].lower()} to display.")
+
+    # Performance vs Benchmark section
+    if table_view == view_options[0] or (is_trading_section and table_view == view_options[1]):
+        st.divider()
+        st.header("Performance vs Benchmark")
+        benchmark_choice = st.selectbox("Select Benchmark", ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500'], key=f"{key_prefix}_benchmark_choice")
+        with st.spinner("Loading Benchmark Data..."):
+            if table_view == view_options[0]:
+                holdings_df = get_holdings_df(config['asset_table'])
+            else:
+                realized_df = get_realized_df(config['realized_table'])
+                holdings_df = realized_df.rename(columns={'symbol': 'ticker', 'realized_value': 'current_value', 'realized_profit_loss': 'return_amount', 'realized_return_pct': 'return_%'})
+                holdings_df['buy_price'] = holdings_df['invested_value'] / holdings_df['quantity']
+                holdings_df['symbol'] = holdings_df['ticker']
+
+            benchmark_data = get_benchmark_comparison_data(holdings_df, benchmark_choice)
+            if not benchmark_data.empty:
+                benchmark_chart = alt.Chart(benchmark_data).mark_line().encode(
+                    x=alt.X('Date:T', title='Date'),
+                    y=alt.Y('Return %:Q', title='Total Return %'),
+                    color=alt.Color('Type:N', title='Legend')
+                ).properties(height=300).interactive()
+                zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                st.altair_chart(benchmark_chart + zero_line, use_container_width=True)
+            else:
+                st.warning("Could not generate benchmark data. Ensure you have at least one position.")
+
+
+# --- MAIN APP LOGIC ---
+def home_page():
+    """Renders the main home page."""
+    st.title("Finance Dashboard")
+    _update_existing_portfolio_info()
+
+    # Calculate and display new metrics
+    returns_data = get_combined_returns()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            label="Return (Investment + Trading)",
+            value=f"₹{returns_data['inv_trade_return_amount']:,.2f}",
+            delta=f"{returns_data['inv_trade_return_pct']:.2f}%"
+        )
+    with col2:
+        st.metric(
+            label="Return(Investment+Trading+Mutual Fund)",
+            value=f"₹{returns_data['total_return_amount']:,.2f}",
+            delta=f"{returns_data['total_return_pct']:.2f}%"
+        )
+
+    col3, col4 = st.columns(2)
+    with col3:
+        st.metric("Total Investment Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_invested_value']:,.2f}")
+    with col4:
+        st.metric("Current Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_current_value']:,.2f}")
+
+    st.divider()
+
+    st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
+    st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
+    st.button("💰 Funds", use_container_width=True, on_click=set_page, args=("funds",))
+    st.button("💸 Expense Tracker", use_container_width=True, on_click=set_page, args=("expense_tracker",))
+    st.button("📚 Mutual Fund", use_container_width=True, on_click=set_page, args=("mutual_fund",))
+
+def set_page(page):
+    """Sets the current page in session state."""
+    st.session_state.page = page
+
+# New function to get combined returns
+def get_combined_returns():
+    """Calculates and returns combined returns for all asset types."""
+    # Get Investment Holdings
+    inv_df = get_holdings_df("portfolio")
+    inv_invested = inv_df['invested_value'].sum() if not inv_df.empty else 0
+    inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
+
+    # Get Trading Holdings
+    trade_df = get_holdings_df("trades")
+    trade_invested = trade_df['invested_value'].sum() if not trade_df.empty else 0
+    trade_current = trade_df['current_value'].sum() if not trade_df.empty else 0
+
+    # Get Mutual Fund Holdings
+    mf_df = get_mf_holdings_df()
+    mf_invested = mf_df['Investment'].sum() if not mf_df.empty else 0
+    mf_current = mf_df['Current Value'].sum() if not mf_df.empty else 0
+
+    # Calculate combined returns for Investment and Trading
+    inv_trade_invested = inv_invested + trade_invested
+    inv_trade_current = inv_current + trade_current
+    inv_trade_return_amount = (inv_trade_current - inv_trade_invested).round(2)
+    inv_trade_return_pct = (inv_trade_return_amount / inv_trade_invested * 100).round(2) if inv_trade_invested > 0 else 0
+
+    # Calculate combined returns for all assets
+    total_invested = inv_trade_invested + mf_invested
+    total_current = inv_trade_current + mf_current
+    total_return_amount = (total_current - total_invested).round(2)
+    total_return_pct = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
+
+    return {
+        "inv_trade_return_amount": inv_trade_return_amount,
+        "inv_trade_return_pct": inv_trade_return_pct,
+        "total_invested_value": total_invested,
+        "total_current_value": total_current,
+        "total_return_amount": total_return_amount,
+        "total_return_pct": total_return_pct,
+    }
+
+# New function for mutual fund holdings to be used in get_combined_returns
+def get_mf_holdings_df():
+    """Calculates current mutual fund holdings from transaction data."""
+    transactions_df = pd.read_sql("SELECT * FROM mf_transactions", DB_CONN)
+    if transactions_df.empty:
+        return pd.DataFrame()
+
+    holdings = []
+    unique_schemes = transactions_df['scheme_name'].unique()
+    latest_navs = {code: fetch_latest_mf_nav(code) for code in transactions_df['yfinance_symbol'].unique()}
+
+    for scheme in unique_schemes:
+        scheme_tx = transactions_df[transactions_df['scheme_name'] == scheme].copy()
+        purchases = scheme_tx[scheme_tx['type'] == 'Purchase']
+        redemptions = scheme_tx[scheme_tx['type'] == 'Redemption']
+
+        total_units = purchases['units'].sum() - redemptions['units'].sum()
+        if total_units > 0.001:
+            total_investment = (purchases['units'] * purchases['nav']).sum() - (redemptions['units'] * redemptions['nav']).sum()
+            avg_nav = total_investment / total_units if total_units > 0 else 0
+            code = scheme_tx['yfinance_symbol'].iloc[0]
+            latest_nav = latest_navs.get(code) or 0
+            current_value = total_units * latest_nav
+            pnl = current_value - total_investment
+            pnl_pct = (pnl / total_investment) * 100 if total_investment > 0 else 0
+
+            holdings.append({
+                "Scheme": scheme, "Units": round(total_units, 4), "Avg NAV": round(avg_nav, 4),
+                "Latest NAV": round(latest_nav, 4), "Investment": round(total_investment, 2),
+                "Current Value": round(current_value, 2), "P&L": round(pnl, 2), "P&L %": round(pnl_pct, 2),
+                "yfinance_symbol": code
+            })
+    return pd.DataFrame(holdings)
+
+def _calculate_mf_cumulative_return(transactions_df, historical_df):
+    """
+    Calculates the cumulative return of a mutual fund portfolio over time.
+
+    Args:
+        transactions_df (pd.DataFrame): A DataFrame of fund transactions for a single fund.
+        historical_df (pd.DataFrame): A DataFrame of historical NAV data for the fund.
+
+    Returns:
+        pd.DataFrame: A DataFrame with the daily cumulative return percentage.
+    """
+    if transactions_df.empty or historical_df.empty:
+        return pd.DataFrame()
+
+    transactions_df['date'] = pd.to_datetime(transactions_df['date'])
+    transactions_df = transactions_df.sort_values('date').reset_index(drop=True)
+
+    # Use the min and max dates from the transactions and historical data
+    start_date = transactions_df['date'].min()
+    end_date = historical_df.index.max()
+    all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+
+    # Initialize daily tracking variables
+    units = 0
+    invested_amount = 0
+    daily_df = []
+
+    # Process transactions and NAV data day by day
+    for date in all_dates:
+        # Check if there is an NAV value for this date
+        if date in historical_df.index:
+            nav = historical_df.loc[date]['NAV']
+
+            # Process transactions for this date
+            todays_tx = transactions_df[transactions_df['date'] == date]
+            for _, tx_row in todays_tx.iterrows():
+                if tx_row['type'] == 'Purchase':
+                    units += tx_row['units']
+                    invested_amount += (tx_row['units'] * tx_row['nav'])
+                elif tx_row['type'] == 'Redemption':
+                    units -= tx_row['units']
+                    invested_amount -= (tx_row['units'] * tx_row['nav'])
+
+            # Calculate current value and return for the day
+            current_value = units * nav if units > 0 else 0
+
+            if invested_amount > 0:
+                cumulative_return = ((current_value - invested_amount) / invested_amount) * 100
+            else:
+                cumulative_return = 0
+
+            daily_df.append({
+                'date': date,
+                'cumulative_return': cumulative_return,
+            })
+
+    return_df = pd.DataFrame(daily_df)
+    return return_df
+
+
+# --- MAIN APP LOGIC ---
+
+# Move home_page definition to the top
+def home_page():
+    """Renders the main home page."""
+    st.title("Finance Dashboard")
+    _update_existing_portfolio_info()
+
+    # Calculate and display new metrics
+    returns_data = get_combined_returns()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            label="Return (Investment + Trading)",
+            value=f"₹{returns_data['inv_trade_return_amount']:,.2f}",
+            delta=f"{returns_data['inv_trade_return_pct']:.2f}%"
+        )
+    with col2:
+        st.metric(
+            label="Return(Investment+Trading+Mutual Fund)",
+            value=f"₹{returns_data['total_return_amount']:,.2f}",
+            delta=f"{returns_data['total_return_pct']:.2f}%"
+        )
+
+    col3, col4 = st.columns(2)
+    with col3:
+        st.metric("Total Investment Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_invested_value']:,.2f}")
+    with col4:
+        st.metric("Current Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_current_value']:,.2f}")
+
+    st.divider()
+
+    st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
+    st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
+    st.button("💰 Funds", use_container_width=True, on_click=set_page, args=("funds",))
+    st.button("💸 Expense Tracker", use_container_width=True, on_click=set_page, args=("expense_tracker",))
+    st.button("📚 Mutual Fund", use_container_width=True, on_click=set_page, args=("mutual_fund",))
+
+def set_page(page):
+    """Sets the current page in session state."""
+    st.session_state.page = page
+
+# New function to get combined returns
+def get_combined_returns():
+    """Calculates and returns combined returns for all asset types."""
+    # Get Investment Holdings
+    inv_df = get_holdings_df("portfolio")
+    inv_invested = inv_df['invested_value'].sum() if not inv_df.empty else 0
+    inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
+
+    # Get Trading Holdings
+    trade_df = get_holdings_df("trades")
+    trade_invested = trade_df['invested_value'].sum() if not trade_df.empty else 0
+    trade_current = trade_df['current_value'].sum() if not trade_df.empty else 0
+
+    # Get Mutual Fund Holdings
+    mf_df = get_mf_holdings_df()
+    mf_invested = mf_df['Investment'].sum() if not mf_df.empty else 0
+    mf_current = mf_df['Current Value'].sum() if not mf_df.empty else 0
+
+    # Calculate combined returns for Investment and Trading
+    inv_trade_invested = inv_invested + trade_invested
+    inv_trade_current = inv_current + trade_current
+    inv_trade_return_amount = (inv_trade_current - inv_trade_invested).round(2)
+    inv_trade_return_pct = (inv_trade_return_amount / inv_trade_invested * 100).round(2) if inv_trade_invested > 0 else 0
+
+    # Calculate combined returns for all assets
+    total_invested = inv_trade_invested + mf_invested
+    total_current = inv_trade_current + mf_current
+    total_return_amount = (total_current - total_invested).round(2)
+    total_return_pct = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
+
+    return {
+        "inv_trade_return_amount": inv_trade_return_amount,
+        "inv_trade_return_pct": inv_trade_return_pct,
+        "total_invested_value": total_invested,
+        "total_current_value": total_current,
+        "total_return_amount": total_return_amount,
+        "total_return_pct": total_return_pct,
+    }
+
+# New function for mutual fund holdings to be used in get_combined_returns
+def get_mf_holdings_df():
+    """Calculates current mutual fund holdings from transaction data."""
+    transactions_df = pd.read_sql("SELECT * FROM mf_transactions", DB_CONN)
+    if transactions_df.empty:
+        return pd.DataFrame()
+
+    holdings = []
+    unique_schemes = transactions_df['scheme_name'].unique()
+    latest_navs = {code: fetch_latest_mf_nav(code) for code in transactions_df['yfinance_symbol'].unique()}
+
+    for scheme in unique_schemes:
+        scheme_tx = transactions_df[transactions_df['scheme_name'] == scheme].copy()
+        purchases = scheme_tx[scheme_tx['type'] == 'Purchase']
+        redemptions = scheme_tx[scheme_tx['type'] == 'Redemption']
+
+        total_units = purchases['units'].sum() - redemptions['units'].sum()
+        if total_units > 0.001:
+            total_investment = (purchases['units'] * purchases['nav']).sum() - (redemptions['units'] * redemptions['nav']).sum()
+            avg_nav = total_investment / total_units if total_units > 0 else 0
+            code = scheme_tx['yfinance_symbol'].iloc[0]
+            latest_nav = latest_navs.get(code) or 0
+            current_value = total_units * latest_nav
+            pnl = current_value - total_investment
+            pnl_pct = (pnl / total_investment) * 100 if total_investment > 0 else 0
+
+            holdings.append({
+                "Scheme": scheme, "Units": round(total_units, 4), "Avg NAV": round(avg_nav, 4),
+                "Latest NAV": round(latest_nav, 4), "Investment": round(total_investment, 2),
+                "Current Value": round(current_value, 2), "P&L": round(pnl, 2), "P&L %": round(pnl_pct, 2),
+                "yfinance_symbol": code
+            })
+    return pd.DataFrame(holdings)
+
+def _calculate_mf_cumulative_return(transactions_df, historical_df):
+    """
+    Calculates the cumulative return of a mutual fund portfolio over time.
+
+    Args:
+        transactions_df (pd.DataFrame): A DataFrame of fund transactions for a single fund.
+        historical_df (pd.DataFrame): A DataFrame of historical NAV data for the fund.
+
+    Returns:
+        pd.DataFrame: A DataFrame with the daily cumulative return percentage.
+    """
+    if transactions_df.empty or historical_df.empty:
+        return pd.DataFrame()
+
+    transactions_df['date'] = pd.to_datetime(transactions_df['date'])
+    transactions_df = transactions_df.sort_values('date').reset_index(drop=True)
+
+    # Use the min and max dates from the transactions and historical data
+    start_date = transactions_df['date'].min()
+    end_date = historical_df.index.max()
+    all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+
+    # Initialize daily tracking variables
+    units = 0
+    invested_amount = 0
+    daily_df = []
+
+    # Process transactions and NAV data day by day
+    for date in all_dates:
+        # Check if there is an NAV value for this date
+        if date in historical_df.index:
+            nav = historical_df.loc[date]['NAV']
+
+            # Process transactions for this date
+            todays_tx = transactions_df[transactions_df['date'] == date]
+            for _, tx_row in todays_tx.iterrows():
+                if tx_row['type'] == 'Purchase':
+                    units += tx_row['units']
+                    invested_amount += (tx_row['units'] * tx_row['nav'])
+                elif tx_row['type'] == 'Redemption':
+                    units -= tx_row['units']
+                    invested_amount -= (tx_row['units'] * tx_row['nav'])
+
+            # Calculate current value and return for the day
+            current_value = units * nav if units > 0 else 0
+
+            if invested_amount > 0:
+                cumulative_return = ((current_value - invested_amount) / invested_amount) * 100
+            else:
+                cumulative_return = 0
+
+            daily_df.append({
+                'date': date,
+                'cumulative_return': cumulative_return,
+            })
+
+    return_df = pd.DataFrame(daily_df)
+    return return_df
+
+
+# --- PAGE RENDERERS ---
+PAGE_CONFIGS = {
+    "investment": {
+        "title": "📈 Investment Portfolio",
+        "asset_table": "portfolio",
+        "realized_table": "realized_stocks",
+        "asset_col": "ticker",
+        "asset_name": "Stock",
+        "asset_name_plural": "Stocks",
+        "key_prefix": "inv"
+    },
+    "trading": {
+        "title": "📊 Trading Book",
+        "asset_table": "trades",
+        "realized_table": "exits",
+        "asset_col": "symbol",
+        "asset_name": "Trade",
+        "asset_name_plural": "Trades",
+        "key_prefix": "trade"
+    }
+}
+
+def color_return_value(val):
+    """Applies color to a cell based on its numerical value."""
+    if val is None or not isinstance(val, (int, float)):
+        return ''
+    return 'color: green' if val >= 0 else 'color: red'
+
+def render_asset_page(config):
+    """Renders the Investment and Trading pages."""
+    c = DB_CONN.cursor()
+    key_prefix = config['key_prefix']
+    is_trading_section = key_prefix == 'trade'
+
+    col_title, col_refresh = st.columns([0.8, 0.2])
+    with col_title:
+        st.title(config["title"])
+    with col_refresh:
+        st.write("")
+        st.write("")
+        if st.button("Refresh Live Data", key=f"{key_prefix}_refresh_data"):
+            with st.spinner("Fetching latest prices..."):
+                df_symbols = pd.read_sql(f"SELECT {config['asset_col']} FROM {config['asset_table']}", DB_CONN)
+                all_symbols = df_symbols[config['asset_col']].tolist()
+                for symbol in all_symbols:
+                    update_stock_data(symbol)
+            st.success("Data refreshed!")
+            st.rerun()
+
+    st.sidebar.header(f"Add {config['asset_name']}")
+
+    with st.sidebar.form(f"{key_prefix}_add_form"):
+        company_name = st.text_input(f"{config['asset_name']} Name", value="", key=f"{key_prefix}_add_company_name")
+        search_button = st.form_submit_button("Search")
+
+    if search_button and company_name:
+        st.session_state[f"{key_prefix}_search_results"] = search_for_ticker(company_name)
+        st.session_state[f"{key_prefix}_selected_symbol"] = None
+        st.rerun()
+
+    if st.session_state.get(f"{key_prefix}_search_results"):
+        results = st.session_state[f"{key_prefix}_search_results"]
+        symbols_only = [res.split(" - ")[0] for res in results]
+        selected_symbol_from_search = st.sidebar.selectbox(
+            f"Select {config['asset_name']} Symbol",
+            options=[None] + symbols_only,
+            index=0,
+            key=f"{key_prefix}_select_symbol",
+            format_func=lambda x: "Select a stock..." if x is None else x
+        )
+        if selected_symbol_from_search and selected_symbol_from_search != st.session_state.get(f"{key_prefix}_selected_symbol"):
+            st.session_state[f"{key_prefix}_selected_symbol"] = selected_symbol_from_search
+            st.rerun()
+
+    if st.session_state.get(f"{key_prefix}_selected_symbol"):
+        with st.sidebar.form(f"{key_prefix}_add_details_form"):
+            symbol = st.session_state[f"{key_prefix}_selected_symbol"]
+            st.write(f"Selected: **{symbol}**")
+            stock_info = fetch_stock_info(symbol)
+            current_price = stock_info['price']
+            sector = stock_info['sector']
+            market_cap = stock_info['market_cap']
+            currency = "₹" if ".NS" in symbol else "$"
+
+            if current_price:
+                st.info(f"Current Price: {currency}{current_price:,.2f}")
+            else:
+                st.warning("Could not fetch current price.")
+
+            buy_price = st.number_input(f"Buy Price ({currency})", min_value=0.01, format="%.2f", key=f"{key_prefix}_buy_price")
+            buy_date = st.date_input("Buy Date", max_value=datetime.date.today(), key=f"{key_prefix}_buy_date")
+            quantity = st.number_input("Quantity", min_value=1, step=1, key=f"{key_prefix}_buy_quantity")
+            transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_buy_transaction_fee", value=0.0)
+
+            if not is_trading_section:
+                st.text_input("Sector", value=sector, key=f"{key_prefix}_sector", disabled=True)
+                st.text_input("Market Cap", value=_categorize_market_cap(market_cap) if market_cap != 'N/A' else 'N/A', key=f"{key_prefix}_market_cap", disabled=True)
+            else:
+                target_price = st.number_input("Target Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_target_price")
+                stop_loss_price = st.number_input("Stop Loss Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_stop_loss_price")
+
+            add_button = st.form_submit_button(f"Add to {config['asset_name_plural']}")
+            if add_button:
+                if not (buy_price and buy_price > 0 and quantity and quantity > 0):
+                    st.error("Buy Price and Quantity must be positive.")
+                elif update_stock_data(symbol):
+                    total_cost = (buy_price * quantity) + transaction_fee
+                    c.execute(f"SELECT * FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol,))
+                    existing = c.fetchone()
+                    if existing:
+                        old_buy_price, old_quantity = existing[1], existing[3]
+                        old_total_cost = old_buy_price * old_quantity
+                        new_quantity = old_quantity + quantity
+                        new_avg_price = (old_total_cost + total_cost - transaction_fee) / new_quantity
+                        if is_trading_section:
+                            c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, target_price=?, stop_loss_price=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, round(target_price, 2), round(stop_loss_price, 2), symbol))
+                        else:
+                            c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, sector=?, market_cap=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, sector, _categorize_market_cap(market_cap), symbol))
+                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} more units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        st.success(f"Updated {symbol}. New quantity: {new_quantity}, New avg. price: {currency}{new_avg_price:,.2f}")
+                    else:
+                        if is_trading_section:
+                            c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, round(target_price, 2), round(stop_loss_price, 2)))
+                        else:
+                            c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, sector, market_cap) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, sector, _categorize_market_cap(market_cap)))
+                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        st.success(f"{symbol} added successfully!")
+                    DB_CONN.commit()
+                    st.rerun()
+                else:
+                    st.error(f"Failed to fetch historical data for {symbol}. Cannot add.")
+
+    st.sidebar.header(f"Sell {config['asset_name']}")
+    all_symbols = pd.read_sql(f"SELECT {config['asset_col']} FROM {config['asset_table']}", DB_CONN)[config['asset_col']].tolist()
+
+    if all_symbols:
+        selected_option = st.sidebar.selectbox(
+            f"Select {config['asset_name']} to Sell",
+            options=[None] + all_symbols,
+            index=0,
+            key=f"{key_prefix}_sell_symbol_selector",
+            format_func=lambda x: "Select a stock..." if x is None else x
+        )
+        available_qty = 1
+        if selected_option:
+            symbol_to_sell = selected_option
+            c.execute(f"SELECT quantity FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+            result = c.fetchone()
+            if result:
+                available_qty = result[0]
+                st.sidebar.info(f"Available to sell: {available_qty} units of {symbol_to_sell}")
+        else:
+            symbol_to_sell = None
+
+        with st.sidebar.form(f"{key_prefix}_sell_form"):
+            is_disabled = not symbol_to_sell
+            sell_qty = st.number_input("Quantity to Sell", min_value=1, max_value=available_qty, step=1, key=f"{key_prefix}_sell_qty", disabled=is_disabled)
+            sell_price = st.number_input("Sell Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_sell_price", disabled=is_disabled)
+            sell_date = st.date_input("Sell Date", max_value=datetime.date.today(), key=f"{key_prefix}_sell_date", disabled=is_disabled)
+            sell_transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_sell_transaction_fee", disabled=is_disabled, value=0.0)
+            sell_button = st.form_submit_button(f"Sell {config['asset_name']}")
+            if sell_button:
+                if not symbol_to_sell:
+                    st.warning(f"Please select a {config['asset_name']} to sell.")
+                elif not (sell_price and sell_price > 0):
+                    st.error("Sell price must be greater than zero.")
+                elif not (sell_qty and sell_qty > 0):
+                    st.error("Quantity to sell must be positive.")
+                else:
+                    if is_trading_section:
+                        c.execute(f"SELECT buy_price, buy_date, quantity, target_price, stop_loss_price FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+                        buy_price, buy_date, current_qty, target_price, stop_loss_price = c.fetchone()
+                    else:
+                        c.execute(f"SELECT buy_price, buy_date, quantity FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+                        buy_price, buy_date, current_qty = c.fetchone()
+
+                    realized_return = ((sell_price - buy_price) / buy_price * 100)
+                    transaction_id = str(uuid.uuid4())
+
+                    if is_trading_section:
+                        c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                  (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2), round(target_price, 2), round(stop_loss_price, 2)))
+                    else:
+                        c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                  (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2)))
+
+                    update_funds_on_transaction("Deposit", round((sell_price * sell_qty) - sell_transaction_fee, 2), f"Sale of {sell_qty} units of {symbol_to_sell}", sell_date.strftime("%Y-%m-%d"))
+
+                    if sell_qty == current_qty:
+                        c.execute(f"DELETE FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
+                    else:
+                        c.execute(f"UPDATE {config['asset_table']} SET quantity=? WHERE {config['asset_col']}=?", (current_qty - sell_qty, symbol_to_sell))
+
+                    DB_CONN.commit()
+                    st.success(f"Sold {sell_qty} units of {symbol_to_sell}.")
+                    st.rerun()
+    else:
+        st.sidebar.info(f"No open {config['asset_name_plural'].lower()}.")
+
+    view_options = ["Holdings", "Exited Positions"] if not is_trading_section else ["Open Trades", "Closed Trades"]
+    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view", label_visibility="hidden")
+
+    if table_view == view_options[0]:
+        holdings_df = get_holdings_df(config['asset_table'])
+        if not holdings_df.empty:
+            total_invested, total_current = holdings_df['invested_value'].sum(), holdings_df['current_value'].sum()
+            total_return_amount = (total_current - total_invested).round(2)
+            total_return_percent = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Investment", f"₹{total_invested:,.2f}")
+            with col2:
+                st.metric("Current Value", f"₹{total_current:,.2f}")
+            with col3:
+                st.metric("Total Return", f"₹{total_return_amount:,.2f}", f"{total_return_percent:.2f}%")
+            st.divider()
+
+            if not is_trading_section:
+                # New layout for portfolio metrics
+                benchmark_choice = 'Nifty 50'
+                metrics = calculate_portfolio_metrics(holdings_df, pd.DataFrame(), benchmark_choice)
+
+                col_alpha, col_beta, col_drawdown, col_annual_return = st.columns(4)
+                with col_alpha:
+                    st.metric("Alpha", f"{metrics['alpha']}%")
+                with col_beta:
+                    st.metric("Beta", f"{metrics['beta']}")
+                with col_drawdown:
+                    st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
+                with col_annual_return:
+                    st.metric("Annualized Return", f"{metrics['annualized_return']}%")
+                st.divider()
+
+            # Responsive Dataframe display
+            with st.expander("View Detailed Holdings"):
+                column_rename = {
+                    'symbol': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date', 'quantity': 'Quantity',
+                    'sector': 'Sector', 'market_cap': 'Market Cap', 'current_price': 'Current Price', 'return_%': 'Return (%)',
+                    'return_amount': 'Return (Amount)', 'invested_value': 'Investment Value', 'current_value': 'Current Value',
+                    'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
+                }
+                df_to_style = holdings_df.rename(columns=column_rename)
+                if not is_trading_section:
+                    df_to_style = df_to_style.drop(columns=['Target Price', 'Stop Loss', 'Expected RRR'], errors='ignore')
+
+                styled_holdings_df = df_to_style.style.map(color_return_value, subset=['Return (%)']).format({
+                    'Buy Price': '₹{:.2f}', 'Current Price': '₹{:.2f}', 'Return (Amount)': '₹{:.2f}',
+                    'Investment Value': '₹{:.2f}', 'Current Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
+                    'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Expected RRR': '{:.2f}'
+                })
+                st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
+
+            st.header("Return Chart")
+            all_symbols_list = holdings_df["symbol"].tolist()
+            selected_symbols = st.multiselect("Select assets for return chart", all_symbols_list, default=all_symbols_list, key=f"{key_prefix}_perf_symbols")
+
+            chart_data = []
+            for symbol in selected_symbols:
+                asset_info = holdings_df.loc[holdings_df["symbol"] == symbol].iloc[0]
+                history_df = pd.read_sql("SELECT date, close_price FROM price_history WHERE ticker=? AND date>=? ORDER BY date ASC", DB_CONN, params=(symbol, asset_info["buy_date"]))
+                if not history_df.empty:
+                    history_df["return_%"] = ((history_df["close_price"] - asset_info["buy_price"]) / asset_info["buy_price"] * 100).round(2)
+                    history_df["symbol"] = symbol
+                    history_df['date'] = pd.to_datetime(history_df['date'])
+                    chart_data.append(history_df)
+
+            if chart_data:
+                full_chart_df = pd.concat(chart_data)
+                chart = alt.Chart(full_chart_df).mark_line().encode(
+                    x=alt.X('date:T', title='Date'),
+                    y=alt.Y('return_%:Q', title='Return %'),
+                    color='symbol:N',
+                    tooltip=['symbol', 'date', alt.Tooltip('return_%', format=".2f")]
+                ).properties(height=300).interactive()
+                zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                st.altair_chart(chart + zero_line, use_container_width=True)
+            else:
+                st.info("No data to display for selected assets.")
+        else:
+            st.info(f"No {view_options[0].lower()} to display. Add a {config['asset_name'].lower()} from the sidebar.")
+    elif table_view == view_options[1]:
+        realized_df = get_realized_df(config['realized_table'])
+        if not realized_df.empty:
+
+            # Display Trading Metrics for Realized Trades
+            if is_trading_section:
+                st.subheader("Key Trading Metrics")
+                trading_metrics = calculate_trading_metrics(realized_df)
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Win Ratio", f"{trading_metrics['win_ratio']}%")
+                col2.metric("Profit Factor", f"{trading_metrics['profit_factor']}")
+                col3.metric("Expectancy", f"₹{trading_metrics['expectancy']}")
+                st.divider()
+
+            with st.expander("View Detailed Realized Positions"):
+                df_to_style = realized_df.drop(columns=['transaction_id'], errors='ignore')
+                column_rename = {
+                    'ticker': 'Stock Name', 'symbol': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date',
+                    'sell_price': 'Sell Price', 'sell_date': 'Sell Date', 'quantity': 'Quantity',
+                    'realized_return_pct': 'Return (%)', 'realized_profit_loss': 'P/L (Amount)',
+                    'invested_value': 'Investment Value', 'realized_value': 'Realized Value',
+                    'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
+                }
+                styled_realized_df = df_to_style.rename(columns=column_rename).style.map(color_return_value, subset=['Return (%)']).format({
+                    'Buy Price': '₹{:.2f}', 'Sell Price': '₹{:.2f}', 'P/L (Amount)': '₹{:.2f}',
+                    'Investment Value': '₹{:.2f}', 'Realized Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
+                    'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Sell Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Expected RRR': '{:.2f}', 'Actual RRR': '{:.2f}'
+                })
+                st.dataframe(styled_realized_df, use_container_width=True, hide_index=True)
+
+            st.header("Return Chart")
+            realized_df['color'] = realized_df['realized_return_pct'].apply(lambda x: 'Profit' if x >= 0 else 'Loss')
+            base = alt.Chart(realized_df).encode(
+                x=alt.X(config['asset_col'], sort=None, title="Stock Name"),
+                tooltip=[config['asset_col'], alt.Tooltip('realized_return_pct', title='Return %', format=".2f"), alt.Tooltip('realized_profit_loss', title='P/L (₹)', format=".2f")]
+            )
+            bars = base.mark_bar().encode(
+                y=alt.Y('realized_return_pct', title='Return (%)'),
+                color=alt.Color('color', scale=alt.Scale(domain=['Profit', 'Loss'], range=['#2ca02c', '#d62728']), legend=None)
+            )
+            st.altair_chart(bars, use_container_width=True)
+        else:
+            st.info(f"No {view_options[1].lower()} to display.")
+
+    # Performance vs Benchmark section
+    if table_view == view_options[0] or (is_trading_section and table_view == view_options[1]):
+        st.divider()
+        st.header("Performance vs Benchmark")
+        benchmark_choice = st.selectbox("Select Benchmark", ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500'], key=f"{key_prefix}_benchmark_choice")
+        with st.spinner("Loading Benchmark Data..."):
+            if table_view == view_options[0]:
+                holdings_df = get_holdings_df(config['asset_table'])
+            else:
+                realized_df = get_realized_df(config['realized_table'])
+                holdings_df = realized_df.rename(columns={'symbol': 'ticker', 'realized_value': 'current_value', 'realized_profit_loss': 'return_amount', 'realized_return_pct': 'return_%'})
+                holdings_df['buy_price'] = holdings_df['invested_value'] / holdings_df['quantity']
+                holdings_df['symbol'] = holdings_df['ticker']
+
+            benchmark_data = get_benchmark_comparison_data(holdings_df, benchmark_choice)
+            if not benchmark_data.empty:
+                benchmark_chart = alt.Chart(benchmark_data).mark_line().encode(
+                    x=alt.X('Date:T', title='Date'),
+                    y=alt.Y('Return %:Q', title='Total Return %'),
+                    color=alt.Color('Type:N', title='Legend')
+                ).properties(height=300).interactive()
+                zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                st.altair_chart(benchmark_chart + zero_line, use_container_width=True)
+            else:
+                st.warning("Could not generate benchmark data. Ensure you have at least one position.")
+
+
+# --- MAIN APP LOGIC ---
+
+# Move home_page definition to the top
 def home_page():
     """Renders the main home page."""
     st.title("Finance Dashboard")
