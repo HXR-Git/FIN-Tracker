@@ -17,6 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
     page_title="Finance Dashboard",
+    page_icon="💰",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
