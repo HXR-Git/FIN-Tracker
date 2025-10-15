@@ -17,10 +17,47 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
     page_title="Finance Dashboard",
-    page_icon="💰",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+# --- USER AUTHENTICATION ---
+# Hardcoded credentials for demonstration
+USERNAME = "HXR"
+PASSWORD = "Rossph"
+
+def login_page():
+    """Renders the login page."""
+    st.title("Login to Finance Dashboard")
+    st.markdown("Please enter your credentials to access the dashboard.")
+
+    # Callback to clear the input fields
+    def reset_login_fields():
+        if "username" in st.session_state:
+            st.session_state.username = ""
+        if "password" in st.session_state:
+            st.session_state.password = ""
+
+    # The login form now only contains the submit button
+    with st.form("login_form"):
+        st.subheader("Login")
+        username = st.text_input("Username", key="username")
+        password = st.text_input("Password", type="password", key="password")
+
+        submit_button = st.form_submit_button("Login")
+
+    # The reset button is now outside the form
+    if st.button("Reset", on_click=reset_login_fields):
+        pass
+
+    if submit_button:
+        if username == USERNAME and password == PASSWORD:
+            st.session_state.logged_in = True
+            st.success("Logged in successfully!")
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
 
 # --- INDICATOR FUNCTIONS (Unused but kept for reference) ---
 def rsi(close, period=14):
@@ -390,10 +427,9 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
 # --- NEW METRICS CALCULATION FUNCTIONS ---
 
 def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
-    """Calculates alpha, beta, max drawdown, and annualized return."""
+    """Calculates alpha, beta, and max drawdown."""
     metrics = {
-        'alpha': 'N/A', 'beta': 'N/A', 'max_drawdown': 'N/A',
-        'annualized_return': 'N/A'
+        'alpha': 'N/A', 'beta': 'N/A', 'max_drawdown': 'N/A'
     }
     if holdings_df.empty:
         return metrics
@@ -418,10 +454,6 @@ def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
     drawdown = (cumulative_returns / peak) - 1
     max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0
     metrics['max_drawdown'] = round(max_drawdown, 2)
-    total_days = (portfolio_value.index[-1] - portfolio_value.index[0]).days
-    if total_days > 0:
-        annualized_return = ((portfolio_value.iloc[-1] / portfolio_value.iloc[0]) ** (365.25 / total_days) - 1) * 100
-        metrics['annualized_return'] = round(annualized_return, 2)
     benchmark_map = {'Nifty 50': '^NSEI', 'Nifty 100': '^CNX100', 'Nifty 200': '^CNX200', 'Nifty 500': '^CRSLDX'}
     selected_ticker = benchmark_map.get(benchmark_choice)
     if selected_ticker:
@@ -492,21 +524,43 @@ def get_combined_returns():
     mf_df = get_mf_holdings_df()
     mf_invested = mf_df['Investment'].sum() if not mf_df.empty else 0
     mf_current = mf_df['Current Value'].sum() if not mf_df.empty else 0
-    inv_trade_invested = inv_invested + trade_invested
-    inv_trade_current = inv_current + trade_current
-    inv_trade_return_amount = (inv_trade_current - inv_trade_invested).round(2)
-    inv_trade_return_pct = (inv_trade_return_amount / inv_trade_invested * 100).round(2) if inv_trade_invested > 0 else 0
-    total_invested = inv_trade_invested + mf_invested
-    total_current = inv_trade_current + mf_current
-    total_return_amount = (total_current - total_invested).round(2)
-    total_return_pct = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
+
+    inv_return_amount = round(float(inv_current - inv_invested), 2)
+    inv_return_pct = round(float(inv_return_amount / inv_invested * 100), 2) if inv_invested > 0 else 0
+
+    trade_return_amount = round(float(trade_current - trade_invested), 2)
+    trade_return_pct = round(float(trade_return_amount / trade_invested * 100), 2) if trade_invested > 0 else 0
+
+    mf_return_amount = round(float(mf_current - mf_invested), 2)
+    mf_return_pct = round(float(mf_return_amount / mf_invested * 100), 2) if mf_invested > 0 else 0
+
+    total_invested = inv_invested + trade_invested + mf_invested
+    total_current = inv_current + trade_current + mf_current
+    total_return_amount = round(float(total_current - total_invested), 2)
+    total_return_pct = round(float(total_return_amount / total_invested * 100), 2) if total_invested > 0 else 0
+
+    # Corrected method to calculate realized amounts
+    realized_stocks_df = get_realized_df("realized_stocks")
+    realized_exits_df = get_realized_df("exits")
+
+    realized_inv = realized_stocks_df['realized_profit_loss'].sum() if not realized_stocks_df.empty else 0
+    realized_trade = realized_exits_df['realized_profit_loss'].sum() if not realized_exits_df.empty else 0
+    realized_mf = 0  # No realized MF table, so it remains 0
+
     return {
-        "inv_trade_return_amount": inv_trade_return_amount,
-        "inv_trade_return_pct": inv_trade_return_pct,
+        "inv_return_amount": inv_return_amount,
+        "inv_return_pct": inv_return_pct,
+        "trade_return_amount": trade_return_amount,
+        "trade_return_pct": trade_return_pct,
+        "mf_return_amount": mf_return_amount,
+        "mf_return_pct": mf_return_pct,
         "total_invested_value": total_invested,
         "total_current_value": total_current,
         "total_return_amount": total_return_amount,
         "total_return_pct": total_return_pct,
+        "realized_inv": round(float(realized_inv), 2),
+        "realized_trade": round(float(realized_trade), 2),
+        "realized_mf": round(float(realized_mf), 2)
     }
 
 def get_mf_holdings_df():
@@ -538,87 +592,171 @@ def get_mf_holdings_df():
             })
     return pd.DataFrame(holdings)
 
-def _calculate_mf_cumulative_return(transactions_df, historical_df):
+def _calculate_mf_cumulative_return(transactions_df):
     """Calculates the cumulative return of a mutual fund portfolio over time."""
-    if transactions_df.empty or historical_df.empty:
+    if transactions_df.empty:
         return pd.DataFrame()
 
-    # FIX: Explicitly create a copy to avoid SettingWithCopyWarning
-    transactions_df = transactions_df.copy()
-    transactions_df['date'] = pd.to_datetime(transactions_df['date'])
-    transactions_df = transactions_df.sort_values('date').reset_index(drop=True)
-    start_date = transactions_df['date'].min()
-    end_date = historical_df.index.max()
-    all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
-    units = 0
-    invested_amount = 0
-    daily_df = []
-    for date in all_dates:
-        if date in historical_df.index:
-            nav = historical_df.loc[date]['NAV']
-            todays_tx = transactions_df[transactions_df['date'] == date]
-            for _, tx_row in todays_tx.iterrows():
-                if tx_row['type'] == 'Purchase':
-                    units += tx_row['units']
-                    invested_amount += (tx_row['units'] * tx_row['nav'])
-                elif tx_row['type'] == 'Redemption':
-                    units -= tx_row['units']
-                    invested_amount -= (tx_row['units'] * tx_row['nav'])
-            current_value = units * nav if units > 0 else 0
-            if invested_amount > 0:
-                cumulative_return = ((current_value - invested_amount) / invested_amount) * 100
-            else:
-                cumulative_return = 0
-            daily_df.append({
-                'date': date,
-                'cumulative_return': cumulative_return,
-            })
-    return_df = pd.DataFrame(daily_df)
-    return return_df
+    all_schemes_daily_returns = []
+    unique_schemes = transactions_df['scheme_name'].unique()
 
-# --- PAGE RENDERING FUNCTIONS ---
+    for scheme_name in unique_schemes:
+        scheme_tx_df = transactions_df[transactions_df['scheme_name'] == scheme_name].copy()
+        scheme_tx_df['date'] = pd.to_datetime(scheme_tx_df['date'], format='%Y-%m-%d', errors='coerce')
+        scheme_tx_df = scheme_tx_df.sort_values('date').reset_index(drop=True)
+
+        scheme_code = scheme_tx_df['yfinance_symbol'].iloc[0]
+        historical_data = get_mf_historical_data(scheme_code)
+
+        if historical_data.empty:
+            continue
+
+        start_date = scheme_tx_df['date'].min()
+        end_date = historical_data.index.max()
+        all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+
+        units = 0
+        invested_amount = 0
+        daily_records = []
+
+        for date in all_dates:
+            if date in historical_data.index:
+                nav = historical_data.loc[date]['NAV']
+                todays_tx = scheme_tx_df[scheme_tx_df['date'] == date]
+
+                for _, tx_row in todays_tx.iterrows():
+                    if tx_row['type'] == 'Purchase':
+                        units += tx_row['units']
+                        invested_amount += (tx_row['units'] * tx_row['nav'])
+                    elif tx_row['type'] == 'Redemption':
+                        units -= tx_row['units']
+                        invested_amount -= (tx_row['units'] * tx_row['nav'])
+
+                current_value = units * nav if units > 0 else 0
+
+                if invested_amount > 0:
+                    cumulative_return = ((current_value - invested_amount) / invested_amount) * 100
+                else:
+                    cumulative_return = 0
+
+                daily_records.append({
+                    'date': date,
+                    'cumulative_return': cumulative_return,
+                    'scheme_name': scheme_name
+                })
+
+        all_schemes_daily_returns.append(pd.DataFrame(daily_records))
+
+    if not all_schemes_daily_returns:
+        return pd.DataFrame()
+
+    return pd.concat(all_schemes_daily_returns)
+
+def main_app():
+    """Renders the main dashboard pages."""
+    if "page" not in st.session_state:
+        st.session_state.page = "home"
+
+    pages = {
+        "home": home_page,
+        "investment": lambda: render_asset_page(PAGE_CONFIGS["investment"]),
+        "trading": lambda: render_asset_page(PAGE_CONFIGS["trading"]),
+        "funds": funds_page,
+        "expense_tracker": expense_tracker_page,
+        "mutual_fund": mutual_fund_page,
+    }
+
+    pages[st.session_state.page]()
+
+    if st.session_state.page != "home":
+        st.button("Back to Home", on_click=set_page, args=("home",))
+    if st.sidebar.button("Logout", type="secondary"):
+        st.session_state.logged_in = False
+        st.session_state.page = "home"
+        st.rerun()
+    if st.sidebar.button("Clear Session State", type="secondary"):
+        current_page = st.session_state.get("page", "home")
+        for key in list(st.session_state.keys()):
+            if key not in ['page', 'mf_all_schemes', 'logged_in']:
+                del st.session_state[key]
+        st.session_state.page = current_page
+        st.rerun()
+
 def home_page():
     """Renders the main home page."""
     st.title("Finance Dashboard")
     _update_existing_portfolio_info()
     returns_data = get_combined_returns()
-    col1, col2 = st.columns(2)
+
+    col1, col2, col3 = st.columns(3)
     with col1:
         st.metric(
-            label="Return (Investment + Trading)",
-            value=f"₹{returns_data['inv_trade_return_amount']:,.2f}",
-            delta=f"{returns_data['inv_trade_return_pct']:.2f}%"
+            label="Total Investment Value",
+            value=f"₹{returns_data['total_invested_value']:,.2f}",
         )
     with col2:
         st.metric(
-            label="Return(Investment+Trading+Mutual Fund)",
+            label="Total Current Value",
+            value=f"₹{returns_data['total_current_value']:,.2f}",
+        )
+    with col3:
+        st.metric(
+            label="Total Portfolio Return",
             value=f"₹{returns_data['total_return_amount']:,.2f}",
             delta=f"{returns_data['total_return_pct']:.2f}%"
         )
-    col3, col4 = st.columns(2)
-    with col3:
-        st.metric("Total Investment Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_invested_value']:,.2f}")
+
+    col4, col5, col6 = st.columns(3)
     with col4:
-        st.metric("Current Value(Investment+Trading+Mutual Fund)", f"₹{returns_data['total_current_value']:,.2f}")
+        st.metric(
+            label="Investment Return",
+            value=f"₹{returns_data['inv_return_amount']:,.2f}",
+            delta=f"{returns_data['inv_return_pct']:.2f}%",
+            help=f"Realized P&L: ₹{returns_data['realized_inv']:,.2f}"
+        )
+    with col5:
+        st.metric(
+            label="Trading Return",
+            value=f"₹{returns_data['trade_return_amount']:,.2f}",
+            delta=f"{returns_data['trade_return_pct']:.2f}%",
+            help=f"Realized P&L: ₹{returns_data['realized_trade']:,.2f}"
+        )
+    with col6:
+        st.metric(
+            label="Mutual Fund Return",
+            value=f"₹{returns_data['mf_return_amount']:,.2f}",
+            delta=f"{returns_data['mf_return_pct']:.2f}%",
+            help=f"Realized P&L: ₹{returns_data['realized_mf']:,.2f}"
+        )
+
     st.divider()
-    st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
-    st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
-    st.button("💰 Funds", use_container_width=True, on_click=set_page, args=("funds",))
-    st.button("💸 Expense Tracker", use_container_width=True, on_click=set_page, args=("expense_tracker",))
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
+        st.button("💰 Funds", use_container_width=True, on_click=set_page, args=("funds",))
+    with col2:
+        st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
+        st.button("💸 Expense Tracker", use_container_width=True, on_click=set_page, args=("expense_tracker",))
     st.button("📚 Mutual Fund", use_container_width=True, on_click=set_page, args=("mutual_fund",))
+
+    col_refresh, _ = st.columns([0.2, 0.8])
+    with col_refresh:
+        if st.button("Refresh Live Data", key="refresh_all_data"):
+            with st.spinner("Fetching latest stock and mutual fund prices..."):
+                all_tickers = pd.read_sql("SELECT ticker FROM portfolio UNION SELECT symbol FROM trades", DB_CONN)['ticker'].tolist()
+                for symbol in all_tickers:
+                    update_stock_data(symbol)
+                mf_symbols = pd.read_sql("SELECT DISTINCT yfinance_symbol FROM mf_transactions", DB_CONN)['yfinance_symbol'].tolist()
+                for symbol in mf_symbols:
+                    fetch_latest_mf_nav(symbol)
+            st.success("All live data refreshed!")
+            st.rerun()
 
 def funds_page():
     """Renders the Funds Management page."""
     c = DB_CONN.cursor()
-    col_title, col_refresh = st.columns([0.8, 0.2])
-    with col_title:
-        st.title("💰 Funds Management")
-    with col_refresh:
-        st.write("")
-        st.write("")
-        if st.button("Refresh Live Data", key="funds_refresh_data"):
-            st.success("Funds data is always up to date as it is locally managed.")
-            st.rerun()
+    st.title("💰 Funds Management")
     st.sidebar.header("Add Transaction")
     with st.sidebar.form("deposit_form", clear_on_submit=True):
         st.subheader("Add Deposit")
@@ -644,18 +782,45 @@ def funds_page():
                 st.rerun()
             else:
                 st.warning("Withdrawal amount must be greater than zero.")
-    fund_df = pd.read_sql("SELECT * FROM fund_transactions ORDER BY date DESC", DB_CONN)
+
+    fund_df = pd.read_sql("SELECT transaction_id, date, type, amount, description FROM fund_transactions ORDER BY date DESC", DB_CONN)
     if not fund_df.empty:
-        fund_df['date'] = pd.to_datetime(fund_df['date']).dt.strftime('%d/%m/%Y')
+        fund_df['date'] = pd.to_datetime(fund_df['date'], format='%Y-%m-%d', errors='coerce')
+        fund_df['balance'] = fund_df.apply(lambda row: row['amount'] if row['type'] == 'Deposit' else -row['amount'], axis=1)
+        fund_df['cumulative_balance'] = fund_df['balance'].cumsum()
+
         total_deposits, total_withdrawals = fund_df.loc[fund_df['type'] == 'Deposit', 'amount'].sum(), fund_df.loc[fund_df['type'] == 'Withdrawal', 'amount'].sum()
         available_capital = total_deposits - total_withdrawals
+
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Deposits", f"₹{total_deposits:,.2f}")
         col2.metric("Total Withdrawals", f"₹{total_withdrawals:,.2f}")
         col3.metric("Available Capital", f"₹{available_capital:,.2f}")
+
         st.divider()
-        with st.expander("View Transaction History"):
-            st.dataframe(fund_df.drop(columns=['transaction_id']), use_container_width=True, hide_index=True)
+        st.subheader("Fund Flow Chart")
+
+        # Create a chart using Altair
+        chart = alt.Chart(fund_df).mark_line().encode(
+            x=alt.X('date', title='Date'),
+            y=alt.Y('cumulative_balance', title='Cumulative Balance (₹)'),
+            tooltip=['date', 'cumulative_balance']
+        ).properties(
+            height=400
+        ).interactive()
+
+        st.altair_chart(chart, use_container_width=True)
+
+        st.subheader("Transaction History")
+        edited_df = st.data_editor(fund_df[['transaction_id', 'date', 'type', 'amount', 'description']], use_container_width=True, hide_index=True, num_rows="dynamic",
+                                   column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
+                                                  "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True)})
+        if st.button("Save Changes to Transactions"):
+            c.execute("DELETE FROM fund_transactions")
+            edited_df['date'] = edited_df['date'].astype(str) # Convert back to string for SQLite
+            edited_df.to_sql('fund_transactions', DB_CONN, if_exists='append', index=False)
+            st.success("Funds transactions updated successfully!")
+            st.rerun()
     else:
         st.info("No fund transactions logged yet.")
 
@@ -664,31 +829,33 @@ def expense_tracker_page():
     st.title("💸 Expense Tracker")
     _process_recurring_expenses()
     c = DB_CONN.cursor()
-    CATEGORIES = sorted(["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other", "Salary", "Gift", "Bonus", "Investment Income"])
+
+    # Check if expenses table exists and has data before querying
+    try:
+        expense_categories = pd.read_sql("SELECT DISTINCT category FROM expenses WHERE type='Expense'", DB_CONN)['category'].tolist()
+        CATEGORIES = sorted(list(set(expense_categories + ["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"])))
+    except pd.io.sql.DatabaseError:
+        CATEGORIES = sorted(["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"])
+
     PAYMENT_METHODS = ["UPI", "Credit Card", "Debit Card", "Cash", "Net Banking"]
+
     view = st.radio("Select View", ["Dashboard", "Transaction History", "Manage Budgets", "Manage Recurring"], horizontal=True, label_visibility="hidden")
+
     st.sidebar.header("Add Transaction")
     with st.sidebar.form("new_transaction_form", clear_on_submit=True):
         trans_type = st.radio("Transaction Type", ["Expense", "Income"], key="trans_type")
         trans_date = st.date_input("Date", max_value=datetime.date.today(), value=datetime.date.today())
         trans_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None)
+
+        final_cat = st.text_input("Category", help="Enter a custom category name")
+
         if trans_type == "Income":
-            income_categories = [cat for cat in CATEGORIES if cat in ["Salary", "Gift", "Bonus", "Investment Income", "Other"]]
-            trans_cat = st.selectbox("Category", sorted(income_categories), index=None)
             trans_pm = "N/A"
         else:
-            expense_categories = [cat for cat in CATEGORIES if cat not in ["Salary", "Gift", "Bonus", "Investment Income"]]
-            trans_cat = st.selectbox("Category", sorted(expense_categories), index=None)
-            trans_pm = st.selectbox("Payment Method", PAYMENT_METHODS, index=None)
-        if trans_cat == 'Other':
-            custom_category = st.text_input("Enter New Category Name", key="custom_cat_input")
-            if custom_category:
-                final_cat = custom_category
-            else:
-                final_cat = 'Other'
-        else:
-            final_cat = trans_cat
+            trans_pm = st.selectbox("Payment Method", options=PAYMENT_METHODS, index=None)
+
         trans_desc = st.text_input("Description", value="")
+
         if st.form_submit_button("Add Transaction"):
             if trans_amount and final_cat and (trans_pm or trans_type == "Income"):
                 c.execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -698,10 +865,15 @@ def expense_tracker_page():
                 st.rerun()
             else:
                 st.warning("Please fill all required fields.")
+
     if view == "Dashboard":
-        st.header("Monthly Dashboard")
         month_year = datetime.date.today().strftime("%Y-%m")
         expenses_df = pd.read_sql(f"SELECT * FROM expenses WHERE date LIKE '{month_year}-%'", DB_CONN)
+
+        if expenses_df.empty:
+            st.info("No expenses logged for this month to display the dashboard.")
+            return
+
         budgets_df = pd.read_sql(f"SELECT category, amount FROM budgets WHERE month_year = '{month_year}'", DB_CONN).set_index('category')
         inflows_df = expenses_df[expenses_df['type'] == 'Income']
         outflows_df = expenses_df[expenses_df['type'] == 'Expense']
@@ -709,67 +881,80 @@ def expense_tracker_page():
         total_income = inflows_df['amount'].sum()
         total_budget = budgets_df['amount'].sum()
         net_flow = total_income - total_spent
+
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Income", f"₹{total_income:,.2f}")
         col2.metric("Total Spent this Month", f"₹{total_spent:,.2f}")
         col3.metric("Net Flow", f"₹{net_flow:,.2f}", delta_color="inverse" if net_flow >= 0 else "normal")
         col4.metric("Total Budget for Month", f"₹{total_budget:,.2f}")
         st.divider()
-        if not expenses_df.empty:
-            st.subheader("Category-wise Spending")
-            spending_by_category = outflows_df.groupby('category')['amount'].sum().reset_index()
-            if not spending_by_category.empty:
-                pie_chart = alt.Chart(spending_by_category).mark_arc(outerRadius=120).encode(
-                    theta=alt.Theta("amount", stack=True),
-                    color=alt.Color("category"),
-                    tooltip=["category", "amount"]
-                ).properties(height=350)
-                st.altair_chart(pie_chart, use_container_width=True)
-            else:
-                st.info("No expenses logged for this month to plot.")
-            st.divider()
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("Monthly Spending Trend")
-                monthly_spending_df = pd.read_sql("SELECT SUBSTR(date, 1, 7) AS month, SUM(amount) AS amount FROM expenses WHERE type='Expense' GROUP BY month ORDER BY month DESC", DB_CONN)
-                if not monthly_spending_df.empty:
-                    bar_chart = alt.Chart(monthly_spending_df).mark_bar().encode(
-                        x=alt.X('month', title='Month', sort='-x'),
-                        y=alt.Y('amount', title='Total Spent (₹)'),
-                        tooltip=[alt.Tooltip('month', title='Month'), alt.Tooltip('amount', format='.2f', title='Amount')]
-                    ).properties(height=350)
-                    st.altair_chart(bar_chart, use_container_width=True)
-                else:
-                    st.info("No expenses logged for this month.")
-            with col2:
-                # Renamed chart title from "Income vs. Expense" to "Inflow vs. Outflow"
-                st.subheader("Inflow vs. Outflow")
-                monthly_flows_df = pd.read_sql("SELECT SUBSTR(date, 1, 7) AS month, type, SUM(amount) AS amount FROM expenses GROUP BY month, type ORDER BY month DESC", DB_CONN)
-                if not monthly_flows_df.empty:
-                    bar_chart = alt.Chart(monthly_flows_df).mark_bar().encode(
-                        x=alt.X('month', title='Month', sort='-x'),
-                        y=alt.Y('amount', title='Amount (₹)'),
-                        color=alt.Color('type', title='Type', scale=alt.Scale(domain=['Income', 'Expense'], range=['#2ca02c', '#d62728'])),
-                        tooltip=['month', alt.Tooltip('type', title='Type'), alt.Tooltip('amount', format='.2f', title='Amount')]
-                    ).properties(height=300)
-                    st.altair_chart(bar_chart, use_container_width=True)
-                else:
-                    st.info("No income or expenses to compare.")
+
+        st.subheader("Category-wise Spending")
+        spending_by_category = outflows_df.groupby('category')['amount'].sum().reset_index()
+        if not spending_by_category.empty:
+            pie_chart = alt.Chart(spending_by_category).mark_arc(outerRadius=120).encode(
+                theta=alt.Theta("amount", stack=True),
+                color=alt.Color("category"),
+                tooltip=["category", "amount"]
+            ).properties(height=350)
+            st.altair_chart(pie_chart, use_container_width=True)
         else:
-            st.info("No transactions logged for this month to display charts.")
+            st.info("No expenses logged for this month to plot.")
+        st.divider()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Monthly Spending Trend")
+            monthly_spending_df = pd.read_sql("SELECT SUBSTR(date, 1, 7) AS month, SUM(amount) AS amount FROM expenses WHERE type='Expense' GROUP BY month ORDER BY month DESC", DB_CONN)
+            if not monthly_spending_df.empty:
+                bar_chart = alt.Chart(monthly_spending_df).mark_bar().encode(
+                    x=alt.X('month', title='Month', sort='-x'),
+                    y=alt.Y('amount', title='Total Spent (₹)'),
+                    tooltip=[alt.Tooltip('month', title='Month'), alt.Tooltip('amount', format='.2f', title='Amount')]
+                ).properties(height=350)
+                st.altair_chart(bar_chart, use_container_width=True)
+            else:
+                st.info("No expenses logged for this month.")
+        with col2:
+            st.subheader("Inflow vs. Outflow")
+            monthly_flows_df = pd.read_sql("SELECT SUBSTR(date, 1, 7) AS month, type, SUM(amount) AS amount FROM expenses GROUP BY month, type ORDER BY month DESC", DB_CONN)
+            if not monthly_flows_df.empty:
+                bar_chart = alt.Chart(monthly_flows_df).mark_bar().encode(
+                    x=alt.X('month', title='Month', sort='-x'),
+                    y=alt.Y('amount', title='Amount (₹)'),
+                    color=alt.Color('type', title='Type', scale=alt.Scale(domain=['Income', 'Expense'], range=['#2ca02c', '#d62728'])),
+                    tooltip=['month', alt.Tooltip('type', title='Type'), alt.Tooltip('amount', format='.2f', title='Amount')]
+                ).properties(height=300)
+                st.altair_chart(bar_chart, use_container_width=True)
+            else:
+                st.info("No income or expenses to compare.")
+
     elif view == "Transaction History":
         st.header("Transaction History")
-        all_expenses_df = pd.read_sql("SELECT * FROM expenses ORDER BY date DESC", DB_CONN)
+        all_expenses_df = pd.read_sql("SELECT expense_id, date, type, amount, category, payment_method, description FROM expenses ORDER BY date DESC", DB_CONN)
         if not all_expenses_df.empty:
-            all_expenses_df['date'] = pd.to_datetime(all_expenses_df['date']).dt.strftime('%d/%m/%Y')
-            st.dataframe(all_expenses_df.drop(columns=['expense_id']), use_container_width=True, hide_index=True)
+            all_expenses_df['date'] = pd.to_datetime(all_expenses_df['date'], format='%Y-%m-%d', errors='coerce')
+            edited_df = st.data_editor(all_expenses_df, use_container_width=True, hide_index=True, num_rows="dynamic",
+                                       column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
+                                                      "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                      "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
+                                                      "category": st.column_config.TextColumn("Category", required=True),
+                                                      "payment_method": st.column_config.SelectboxColumn("Payment Method", options=PAYMENT_METHODS, required=True)})
+
+            if st.button("Save Changes to Transactions"):
+                c.execute("DELETE FROM expenses")
+                edited_df['date'] = edited_df['date'].astype(str) # Convert back to string for SQLite
+                edited_df.to_sql('expenses', DB_CONN, if_exists='append', index=False)
+                DB_CONN.commit()
+                st.success("Expenses updated successfully!")
+                st.rerun()
         else:
             st.info("No transaction history to display.")
     elif view == "Manage Budgets":
         st.header("Set Your Monthly Budgets")
         budget_month_str = datetime.date.today().strftime("%Y-%m")
         st.info(f"You are setting the budget for: **{datetime.datetime.strptime(budget_month_str, '%Y-%m').strftime('%B %Y')}**")
-        expense_categories_for_budget = sorted([cat for cat in CATEGORIES if cat not in ["Salary", "Gift", "Bonus", "Investment Income", "Other"]])
+        expense_categories_for_budget = sorted(list(pd.read_sql("SELECT DISTINCT category FROM expenses WHERE type='Expense'", DB_CONN)['category']) or CATEGORIES)
         existing_budgets = pd.read_sql(f"SELECT category, amount FROM budgets WHERE month_year = '{budget_month_str}'", DB_CONN)
         budget_df = pd.DataFrame({'category': expense_categories_for_budget, 'amount': [0.0] * len(expense_categories_for_budget)})
         if not existing_budgets.empty:
@@ -790,7 +975,8 @@ def expense_tracker_page():
         st.info("Set up expenses that occur every month (e.g., rent, subscriptions). They will be logged automatically.")
         recurring_df = pd.read_sql("SELECT recurring_id, description, amount, category, payment_method, day_of_month FROM recurring_expenses", DB_CONN)
         edited_recurring = st.data_editor(recurring_df, num_rows="dynamic", use_container_width=True, column_config={
-            "category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
+            "recurring_id": st.column_config.NumberColumn(disabled=True),
+            "category": st.column_config.TextColumn("Category", required=True),
             "payment_method": st.column_config.SelectboxColumn("Payment Method", options=PAYMENT_METHODS, required=True),
             "day_of_month": st.column_config.NumberColumn("Day of Month (1-31)", min_value=1, max_value=31, step=1, required=True)
         })
@@ -806,109 +992,138 @@ def expense_tracker_page():
 def mutual_fund_page():
     """Renders the Mutual Fund tracker page."""
     c = DB_CONN.cursor()
-    col_title, col_refresh = st.columns([0.8, 0.2])
-    with col_title:
-        st.title("📚 Mutual Fund Tracker")
-    with col_refresh:
-        st.write("")
-        st.write("")
-        if st.button("Refresh Live Data", key="mf_refresh_data"):
-            with st.spinner("Fetching latest NAVs..."):
-                mf_symbols = pd.read_sql("SELECT DISTINCT yfinance_symbol FROM mf_transactions", DB_CONN)['yfinance_symbol'].tolist()
-                for symbol in mf_symbols:
-                    fetch_latest_mf_nav(symbol)
-            st.success("NAV data refreshed!")
-            st.rerun()
+    st.title("📚 Mutual Fund Tracker")
     _process_mf_sips()
     key_prefix = "mf"
-    st.sidebar.header("Add Transaction")
-    if f"{key_prefix}_all_schemes" not in st.session_state:
-        st.session_state[f"{key_prefix}_all_schemes"] = fetch_mf_schemes()
-        st.session_state[f"{key_prefix}_search_results"] = []
-    with st.sidebar.form(f"{key_prefix}_search_form"):
-        company_name = st.text_input("Search Fund Name", key=f"{key_prefix}_search_term_input")
-        search_button = st.form_submit_button("Search")
-        if search_button:
-            if company_name:
-                filtered_schemes = {name: code for name, code in st.session_state[f"{key_prefix}_all_schemes"].items() if company_name.lower() in name.lower()}
-                st.session_state[f"{key_prefix}_search_results"] = [f"{name} ({code})" for name, code in filtered_schemes.items()]
-            else:
-                st.session_state[f"{key_prefix}_search_results"] = []
-            st.session_state[f"{key_prefix}_selected_scheme_code"] = None
-            st.rerun()
-    if st.session_state.get(f"{key_prefix}_search_results"):
-        selected_result = st.sidebar.selectbox("Select Mutual Fund", options=[None] + st.session_state[f"{key_prefix}_search_results"], index=0, format_func=lambda x: "Select a fund..." if x is None else x)
-        if selected_result and selected_result != st.session_state.get(f"{key_prefix}_selected_result"):
-            st.session_state[f"{key_prefix}_selected_result"] = selected_result
-            st.rerun()
-    if st.session_state.get(f"{key_prefix}_selected_result"):
-        selected_result = st.session_state[f"{key_prefix}_selected_result"]
-        selected_name = selected_result.split(" (")[0]
-        selected_code = selected_result.split(" (")[-1].replace(")", "")
-        st.session_state[f"{key_prefix}_selected_scheme_code"] = selected_code
-        with st.sidebar.form(f"{key_prefix}_add_details_form"):
-            st.write(f"Selected: **{selected_name}**")
-            mf_date = st.date_input("Date", max_value=datetime.date.today())
-            mf_type = st.selectbox("Type", ["Purchase", "Redemption"])
-            mf_units = st.number_input("Units", min_value=0.001, format="%.4f")
-            mf_nav = st.number_input("NAV (Net Asset Value)", min_value=0.01, format="%.4f")
-            mf_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", value=0.0)
-            if st.form_submit_button("Add Transaction"):
-                if not (mf_units and mf_units > 0 and mf_nav and mf_nav > 0):
-                    st.warning("Please fill all fields.")
+
+    # Read transactions_df at the beginning of the function to avoid UnboundLocalError
+    transactions_df = pd.read_sql("SELECT transaction_id, date, scheme_name, yfinance_symbol, type, units, nav FROM mf_transactions ORDER BY date DESC", DB_CONN)
+
+    view_options = ["Holdings", "Transaction History"]
+    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view", label_visibility="hidden")
+
+    if table_view == "Holdings":
+        st.sidebar.header("Add Transaction")
+        if f"{key_prefix}_all_schemes" not in st.session_state:
+            st.session_state[f"{key_prefix}_all_schemes"] = fetch_mf_schemes()
+            st.session_state[f"{key_prefix}_search_results"] = []
+        with st.sidebar.form(f"{key_prefix}_search_form"):
+            company_name = st.text_input("Search Fund Name", key=f"{key_prefix}_search_term_input")
+            search_button = st.form_submit_button("Search")
+            if search_button:
+                if company_name:
+                    filtered_schemes = {name: code for name, code in st.session_state[f"{key_prefix}_all_schemes"].items() if company_name.lower() in name.lower()}
+                    st.session_state[f"{key_prefix}_search_results"] = [f"{name} ({code})" for name, code in filtered_schemes.items()]
                 else:
-                    amount = mf_units * mf_nav
-                    funds_change_type = "Withdrawal" if mf_type == "Purchase" else "Deposit"
-                    description = f"MF {mf_type}: {selected_name}" + (" (incl. fees)" if mf_type == "Purchase" else " (after fees)")
-                    update_funds_on_transaction(funds_change_type, round(amount + (mf_fee if mf_type == "Purchase" else -mf_fee), 2), description, mf_date.strftime("%Y-%m-%d"))
-                    c.execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                              (str(uuid.uuid4()), mf_date.strftime('%Y-%m-%d'), selected_name, selected_code, mf_type, round(mf_units, 4), round(mf_nav, 4)))
-                    DB_CONN.commit()
-                    st.success(f"{mf_type} of {selected_name} logged!")
-                    st.session_state[f"{key_prefix}_selected_result"] = None
-                    st.rerun()
-    st.divider()
-    transactions_df = pd.read_sql("SELECT * FROM mf_transactions", DB_CONN)
-    if transactions_df.empty:
-        st.info("No mutual fund transactions logged yet. Add one from the sidebar.")
-        return
-    holdings_df = get_mf_holdings_df()
-    if not holdings_df.empty:
-        total_investment = holdings_df['Investment'].sum()
-        total_current_value = holdings_df['Current Value'].sum()
-        total_pnl = holdings_df['P&L'].sum()
-        total_pnl_pct = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Investment", f"₹{total_investment:,.2f}")
-        col2.metric("Current Value", f"₹{total_current_value:,.2f}")
-        col3.metric("Total P&L", f"₹{total_pnl:,.2f}", f"{total_pnl_pct:.2f}%")
+                    st.session_state[f"{key_prefix}_search_results"] = []
+                st.session_state[f"{key_prefix}_selected_scheme_code"] = None
+                st.rerun()
+        if st.session_state.get(f"{key_prefix}_search_results"):
+            selected_result = st.sidebar.selectbox("Select Mutual Fund", options=[None] + st.session_state[f"{key_prefix}_search_results"], index=0, format_func=lambda x: "Select a fund..." if x is None else x)
+            if selected_result and selected_result != st.session_state.get(f"{key_prefix}_selected_result"):
+                st.session_state[f"{key_prefix}_selected_result"] = selected_result
+                st.rerun()
+        if st.session_state.get(f"{key_prefix}_selected_result"):
+            selected_result = st.session_state[f"{key_prefix}_selected_result"]
+            selected_name = selected_result.split(" (")[0]
+            selected_code = selected_result.split(" (")[-1].replace(")", "")
+            st.session_state[f"{key_prefix}_selected_scheme_code"] = selected_code
+            with st.sidebar.form(f"{key_prefix}_add_details_form"):
+                st.write(f"Selected: **{selected_name}**")
+                mf_date = st.date_input("Date", max_value=datetime.date.today())
+                mf_type = st.selectbox("Type", ["Purchase", "Redemption"])
+                mf_units = st.number_input("Units", min_value=0.001, format="%.4f")
+                mf_nav = st.number_input("NAV (Net Asset Value)", min_value=0.01, format="%.4f")
+                mf_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", value=0.0)
+                if st.form_submit_button("Add Transaction"):
+                    if not (mf_units and mf_units > 0 and mf_nav and mf_nav > 0):
+                        st.warning("Please fill all fields.")
+                    else:
+                        amount = mf_units * mf_nav
+                        funds_change_type = "Withdrawal" if mf_type == "Purchase" else "Deposit"
+                        description = f"MF {mf_type}: {selected_name}" + (" (incl. fees)" if mf_type == "Purchase" else " (after fees)")
+                        update_funds_on_transaction(funds_change_type, round(amount + (mf_fee if mf_type == "Purchase" else -mf_fee), 2), description, mf_date.strftime("%Y-%m-%d"))
+                        c.execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                  (str(uuid.uuid4()), mf_date.strftime('%Y-%m-%d'), selected_name, selected_code, mf_type, round(mf_units, 4), round(mf_nav, 4)))
+                        DB_CONN.commit()
+                        st.success(f"{mf_type} of {selected_name} logged!")
+                        st.session_state[f"{key_prefix}_selected_result"] = None
+                        st.rerun()
         st.divider()
-        with st.expander("View Detailed Holdings"):
-            styled_df = holdings_df.drop(columns=['yfinance_symbol']).style.map(color_return_value, subset=['P&L %']).format({
-                "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
-                "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
-            })
-            st.dataframe(styled_df, use_container_width=True, hide_index=True)
-        st.header("Cumulative Return Chart")
-        selected_scheme = st.selectbox("Select Scheme for Chart", options=holdings_df['Scheme'].unique())
-        if selected_scheme:
-            selected_code = holdings_df[holdings_df['Scheme'] == selected_scheme]['yfinance_symbol'].iloc[0]
-            historical_data = get_mf_historical_data(selected_code)
-            scheme_tx_df = transactions_df[transactions_df['scheme_name'] == selected_scheme]
-            cumulative_return_df = _calculate_mf_cumulative_return(scheme_tx_df, historical_data)
-            if not cumulative_return_df.empty:
-                cumulative_return_df['date'] = pd.to_datetime(cumulative_return_df['date'])
-                line_chart = alt.Chart(cumulative_return_df).mark_line().encode(
-                    x=alt.X('date:T', title='Date'),
-                    y=alt.Y('cumulative_return:Q', title='Cumulative Return (%)'),
-                    tooltip=[alt.Tooltip('date', title='Date', format='%Y-%m-%d'), alt.Tooltip('cumulative_return', title='Return %', format=".2f")]
-                ).properties(height=300).interactive()
-                zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
-                st.altair_chart(line_chart + zero_line, use_container_width=True)
+
+        holdings_df = get_mf_holdings_df()
+        if not holdings_df.empty:
+            total_investment = holdings_df['Investment'].sum()
+            total_current_value = holdings_df['Current Value'].sum()
+            total_pnl = holdings_df['P&L'].sum()
+            total_pnl_pct = (total_pnl / total_investment) * 100 if total_investment > 0 else 0
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Investment", f"₹{total_investment:,.2f}")
+            col2.metric("Current Value", f"₹{total_current_value:,.2f}")
+            col3.metric("Total P&L", f"₹{total_pnl:,.2f}", f"{total_pnl_pct:.2f}%")
+            st.divider()
+            with st.expander("View Detailed Holdings"):
+                styled_df = holdings_df.drop(columns=['yfinance_symbol']).style.map(color_return_value, subset=['P&L %']).format({
+                    "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
+                    "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
+                })
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+            st.header("Return Chart")
+
+            all_schemes = transactions_df['scheme_name'].unique().tolist() if not transactions_df.empty else []
+            selected_schemes = st.multiselect("Select schemes to compare", options=all_schemes, default=all_schemes)
+
+            if selected_schemes:
+                filtered_transactions = transactions_df[transactions_df['scheme_name'].isin(selected_schemes)]
+                cumulative_return_df = _calculate_mf_cumulative_return(filtered_transactions)
+
+                if not cumulative_return_df.empty:
+                    cumulative_return_df['date'] = pd.to_datetime(cumulative_return_df['date'])
+
+                    line_chart = alt.Chart(cumulative_return_df).mark_line().encode(
+                        x=alt.X('date:T', title='Date'),
+                        y=alt.Y('cumulative_return:Q', title='Cumulative Return (%)'),
+                        color='scheme_name:N',
+                        tooltip=[
+                            alt.Tooltip('scheme_name', title='Scheme'),
+                            alt.Tooltip('date', title='Date', format='%Y-%m-%d'),
+                            alt.Tooltip('cumulative_return', title='Return %', format=".2f")
+                        ]
+                    ).properties(height=400).interactive()
+
+                    zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                    st.altair_chart(line_chart + zero_line, use_container_width=True)
+                else:
+                    st.info("Not enough data to generate the chart for the selected schemes.")
             else:
-                st.info("Not enough data to generate the chart.")
-    else:
-        st.info("No mutual fund holdings to display.")
+                 st.info("No schemes selected to display the chart.")
+        else:
+            st.info("No mutual fund holdings to display.")
+
+    elif table_view == "Transaction History":
+        if not transactions_df.empty:
+            transactions_df['date'] = pd.to_datetime(transactions_df['date'], format='%Y-%m-%d', errors='coerce')
+            st.subheader("Edit Mutual Fund Transactions")
+            edited_df = st.data_editor(transactions_df, use_container_width=True, hide_index=True, num_rows="dynamic",
+                                       column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
+                                                      "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                      "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
+                                                      "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
+                                                      "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
+                                                      "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
+                                                      "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
+                                                     })
+
+            if st.button("Save Mutual Fund Changes"):
+                c.execute("DELETE FROM mf_transactions")
+                edited_df['date'] = edited_df['date'].astype(str)
+                edited_df.to_sql('mf_transactions', DB_CONN, if_exists='append', index=False)
+                DB_CONN.commit()
+                st.success("Mutual Fund transactions updated successfully!")
+                st.rerun()
+        else:
+            st.info("No mutual fund transactions logged yet.")
 
 
 PAGE_CONFIGS = {
@@ -937,20 +1152,7 @@ def render_asset_page(config):
     c = DB_CONN.cursor()
     key_prefix = config['key_prefix']
     is_trading_section = key_prefix == 'trade'
-    col_title, col_refresh = st.columns([0.8, 0.2])
-    with col_title:
-        st.title(config["title"])
-    with col_refresh:
-        st.write("")
-        st.write("")
-        if st.button("Refresh Live Data", key=f"{key_prefix}_refresh_data"):
-            with st.spinner("Fetching latest prices..."):
-                df_symbols = pd.read_sql(f"SELECT {config['asset_col']} FROM {config['asset_table']}", DB_CONN)
-                all_symbols = df_symbols[config['asset_col']].tolist()
-                for symbol in all_symbols:
-                    update_stock_data(symbol)
-            st.success("Data refreshed!")
-            st.rerun()
+    st.title(config["title"])
 
     st.sidebar.header(f"Add {config['asset_name']}")
     with st.sidebar.form(f"{key_prefix}_add_form"):
@@ -1090,11 +1292,15 @@ def render_asset_page(config):
     view_options = ["Holdings", "Exited Positions"] if not is_trading_section else ["Open Trades", "Closed Trades"]
     table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view", label_visibility="hidden")
     if table_view == view_options[0]:
-        holdings_df = get_holdings_df(config['asset_table'])
+        holdings_df = pd.read_sql(f"SELECT * FROM {config['asset_table']}", DB_CONN)
+
         if not holdings_df.empty:
-            total_invested, total_current = holdings_df['invested_value'].sum(), holdings_df['current_value'].sum()
+            df_to_display = get_holdings_df(config['asset_table'])
+
+            total_invested, total_current = df_to_display['invested_value'].sum(), df_to_display['current_value'].sum()
             total_return_amount = (total_current - total_invested).round(2)
             total_return_percent = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
+
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Total Investment", f"₹{total_invested:,.2f}")
@@ -1102,28 +1308,27 @@ def render_asset_page(config):
                 st.metric("Current Value", f"₹{total_current:,.2f}")
             with col3:
                 st.metric("Total Return", f"₹{total_return_amount:,.2f}", f"{total_return_percent:.2f}%")
-            st.divider()
+
             if not is_trading_section:
                 benchmark_choice = 'Nifty 50'
-                metrics = calculate_portfolio_metrics(holdings_df, pd.DataFrame(), benchmark_choice)
-                col_alpha, col_beta, col_drawdown, col_annual_return = st.columns(4)
+                metrics = calculate_portfolio_metrics(df_to_display, pd.DataFrame(), benchmark_choice)
+                col_alpha, col_beta, col_drawdown = st.columns(3)
                 with col_alpha:
                     st.metric("Alpha", f"{metrics['alpha']}%")
                 with col_beta:
                     st.metric("Beta", f"{metrics['beta']}")
                 with col_drawdown:
                     st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
-                with col_annual_return:
-                    st.metric("Annualized Return", f"{metrics['annualized_return']}%")
-                st.divider()
+
+            st.divider()
             with st.expander("View Detailed Holdings"):
                 column_rename = {
-                    'symbol': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date', 'quantity': 'Quantity',
+                    'symbol': 'Stock Name', 'ticker': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date', 'quantity': 'Quantity',
                     'sector': 'Sector', 'market_cap': 'Market Cap', 'current_price': 'Current Price', 'return_%': 'Return (%)',
                     'return_amount': 'Return (Amount)', 'invested_value': 'Investment Value', 'current_value': 'Current Value',
                     'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
                 }
-                df_to_style = holdings_df.rename(columns=column_rename)
+                df_to_style = df_to_display.rename(columns=column_rename)
                 if not is_trading_section:
                     df_to_style = df_to_style.drop(columns=['Target Price', 'Stop Loss', 'Expected RRR'], errors='ignore')
                 styled_holdings_df = df_to_style.style.map(color_return_value, subset=['Return (%)']).format({
@@ -1134,11 +1339,11 @@ def render_asset_page(config):
                 })
                 st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
             st.header("Return Chart")
-            all_symbols_list = holdings_df["symbol"].tolist()
+            all_symbols_list = df_to_display["symbol"].tolist()
             selected_symbols = st.multiselect("Select assets for return chart", all_symbols_list, default=all_symbols_list, key=f"{key_prefix}_perf_symbols")
             chart_data = []
             for symbol in selected_symbols:
-                asset_info = holdings_df.loc[holdings_df["symbol"] == symbol].iloc[0]
+                asset_info = df_to_display.loc[df_to_display["symbol"] == symbol].iloc[0]
                 history_df = pd.read_sql("SELECT date, close_price FROM price_history WHERE ticker=? AND date>=? ORDER BY date ASC", DB_CONN, params=(symbol, asset_info["buy_date"]))
                 if not history_df.empty:
                     history_df["return_%"] = ((history_df["close_price"] - asset_info["buy_price"]) / asset_info["buy_price"] * 100).round(2)
@@ -1163,13 +1368,12 @@ def render_asset_page(config):
         realized_df = get_realized_df(config['realized_table'])
         if not realized_df.empty:
             if is_trading_section:
-                st.subheader("Key Trading Metrics")
                 trading_metrics = calculate_trading_metrics(realized_df)
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Win Ratio", f"{trading_metrics['win_ratio']}%")
                 col2.metric("Profit Factor", f"{trading_metrics['profit_factor']}")
                 col3.metric("Expectancy", f"₹{trading_metrics['expectancy']}")
-                st.divider()
+            st.divider()
             with st.expander("View Detailed Realized Positions"):
                 df_to_style = realized_df.drop(columns=['transaction_id'], errors='ignore')
                 column_rename = {
@@ -1201,7 +1405,6 @@ def render_asset_page(config):
         else:
             st.info(f"No {view_options[1].lower()} to display.")
 
-    # Conditional display of Performance vs Benchmark chart
     current_holdings = get_holdings_df(config['asset_table'])
     if (table_view == view_options[0] and not current_holdings.empty) or (is_trading_section and table_view == view_options[1] and not get_realized_df(config['realized_table']).empty):
         st.divider()
@@ -1231,26 +1434,10 @@ def render_asset_page(config):
         st.info("No data to compare against a benchmark.")
 
 # --- MAIN APP LOGIC ---
-if "page" not in st.session_state:
-    st.session_state.page = "home"
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
 
-pages = {
-    "home": home_page,
-    "investment": lambda: render_asset_page(PAGE_CONFIGS["investment"]),
-    "trading": lambda: render_asset_page(PAGE_CONFIGS["trading"]),
-    "funds": funds_page,
-    "expense_tracker": expense_tracker_page,
-    "mutual_fund": mutual_fund_page,
-}
-
-pages[st.session_state.page]()
-
-if st.session_state.page != "home":
-    st.button("Back to Home", on_click=set_page, args=("home",))
-if st.sidebar.button("Clear Session State", type="secondary"):
-    current_page = st.session_state.get("page", "home")
-    for key in list(st.session_state.keys()):
-        if key not in ['page', 'mf_all_schemes']:
-            del st.session_state[key]
-    st.session_state.page = current_page
-    st.rerun()
+if st.session_state.logged_in:
+    main_app()
+else:
+    login_page()
