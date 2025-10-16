@@ -108,7 +108,7 @@ def initialize_database(conn):
     c.execute("""CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close_price REAL, PRIMARY KEY (ticker, date))""")
     c.execute("""CREATE TABLE IF NOT EXISTS realized_stocks (transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL, sell_price REAL NOT NULL, sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS exits (transaction_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL, sell_price REAL NOT NULL, sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL, target_price REAL NOT NULL, stop_loss_price REAL NOT NULL)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS fund_transactions (transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL, type TEXT NOT NULL, amount REAL NOT NULL, description TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS fund_transactions (transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL, type TEXT NOT NULL, amount REAL NOT NULL, description TEXT, allocation_type TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS expenses (expense_id TEXT PRIMARY KEY, date TEXT NOT NULL, amount REAL NOT NULL, category TEXT NOT NULL, payment_method TEXT, description TEXT, type TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS budgets (budget_id INTEGER PRIMARY KEY AUTOINCREMENT, month_year TEXT NOT NULL, category TEXT NOT NULL, amount REAL NOT NULL, UNIQUE(month_year, category))""")
     c.execute("""CREATE TABLE IF NOT EXISTS recurring_expenses (recurring_id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL UNIQUE, amount REAL NOT NULL, category TEXT NOT NULL, payment_method TEXT, day_of_month INTEGER NOT NULL)""")
@@ -120,6 +120,7 @@ def initialize_database(conn):
 def _add_missing_columns(conn):
     """Handles database schema migrations by adding missing columns."""
     c = conn.cursor()
+    # Migration 1: Add sector and market_cap to portfolio
     c.execute("PRAGMA table_info(portfolio)")
     columns = [info[1] for info in c.fetchall()]
     if 'sector' not in columns:
@@ -128,6 +129,8 @@ def _add_missing_columns(conn):
     if 'market_cap' not in columns:
         c.execute("ALTER TABLE portfolio ADD COLUMN market_cap TEXT")
         logging.info("Added 'market_cap' column to 'portfolio' table.")
+
+    # Migration 2: Add type to expenses
     c.execute("PRAGMA table_info(expenses)")
     expense_columns = [info[1] for info in c.fetchall()]
     if 'type' not in expense_columns:
@@ -135,15 +138,43 @@ def _add_missing_columns(conn):
         logging.info("Added 'type' column to 'expenses' table.")
         c.execute("UPDATE expenses SET type = 'Expense' WHERE type IS NULL")
         logging.info("Set 'type' to 'Expense' for existing records.")
+
+    # FIX: Add 'allocation_type' to fund_transactions table
+    c.execute("PRAGMA table_info(fund_transactions)")
+    fund_cols = [info[1] for info in c.fetchall()]
+    if 'allocation_type' not in fund_cols:
+        c.execute("ALTER TABLE fund_transactions ADD COLUMN allocation_type TEXT")
+        logging.info("Added 'allocation_type' column to 'fund_transactions' table.")
+        # Attempt to categorize existing withdrawals based on description heuristics
+        c.execute("UPDATE fund_transactions SET allocation_type = 'Investment' WHERE type = 'Withdrawal' AND description LIKE '%Purchase%' AND description NOT LIKE 'ALLOCATION:%'")
+        c.execute("UPDATE fund_transactions SET allocation_type = 'Trading' WHERE type = 'Withdrawal' AND description LIKE '%Trading%' AND description NOT LIKE 'ALLOCATION:%'")
+        c.execute("UPDATE fund_transactions SET allocation_type = 'Mutual Fund' WHERE type = 'Withdrawal' AND description LIKE 'MF %' AND description NOT LIKE 'ALLOCATION:%'")
+        c.execute("UPDATE fund_transactions SET allocation_type = 'Other/Expenses' WHERE type = 'Withdrawal' AND allocation_type IS NULL")
+        c.execute("UPDATE fund_transactions SET allocation_type = 'Deposit' WHERE type = 'Deposit'")
+        conn.commit()
+        logging.info("Attempted to back-fill 'allocation_type' for existing data.")
+
     conn.commit()
 
 DB_CONN = get_db_connection()
 initialize_database(DB_CONN)
 
-def update_funds_on_transaction(transaction_type, amount, description, date):
-    """Inserts a new transaction into the fund_transactions table."""
+def update_funds_on_transaction(transaction_type, amount, description, date, allocation_type=None):
+    """Inserts a new transaction into the fund_transactions table, now writing allocation_type directly."""
+
+    # Clean up description if it contains the old ALLOCATION tag for new entries
+    # NOTE: Since the old logic prepended ALLOCATION: to description, we must strip it for clean display
+    if description and description.startswith("ALLOCATION:"):
+        description = description.split(' - ', 1)[-1].strip()
+
+    # Ensure allocation type is set for Deposits too, for completeness in filtering
+    if allocation_type is None and transaction_type == 'Deposit':
+        allocation_type = 'Deposit'
+
     c = DB_CONN.cursor()
-    c.execute("INSERT INTO fund_transactions (transaction_id, date, type, amount, description) VALUES (?, ?, ?, ?, ?)", (str(uuid.uuid4()), date, transaction_type, amount, description))
+    # The SQL INSERT statement now explicitly includes the allocation_type column
+    c.execute("INSERT INTO fund_transactions (transaction_id, date, type, amount, description, allocation_type) VALUES (?, ?, ?, ?, ?, ?)",
+              (str(uuid.uuid4()), date, transaction_type, amount, description, allocation_type))
     DB_CONN.commit()
 
 # --- API & DATA FUNCTIONS ---
@@ -366,7 +397,8 @@ def _process_mf_sips():
                         nav = fetch_latest_mf_nav(sip['yfinance_symbol'])
                         if nav:
                             units = sip['amount'] / nav
-                            update_funds_on_transaction("Withdrawal", round(sip['amount'], 2), f"MF SIP: {sip['scheme_name']}", sip_date_this_month)
+                            # Pass allocation_type directly
+                            update_funds_on_transaction("Withdrawal", round(sip['amount'], 2), f"MF SIP: {sip['scheme_name']}", sip_date_this_month, allocation_type="Mutual Fund")
                             c.execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (?, ?, ?, ?, ?, ?, ?)",
                                       (str(uuid.uuid4()), sip_date_this_month, sip['scheme_name'], sip['yfinance_symbol'], 'Purchase', round(units, 4), round(nav, 4)))
                             DB_CONN.commit()
@@ -652,6 +684,37 @@ def _calculate_mf_cumulative_return(transactions_df):
 
     return pd.concat(all_schemes_daily_returns)
 
+@st.cache_data(ttl=3600)
+def get_withdrawal_allocation_df(fund_transactions_df):
+    """Analyzes fund withdrawals by reading the dedicated 'allocation_type' column."""
+
+    ALLOCATION_CATEGORIES = ['Investment', 'Trading', 'Mutual Fund', 'Other Expense']
+
+    if fund_transactions_df.empty:
+        # Guarantees a valid DataFrame structure for Altair
+        return pd.DataFrame({'Category': ALLOCATION_CATEGORIES, 'Amount': [0.0]*len(ALLOCATION_CATEGORIES)})
+
+    withdrawals_df = fund_transactions_df[fund_transactions_df['type'] == 'Withdrawal'].copy()
+
+    # 1. Use the dedicated allocation_type column (pre-filled by migration/forms)
+    # Filter out empty allocation types and map to 'Other/Expenses' if necessary.
+    withdrawals_df['Category'] = withdrawals_df['allocation_type'].apply(
+        lambda x: x if pd.notna(x) and x in ALLOCATION_CATEGORIES else 'Other/Expenses'
+    )
+
+    # 2. Group and sum amounts
+    allocation_summary = withdrawals_df.groupby('Category')['amount'].sum().reset_index()
+    allocation_summary.rename(columns={'amount': 'Amount'}, inplace=True)
+
+    # Re-index to ensure the chart structure is complete
+    full_categories_df = pd.DataFrame({'Category': ALLOCATION_CATEGORIES + ['Other/Expenses']})
+
+    final_df = full_categories_df.merge(allocation_summary, on='Category', how='left').fillna(0)
+
+    # Filter out zero-amount entries before returning to Altair, for clarity
+    return final_df[final_df['Amount'] > 0]
+# -----------------------------------------------------------------------------
+
 def main_app():
     """Renders the main dashboard pages."""
     if "page" not in st.session_state:
@@ -758,6 +821,14 @@ def funds_page():
     c = DB_CONN.cursor()
     st.title("💰 Funds Management")
     st.sidebar.header("Add Transaction")
+
+    # ---------------------------------------------
+    # ALLOCATION OPTIONS FOR WITHDRAWAL FORM AND EDITING
+    ALLOCATION_OPTIONS = ["Investment", "Trading", "Mutual Fund", "Other Expense"]
+    # The complete list of values used in the allocation_type column (Deposits use 'Deposit')
+    ALL_ALLOCATION_TYPES = ALLOCATION_OPTIONS + ["Deposit"]
+    # ---------------------------------------------
+
     with st.sidebar.form("deposit_form", clear_on_submit=True):
         st.subheader("Add Deposit")
         deposit_date = st.date_input("Date", max_value=datetime.date.today(), key="deposit_date")
@@ -765,29 +836,59 @@ def funds_page():
         deposit_desc = st.text_input("Description", placeholder="e.g., Salary", value="")
         if st.form_submit_button("Add Deposit"):
             if deposit_amount and deposit_amount > 0:
-                update_funds_on_transaction("Deposit", round(deposit_amount, 2), deposit_desc, deposit_date.strftime("%Y-%m-%d"))
+                # Deposit: Pass allocation type as 'Deposit'
+                update_funds_on_transaction("Deposit", round(deposit_amount, 2), deposit_desc, deposit_date.strftime("%Y-%m-%d"), allocation_type="Deposit")
                 st.success("Deposit recorded!")
                 st.rerun()
             else:
                 st.warning("Deposit amount must be greater than zero.")
+
     with st.sidebar.form("withdrawal_form", clear_on_submit=True):
         st.subheader("Record Withdrawal")
         wd_date = st.date_input("Date", max_value=datetime.date.today(), key="wd_date")
         wd_amount = st.number_input("Amount", min_value=0.01, format="%.2f", key="wd_amount", value=None)
+
+        # FIX: ADD ALLOCATION TYPE SELECTOR
+        wd_allocation = st.selectbox("Allocation Type", options=["Select..."] + ALLOCATION_OPTIONS, index=0)
+
         wd_desc = st.text_input("Description", placeholder="e.g., Personal Use", value="")
+
         if st.form_submit_button("Record Withdrawal"):
-            if wd_amount and wd_amount > 0:
-                update_funds_on_transaction("Withdrawal", round(wd_amount, 2), wd_desc, wd_date.strftime("%Y-%m-%d"))
+            if wd_amount and wd_amount > 0 and wd_allocation != "Select...":
+                # Withdrawal: Pass selected allocation type
+                update_funds_on_transaction("Withdrawal", round(wd_amount, 2), wd_desc, wd_date.strftime("%Y-%m-%d"), allocation_type=wd_allocation)
                 st.success("Withdrawal recorded!")
                 st.rerun()
+            elif wd_allocation == "Select...":
+                st.warning("Please select an Allocation Type.")
             else:
                 st.warning("Withdrawal amount must be greater than zero.")
 
-    fund_df = pd.read_sql("SELECT transaction_id, date, type, amount, description FROM fund_transactions ORDER BY date DESC", DB_CONN)
+    # Sorts by date (newest first), then by transaction_id (NEWEST entry first on the same date)
+    # Changed query to select the new allocation_type column
+    fund_df = pd.read_sql("SELECT transaction_id, date, type, amount, description, allocation_type FROM fund_transactions ORDER BY date DESC, transaction_id DESC", DB_CONN)
+
     if not fund_df.empty:
         fund_df['date'] = pd.to_datetime(fund_df['date'], format='%Y-%m-%d', errors='coerce')
         fund_df['balance'] = fund_df.apply(lambda row: row['amount'] if row['type'] == 'Deposit' else -row['amount'], axis=1)
-        fund_df['cumulative_balance'] = fund_df['balance'].cumsum()
+
+        # NOTE: Cumulative sum still requires strict chronological (oldest to newest) order for calculation.
+        chronological_df = fund_df.copy()
+        # Primary sort by date (ASC), secondary sort by ID (ASC) to ensure correct chronological cumulative sum
+        chronological_df.sort_values(['date', 'transaction_id'], ascending=[True, True], inplace=True)
+
+        # Calculate cumulative balance on the chronologically sorted data
+        chronological_df['cumulative_balance'] = chronological_df['balance'].cumsum()
+
+        # Merge the cumulative balance back onto the display DF using the unique ID
+        fund_df = fund_df.merge(
+            chronological_df[['transaction_id', 'cumulative_balance']],
+            on='transaction_id',
+            how='left'
+        )
+
+        # Final sort for display (newest day first, NEWEST entry first within the day)
+        fund_df.sort_values(['date', 'transaction_id'], ascending=[False, False], inplace=True)
 
         total_deposits, total_withdrawals = fund_df.loc[fund_df['type'] == 'Deposit', 'amount'].sum(), fund_df.loc[fund_df['type'] == 'Withdrawal', 'amount'].sum()
         available_capital = total_deposits - total_withdrawals
@@ -798,10 +899,47 @@ def funds_page():
         col3.metric("Available Capital", f"₹{available_capital:,.2f}")
 
         st.divider()
-        st.subheader("Fund Flow Chart")
 
-        # Create a chart using Altair
-        chart = alt.Chart(fund_df).mark_line().encode(
+        # --- NEW: FUND ALLOCATION CHART (Reading from allocation_type column) ---
+        st.subheader("Capital Deployment Breakdown (Total Withdrawals)")
+        allocation_df = get_withdrawal_allocation_df(fund_df)
+
+        # Check if there is data to display beyond the empty initialization
+        if allocation_df['Amount'].sum() > 0.01:
+
+            # Filter out categories that are zero for the chart display clarity
+            chart_data = allocation_df[allocation_df['Amount'] > 0.01].copy()
+
+            base = alt.Chart(chart_data).encode(
+                theta=alt.Theta("Amount", stack=True)
+            ).properties(height=350)
+
+            pie = base.mark_arc(outerRadius=120).encode(
+                color=alt.Color("Category"),
+                order=alt.Order("Amount", sort="descending"),
+                tooltip=["Category", alt.Tooltip("Amount", format="₹,.2f")]
+            )
+
+            text = base.mark_text(radius=140).encode(
+                text=alt.Text("Category:N"),
+                order=alt.Order("Amount", sort="descending"),
+                color=alt.value("black")
+            ).transform_filter(alt.datum.Amount > chart_data['Amount'].sum() * 0.05) # Filter small slices
+
+            st.altair_chart(pie + text, use_container_width=True)
+
+            with st.expander("Show Withdrawal Allocation Data"):
+                st.dataframe(chart_data, hide_index=True)
+        else:
+            st.info("No substantial withdrawal data available to create allocation breakdown. Please log a withdrawal using the sidebar and select an Allocation Type.")
+
+        st.divider()
+        st.subheader("Cumulative Fund Flow")
+
+
+        # Cumulative Fund Flow Chart
+        chart_df = chronological_df[['date', 'cumulative_balance']].drop_duplicates(subset=['date'], keep='last')
+        chart = alt.Chart(chart_df).mark_line().encode(
             x=alt.X('date', title='Date'),
             y=alt.Y('cumulative_balance', title='Cumulative Balance (₹)'),
             tooltip=['date', 'cumulative_balance']
@@ -812,32 +950,61 @@ def funds_page():
         st.altair_chart(chart, use_container_width=True)
 
         st.subheader("Transaction History")
-        edited_df = st.data_editor(fund_df[['transaction_id', 'date', 'type', 'amount', 'description']], use_container_width=True, hide_index=True, num_rows="dynamic",
-                                   column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
-                                                  "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True)})
+
+        # --- FIX: RE-ENABLE EDITING FOR ALLOCATION_TYPE COLUMN ---
+        edited_df = st.data_editor(
+            fund_df[['transaction_id', 'date', 'type', 'amount', 'description', 'allocation_type']],
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "transaction_id": st.column_config.TextColumn("ID", disabled=True),
+                "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                "type": st.column_config.SelectboxColumn("Type", options=["Deposit", "Withdrawal"], required=True), # Allow type editing
+                # RE-ENABLE EDITING via selectbox for allocation_type
+                "allocation_type": st.column_config.SelectboxColumn(
+                    "Allocation Type",
+                    options=ALL_ALLOCATION_TYPES,
+                    required=True
+                ),
+            }
+        )
+
         if st.button("Save Changes to Transactions"):
+            # 1. Delete all existing records
             c.execute("DELETE FROM fund_transactions")
-            edited_df['date'] = edited_df['date'].astype(str) # Convert back to string for SQLite
+
+            # 2. Prepare the DataFrame for SQL insertion
+            edited_df['date'] = edited_df['date'].astype(str)
+
+            # 3. Insert the full, edited data back into the table
             edited_df.to_sql('fund_transactions', DB_CONN, if_exists='append', index=False)
-            st.success("Funds transactions updated successfully!")
+            DB_CONN.commit()
+
+            st.success("Funds transactions updated successfully! Rerunning to update the chart.")
             st.rerun()
     else:
         st.info("No fund transactions logged yet.")
 
 def expense_tracker_page():
-    """Renders the Expense Tracker page."""
+    """Renders the Expense Tracker page with enhanced category selection and new charts/metrics."""
     st.title("💸 Expense Tracker")
     _process_recurring_expenses()
     c = DB_CONN.cursor()
 
-    # Check if expenses table exists and has data before querying
-    try:
-        expense_categories = pd.read_sql("SELECT DISTINCT category FROM expenses WHERE type='Expense'", DB_CONN)['category'].tolist()
-        CATEGORIES = sorted(list(set(expense_categories + ["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"])))
-    except pd.io.sql.DatabaseError:
-        CATEGORIES = sorted(["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"])
+    # --- 1. Define and Fetch Categories (Using Session State for Persistence) ---
+    if 'expense_categories_list' not in st.session_state:
+        try:
+            expense_categories = pd.read_sql("SELECT DISTINCT category FROM expenses WHERE type='Expense'", DB_CONN)['category'].tolist()
+            default_categories = ["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"]
+            all_categories = list(set([c for c in expense_categories if c and c != 'N/A'] + default_categories))
+            st.session_state.expense_categories_list = sorted(all_categories)
+        except pd.io.sql.DatabaseError:
+            st.session_state.expense_categories_list = sorted(["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"])
 
-    PAYMENT_METHODS = ["UPI", "Credit Card", "Debit Card", "Cash", "Net Banking"]
+    CATEGORIES = st.session_state.expense_categories_list
+
+    PAYMENT_METHODS = ["UPI", "Credit Card", "Debit Card", "Cash", "Net Banking", "N/A"]
 
     view = st.radio("Select View", ["Dashboard", "Transaction History", "Manage Budgets", "Manage Recurring"], horizontal=True, label_visibility="hidden")
 
@@ -847,12 +1014,36 @@ def expense_tracker_page():
         trans_date = st.date_input("Date", max_value=datetime.date.today(), value=datetime.date.today())
         trans_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None)
 
-        final_cat = st.text_input("Category", help="Enter a custom category name")
+        # --- Enhanced Category Selection ---
+        category_options = ['Select Category...'] + CATEGORIES
+
+        selected_category = st.selectbox(
+            "Select Category",
+            options=category_options,
+            index=0,
+            key="selected_cat"
+        )
+
+        custom_category = st.text_input(
+            "Or Enter New Category",
+            help="Enter a custom category name, this will override the selection.",
+            value="",
+            key="custom_cat"
+        )
+
+        # Determine the final category used in the transaction
+        if custom_category:
+            final_cat = custom_category
+        elif selected_category and selected_category != 'Select Category...':
+            final_cat = selected_category
+        else:
+            final_cat = None
+        # ------------------------------------
 
         if trans_type == "Income":
             trans_pm = "N/A"
         else:
-            trans_pm = st.selectbox("Payment Method", options=PAYMENT_METHODS, index=None)
+            trans_pm = st.selectbox("Payment Method", options=[pm for pm in PAYMENT_METHODS if pm != 'N/A'], index=None)
 
         trans_desc = st.text_input("Description", value="")
 
@@ -861,17 +1052,35 @@ def expense_tracker_page():
                 c.execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
                           (str(uuid.uuid4()), trans_date.strftime("%Y-%m-%d"), trans_type, round(trans_amount, 2), final_cat, trans_pm, trans_desc))
                 DB_CONN.commit()
-                st.success(f"{trans_type} added!")
+                st.success(f"{trans_type} added! Category: **{final_cat}**")
+
+                # Add new custom category to session state immediately for future dropdown use
+                if final_cat not in st.session_state.expense_categories_list:
+                    st.session_state.expense_categories_list.append(final_cat)
+                    st.session_state.expense_categories_list.sort()
+
+                # Clear all general data caches to force dashboard charts (which read the DB) to refresh.
+                st.cache_data.clear()
+
+                # Clear input keys and rerun
+                if "selected_cat" in st.session_state: del st.session_state["selected_cat"]
+                if "custom_cat" in st.session_state: del st.session_state["custom_cat"]
                 st.rerun()
             else:
-                st.warning("Please fill all required fields.")
+                st.warning("Please fill all required fields (Amount and Category).")
 
     if view == "Dashboard":
-        month_year = datetime.date.today().strftime("%Y-%m")
-        expenses_df = pd.read_sql(f"SELECT * FROM expenses WHERE date LIKE '{month_year}-%'", DB_CONN)
+        today = datetime.date.today()
+        start_date_7days = today - datetime.timedelta(days=6)
 
-        if expenses_df.empty:
-            st.info("No expenses logged for this month to display the dashboard.")
+        # Fetch all expense data for the current month and last 7 days
+        month_year = today.strftime("%Y-%m")
+        # Reading data directly from DB to ensure it's fresh after cache clear/rerun
+        expenses_df = pd.read_sql(f"SELECT * FROM expenses WHERE date LIKE '{month_year}-%'", DB_CONN)
+        all_time_expenses_df = pd.read_sql("SELECT * FROM expenses", DB_CONN)
+
+        if all_time_expenses_df.empty:
+            st.info("No expenses logged yet to display the dashboard.")
             return
 
         budgets_df = pd.read_sql(f"SELECT category, amount FROM budgets WHERE month_year = '{month_year}'", DB_CONN).set_index('category')
@@ -882,22 +1091,102 @@ def expense_tracker_page():
         total_budget = budgets_df['amount'].sum()
         net_flow = total_income - total_spent
 
+        # --- Metric Calculation and Formatting ---
+
+        # 1. Spent Breakdown (Outflows)
+        spent_breakdown_df = outflows_df.groupby('payment_method')['amount'].sum().reset_index()
+        spent_help_text = "\n".join([f"{row['payment_method']}: ₹{row['amount']:,.2f}" for _, row in spent_breakdown_df.iterrows()])
+
+        # 2. Remaining Breakdown (Net Flow per Payment Method)
+        flow_df = expenses_df.groupby(['type', 'payment_method'])['amount'].sum().unstack(level=0, fill_value=0).fillna(0)
+        flow_df['Remaining'] = flow_df['Income'] - flow_df['Expense']
+
+        # Filter out 'N/A' for payment methods and methods with near zero remaining
+        remaining_breakdown_df = flow_df[(flow_df['Remaining'].abs() > 0.01) & (flow_df.index != 'N/A')].sort_values('payment_method').reset_index()
+
+        # Build remaining help text
+        remaining_help_text = "\n".join([f"{row['payment_method']}: ₹{row['Remaining']:,.2f}" for _, row in remaining_breakdown_df.iterrows()])
+        if not remaining_help_text:
+             remaining_help_text = "All flows balanced, or no categorized transactions."
+
+
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Income", f"₹{total_income:,.2f}")
-        col2.metric("Total Spent this Month", f"₹{total_spent:,.2f}")
-        col3.metric("Net Flow", f"₹{net_flow:,.2f}", delta_color="inverse" if net_flow >= 0 else "normal")
+
+        # UPDATED: Total Spent with hover breakdown
+        col2.metric("Total Spent this Month", f"₹{total_spent:,.2f}",
+                     help=f"**Spent Breakdown (This Month):**\n{spent_help_text}")
+
+        # Remaining Amount metric
+        col3.metric("Remaining Amount", f"₹{net_flow:,.2f}",
+                     delta_color="inverse" if net_flow >= 0 else "normal",
+                     help=f"**Remaining Breakdown (This Month):**\n{remaining_help_text}")
+
         col4.metric("Total Budget for Month", f"₹{total_budget:,.2f}")
         st.divider()
 
-        st.subheader("Category-wise Spending")
+        # --- 1. Daily Bar Chart (Last 7 Days) ---
+        st.subheader("Daily Spending: Last 7 Days")
+
+        # Prepare the 7-day data
+        all_time_expenses_df['date'] = pd.to_datetime(all_time_expenses_df['date'])
+        daily_spending = all_time_expenses_df[
+            (all_time_expenses_df['type'] == 'Expense') &
+            (all_time_expenses_df['date'].dt.date >= start_date_7days)
+        ].groupby(all_time_expenses_df['date'].dt.date)['amount'].sum().reset_index()
+        daily_spending.rename(columns={'date': 'Date', 'amount': 'Spent'}, inplace=True)
+
+        # Create a full 7-day range for display purposes
+        date_range = pd.date_range(start_date_7days, today)
+        daily_df_full = pd.DataFrame({'Date': date_range.date})
+        daily_df_full = daily_df_full.merge(daily_spending, on='Date', how='left').fillna(0)
+        daily_df_full['Spent'] = daily_df_full['Spent'].round(2)
+        daily_df_full['DayLabel'] = daily_df_full['Date'].apply(lambda x: "Today" if x == today else x.strftime('%a'))
+
+        if not daily_df_full.empty:
+            # Sort by date for display order (left to right, past to present)
+            daily_df_full.sort_values('Date', ascending=True, inplace=True)
+
+            bar_chart = alt.Chart(daily_df_full).mark_bar().encode(
+                x=alt.X('DayLabel:N', sort=daily_df_full['DayLabel'].tolist(), title='Day'),
+                y=alt.Y('Spent:Q', title='Amount Spent (₹)'),
+                tooltip=['Date', alt.Tooltip('Spent', format='.2f', title='Total Spent (₹)')],
+                color=alt.condition(
+                    alt.datum.Date == today.strftime('%Y-%m-%d'), # Highlight today
+                    alt.value('orange'),
+                    alt.value('#4c78a8')
+                )
+            ).properties(height=300)
+            st.altair_chart(bar_chart, use_container_width=True)
+        else:
+            st.info("No expense data for the last 7 days.")
+
+        st.divider()
+
+        # --- 2. Pie Chart Labels Update (FIXED) ---
+        st.subheader(f"Category-wise Spending (Current Month: {month_year})")
         spending_by_category = outflows_df.groupby('category')['amount'].sum().reset_index()
+
         if not spending_by_category.empty:
-            pie_chart = alt.Chart(spending_by_category).mark_arc(outerRadius=120).encode(
-                theta=alt.Theta("amount", stack=True),
+            base = alt.Chart(spending_by_category).encode(
+                theta=alt.Theta("amount", stack=True)
+            )
+
+            pie = base.mark_arc(outerRadius=120).encode(
                 color=alt.Color("category"),
-                tooltip=["category", "amount"]
-            ).properties(height=350)
-            st.altair_chart(pie_chart, use_container_width=True)
+                # Tooltip corrected: shows category and amount/percentage on hover
+                tooltip=["category", alt.Tooltip('amount', format='.2f', title='Amount (₹)')],
+                order=alt.Order("amount", sort="descending")
+            )
+
+            # Text layer to show ONLY the category name (as requested)
+            text = base.mark_text(radius=140).encode(
+                text=alt.Text("category:N"), # Display ONLY the category name
+                order=alt.Order("amount", sort="descending"),
+                color=alt.value("black") # Set the color of the labels
+            ).transform_filter(alt.datum.amount > spending_by_category['amount'].sum() * 0.05) # Only show labels for slices > 5%
+
+            st.altair_chart(pie + text, use_container_width=True)
         else:
             st.info("No expenses logged for this month to plot.")
         st.divider()
@@ -931,15 +1220,18 @@ def expense_tracker_page():
 
     elif view == "Transaction History":
         st.header("Transaction History")
-        all_expenses_df = pd.read_sql("SELECT expense_id, date, type, amount, category, payment_method, description FROM expenses ORDER BY date DESC", DB_CONN)
+        # Sorts by date (newest first), then by expense_id (NEWEST entry first on the same date)
+        all_expenses_df = pd.read_sql("SELECT expense_id, date, type, amount, category, payment_method, description FROM expenses ORDER BY date DESC, expense_id DESC", DB_CONN)
         if not all_expenses_df.empty:
             all_expenses_df['date'] = pd.to_datetime(all_expenses_df['date'], format='%Y-%m-%d', errors='coerce')
+
+            # The st.data_editor will display the data in this sorted order
             edited_df = st.data_editor(all_expenses_df, use_container_width=True, hide_index=True, num_rows="dynamic",
-                                       column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
-                                                      "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                      "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
-                                                      "category": st.column_config.TextColumn("Category", required=True),
-                                                      "payment_method": st.column_config.SelectboxColumn("Payment Method", options=PAYMENT_METHODS, required=True)})
+                                         column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
+                                                        "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                        "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
+                                                        "category": st.column_config.TextColumn("Category", required=True),
+                                                        "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS if pm != 'N/A'], required=True)})
 
             if st.button("Save Changes to Transactions"):
                 c.execute("DELETE FROM expenses")
@@ -977,7 +1269,7 @@ def expense_tracker_page():
         edited_recurring = st.data_editor(recurring_df, num_rows="dynamic", use_container_width=True, column_config={
             "recurring_id": st.column_config.NumberColumn(disabled=True),
             "category": st.column_config.TextColumn("Category", required=True),
-            "payment_method": st.column_config.SelectboxColumn("Payment Method", options=PAYMENT_METHODS, required=True),
+            "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS if pm != 'N/A'], required=True),
             "day_of_month": st.column_config.NumberColumn("Day of Month (1-31)", min_value=1, max_value=31, step=1, required=True)
         })
         if st.button("Save Recurring Rules"):
@@ -1041,8 +1333,12 @@ def mutual_fund_page():
                     else:
                         amount = mf_units * mf_nav
                         funds_change_type = "Withdrawal" if mf_type == "Purchase" else "Deposit"
+
+                        # Use allocation_type for Funds page chart
+                        allocation_type = "Mutual Fund" if funds_change_type == "Withdrawal" else "Deposit"
                         description = f"MF {mf_type}: {selected_name}" + (" (incl. fees)" if mf_type == "Purchase" else " (after fees)")
-                        update_funds_on_transaction(funds_change_type, round(amount + (mf_fee if mf_type == "Purchase" else -mf_fee), 2), description, mf_date.strftime("%Y-%m-%d"))
+
+                        update_funds_on_transaction(funds_change_type, round(amount + (mf_fee if mf_type == "Purchase" else -mf_fee), 2), description, mf_date.strftime("%Y-%m-%d"), allocation_type=allocation_type) # Updated
                         c.execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (?, ?, ?, ?, ?, ?, ?)",
                                   (str(uuid.uuid4()), mf_date.strftime('%Y-%m-%d'), selected_name, selected_code, mf_type, round(mf_units, 4), round(mf_nav, 4)))
                         DB_CONN.commit()
@@ -1097,7 +1393,7 @@ def mutual_fund_page():
                 else:
                     st.info("Not enough data to generate the chart for the selected schemes.")
             else:
-                 st.info("No schemes selected to display the chart.")
+                st.info("No schemes selected to display the chart.")
         else:
             st.info("No mutual fund holdings to display.")
 
@@ -1106,14 +1402,14 @@ def mutual_fund_page():
             transactions_df['date'] = pd.to_datetime(transactions_df['date'], format='%Y-%m-%d', errors='coerce')
             st.subheader("Edit Mutual Fund Transactions")
             edited_df = st.data_editor(transactions_df, use_container_width=True, hide_index=True, num_rows="dynamic",
-                                       column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
-                                                      "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                      "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
-                                                      "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
-                                                      "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
-                                                      "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
-                                                      "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
-                                                     })
+                                         column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
+                                                        "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                        "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
+                                                        "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
+                                                        "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
+                                                        "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
+                                                        "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
+                                                         })
 
             if st.button("Save Mutual Fund Changes"):
                 c.execute("DELETE FROM mf_transactions")
@@ -1213,16 +1509,20 @@ def render_asset_page(config):
                         new_avg_price = (old_total_cost + total_cost - transaction_fee) / new_quantity
                         if is_trading_section:
                             c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, target_price=?, stop_loss_price=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, round(target_price, 2), round(stop_loss_price, 2), symbol))
+                            allocation_type = "Trading"
                         else:
                             c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, sector=?, market_cap=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, sector, _categorize_market_cap(market_cap), symbol))
-                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} more units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                            allocation_type = "Investment"
+                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"), allocation_type=allocation_type) # Updated
                         st.success(f"Updated {symbol}. New quantity: {new_quantity}, New avg. price: {currency}{new_avg_price:,.2f}")
                     else:
                         if is_trading_section:
                             c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, round(target_price, 2), round(stop_loss_price, 2)))
+                            allocation_type = "Trading"
                         else:
                             c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, sector, market_cap) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, sector, _categorize_market_cap(market_cap)))
-                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                            allocation_type = "Investment"
+                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"), allocation_type=allocation_type) # Updated
                         st.success(f"{symbol} added successfully!")
                     DB_CONN.commit()
                     st.rerun()
@@ -1267,18 +1567,25 @@ def render_asset_page(config):
                     if is_trading_section:
                         c.execute(f"SELECT buy_price, buy_date, quantity, target_price, stop_loss_price FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
                         buy_price, buy_date, current_qty, target_price, stop_loss_price = c.fetchone()
+                        allocation_type = "Trading"
                     else:
                         c.execute(f"SELECT buy_price, buy_date, quantity FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
                         buy_price, buy_date, current_qty = c.fetchone()
+                        allocation_type = "Investment"
+
                     realized_return = ((sell_price - buy_price) / buy_price * 100)
                     transaction_id = str(uuid.uuid4())
+
                     if is_trading_section:
                         c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct, target_price, stop_loss_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                   (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2), round(target_price, 2), round(stop_loss_price, 2)))
                     else:
                         c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                                   (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2)))
-                    update_funds_on_transaction("Deposit", round((sell_price * sell_qty) - sell_transaction_fee, 2), f"Sale of {sell_qty} units of {symbol_to_sell}", sell_date.strftime("%Y-%m-%d"))
+
+                    # Note: Sales are Deposits to the cash account, allocation type is 'Deposit'
+                    update_funds_on_transaction("Deposit", round((sell_price * sell_qty) - sell_transaction_fee, 2), f"Sale of {sell_qty} units of {symbol_to_sell}", sell_date.strftime("%Y-%m-%d"), allocation_type="Deposit")
+
                     if sell_qty == current_qty:
                         c.execute(f"DELETE FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
                     else:
