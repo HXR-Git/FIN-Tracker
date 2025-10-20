@@ -59,14 +59,15 @@ def login_page():
         else:
             st.error("Invalid username or password.")
 
-# --- INDICATOR FUNCTIONS (Unused but kept for reference) ---
+# --- INDICATOR FUNCTIONS (UNUSED AGAIN) ---
 def rsi(close, period=14):
     """Calculates the Relative Strength Index (RSI)."""
     delta = close.diff(1)
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period, min_periods=1).mean()
-    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    # Use exponential moving average for smoothing (standard practice)
+    avg_gain = gain.ewm(span=period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(span=period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss
     rsi_val = 100 - (100 / (1 + rs))
     return rsi_val
@@ -105,6 +106,7 @@ def initialize_database(conn):
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS portfolio (ticker TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, sector TEXT, market_cap TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS trades (symbol TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, target_price REAL NOT NULL, stop_loss_price REAL NOT NULL)""")
+    # REVERTED: price_history back to storing only close_price
     c.execute("""CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close_price REAL, PRIMARY KEY (ticker, date))""")
     c.execute("""CREATE TABLE IF NOT EXISTS realized_stocks (transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL, sell_price REAL NOT NULL, sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS exits (transaction_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL, sell_price REAL NOT NULL, sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL, target_price REAL NOT NULL, stop_loss_price REAL NOT NULL)""")
@@ -177,6 +179,7 @@ def _migrate_fund_transactions_schema(conn):
 def _add_missing_columns(conn):
     """Handles database schema migrations by adding missing columns."""
     c = conn.cursor()
+
     # Migration 1: Add sector and market_cap to portfolio
     c.execute("PRAGMA table_info(portfolio)")
     columns = [info[1] for info in c.fetchall()]
@@ -204,6 +207,19 @@ def _add_missing_columns(conn):
     # Migration 4: Remove allocation_type from fund_transactions
     _migrate_fund_transactions_schema(conn)
 
+    # REVERTED Migration 5: Check if price_history has ONLY the required columns (close_price)
+    c.execute("PRAGMA table_info(price_history)")
+    price_history_columns = [info[1] for info in c.fetchall()]
+
+    # Simple check to see if it still contains the OHLCV columns that should have been removed
+    # If the table structure is wrong (i.e., too many columns), drop and recreate it simply
+    if len(price_history_columns) != 3 or price_history_columns[2] != 'close_price':
+        logging.warning("Price history schema is incorrect. Recreating table to single column.")
+        c.execute("DROP TABLE IF EXISTS price_history")
+        c.execute("""CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close_price REAL, PRIMARY KEY (ticker, date))""")
+        logging.info("Recreated price_history table with only 'close_price'.")
+        # Note: All existing data needs to be redownloaded.
+
     conn.commit()
 
 DB_CONN = get_db_connection()
@@ -229,7 +245,12 @@ def search_for_ticker(company_name):
     """Searches for a stock ticker using a company name via Finnhub API."""
     try:
         # Assuming st.secrets["api_keys"]["finnhub"] is correctly configured in your environment
-        api_key = st.secrets["api_keys"]["finnhub"]
+        # Fallback to local secrets access
+        api_key = st.secrets.get("api_keys", {}).get("finnhub")
+        if not api_key:
+             logging.warning("Finnhub API key not found in st.secrets.")
+             return []
+
         url = f"https://finnhub.io/api/v1/search?q={company_name}&token={api_key}"
         response = requests.get(url, timeout=10)
         response.raise_for_status()
@@ -246,14 +267,17 @@ def fetch_stock_info(symbol):
     retry_delay = 5
     for attempt in range(max_retries):
         try:
-            ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol else symbol
+            ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol and not symbol.endswith('.NS') else symbol
             ticker_obj = yf.Ticker(ticker_str)
             info = ticker_obj.info
             price = info.get('currentPrice') or info.get('regularMarketPrice')
+
             if price is None:
+                # Fallback to fetching latest closing price from historical data
                 data = ticker_obj.history(period='1d', auto_adjust=True)
                 if not data.empty:
                     price = data['Close'].iloc[-1]
+
             if price:
                 price = round(price, 2)
 
@@ -261,6 +285,13 @@ def fetch_stock_info(symbol):
             market_cap = info.get('marketCap', 'N/A')
             if sector == 'N/A' and ('fundFamily' in info or 'category' in info):
                 sector = info.get('fundFamily') or info.get('category')
+
+            # Use data from the latest download if price from info failed, just for robustness
+            if price is None:
+                latest_db_price = pd.read_sql("SELECT close_price FROM price_history WHERE ticker = ? ORDER BY date DESC LIMIT 1", DB_CONN, params=(symbol,))
+                if not latest_db_price.empty:
+                    price = latest_db_price['close_price'].iloc[0]
+
             return {'price': price, 'sector': sector, 'market_cap': market_cap}
         except Exception as e:
             logging.warning(f"Attempt {attempt + 1}/{max_retries} to fetch info for {symbol} failed: {e}")
@@ -313,24 +344,35 @@ def get_mf_historical_data(scheme_code):
         return pd.DataFrame()
 
 def update_stock_data(symbol):
-    """Downloads and saves historical stock data to the database."""
+    """Downloads and saves historical stock data (Close Price only) to the database."""
     try:
-        ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol else symbol
+        ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol and not symbol.endswith('.NS') else symbol
         today = datetime.date.today()
+        # Fetch only what's necessary (Close)
         data = yf.download(ticker_str, start="2020-01-01", end=today + datetime.timedelta(days=1), progress=False, auto_adjust=True)
-        if data.empty:
+
+        if data.empty or 'Close' not in data.columns:
+            logging.warning(f"YFinance returned empty or invalid data for {symbol}.")
             return False
+
         data.reset_index(inplace=True)
         data = data[["Date", "Close"]].rename(columns={"Date": "date_col", "Close": "close_price"})
+
         data["ticker"] = symbol
         data["date"] = data["date_col"].dt.strftime("%Y-%m-%d")
+
         c = DB_CONN.cursor()
-        c.executemany("INSERT OR REPLACE INTO price_history (ticker, date, close_price) VALUES (?, ?, ?)", data[["ticker", "date", "close_price"]].to_records(index=False))
+        # Insert only ticker, date, and close_price
+        c.executemany(
+            "INSERT OR REPLACE INTO price_history (ticker, date, close_price) VALUES (?, ?, ?)",
+            data[["ticker", "date", "close_price"]].to_records(index=False)
+        )
         DB_CONN.commit()
         return True
     except Exception as e:
         logging.error(f"YFinance update_stock_data failed for {symbol}: {e}")
         return False
+
 
 def get_holdings_df(table_name):
     """Fetches and calculates current portfolio/trade holdings from the database."""
@@ -480,6 +522,8 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
 
     # 1. Calculate Portfolio Returns (Required for all benchmarks)
     all_tickers = holdings_df['symbol'].unique().tolist()
+
+    # Query all prices, not just close price, in case it's needed later. But for portfolio return, close is enough.
     price_data_query = f"""SELECT date, ticker, close_price FROM price_history WHERE ticker IN ({','.join(['?']*len(all_tickers))}) AND date >= ?"""
     all_prices = pd.read_sql(price_data_query, DB_CONN, params=[*all_tickers, start_date])
     all_prices['date'] = pd.to_datetime(all_prices['date'])
@@ -723,8 +767,6 @@ def get_current_portfolio_allocation():
 
     return final_df.sort_values('Amount', ascending=False)
 # -------------------------------------------------------------------------
-
-# REMOVED: get_total_wealth_allocation function completely as requested
 
 def _calculate_mf_cumulative_return(transactions_df):
     """Calculates the cumulative return of a mutual fund portfolio over time."""
@@ -1842,6 +1884,8 @@ def render_asset_page(config):
                     'Expected RRR': '{:.2f}'
                 })
                 st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
+
+            # --- START RESTORED CHART ---
             st.header("Return Chart")
             all_symbols_list = df_to_display["symbol"].tolist()
             selected_symbols = st.multiselect("Select assets for return chart", all_symbols_list, default=all_symbols_list, key=f"{key_prefix}_perf_symbols")
@@ -1866,8 +1910,11 @@ def render_asset_page(config):
                 st.altair_chart(chart + zero_line, use_container_width=True)
             else:
                 st.info("No data to display for selected assets.")
+            # --- END RESTORED CHART ---
+
         else:
             st.info(f"No {view_options[0].lower()} to display. Add a {config['asset_name'].lower()} from the sidebar.")
+
     elif table_view == view_options[1]:
         realized_df = get_realized_df(config['realized_table'])
         if not realized_df.empty:
