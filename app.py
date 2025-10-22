@@ -656,18 +656,44 @@ def set_page(page):
     """Sets the current page in session state."""
     st.session_state.page = page
 
+# --- REVISED get_combined_returns to exclude Paper Trading ---
 def get_combined_returns():
-    """Calculates and returns combined returns for all asset types."""
+    """
+    Calculates and returns combined returns for all asset types,
+    EXCLUDING data from paper trading (trades not linked to fund withdrawals).
+    """
+    # --- 1. Identify Live Trade Symbols (linked to fund transactions) ---
+    c = DB_CONN.cursor()
+    # Find all symbols linked to a 'Purchase' withdrawal in the funds log
+    live_trade_symbols_query = """
+    SELECT DISTINCT SUBSTR(description, INSTR(description, ' of ') + 4)
+    FROM fund_transactions
+    WHERE type = 'Withdrawal' AND description LIKE 'Purchase % of %'
+    """
+    live_trades_df = pd.read_sql(live_trade_symbols_query, DB_CONN)
+    live_trade_symbols = set(live_trades_df.iloc[:, 0].tolist())
+
+    # --- 2. Investment Portfolio (Always considered 'live') ---
     inv_df = get_holdings_df("portfolio")
     inv_invested = inv_df['invested_value'].sum() if not inv_df.empty else 0
     inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
+
+    # --- 3. Trading Book (Filter for 'live' only) ---
     trade_df = get_holdings_df("trades")
-    trade_invested = trade_df['invested_value'].sum() if not trade_df.empty else 0
-    trade_current = trade_df['current_value'].sum() if not trade_df.empty else 0
+    if not trade_df.empty:
+        live_trade_df = trade_df[trade_df['symbol'].isin(live_trade_symbols)]
+    else:
+        live_trade_df = pd.DataFrame()
+
+    trade_invested = live_trade_df['invested_value'].sum() if not live_trade_df.empty else 0
+    trade_current = live_trade_df['current_value'].sum() if not live_trade_df.empty else 0
+
+    # --- 4. Mutual Funds (Always considered 'live' due to SIP/manual withdrawal link) ---
     mf_df = get_mf_holdings_df()
     mf_invested = mf_df['Investment'].sum() if not mf_df.empty else 0
     mf_current = mf_df['Current Value'].sum() if not mf_df.empty else 0
 
+    # --- 5. Calculate Returns for Display ---
     inv_return_amount = round(float(inv_current - inv_invested), 2)
     inv_return_pct = round(float(inv_return_amount / inv_invested * 100), 2) if inv_invested > 0 else 0
 
@@ -682,12 +708,18 @@ def get_combined_returns():
     total_return_amount = round(float(total_current - total_invested), 2)
     total_return_pct = round(float(total_return_amount / total_invested * 100), 2) if total_invested > 0 else 0
 
-    # Corrected method to calculate realized amounts
+    # --- 6. Calculate Realized P&L (Filter 'exits' table for live trades only) ---
     realized_stocks_df = get_realized_df("realized_stocks")
     realized_exits_df = get_realized_df("exits")
 
+    # Filter realized exits using the same live symbols
+    if not realized_exits_df.empty:
+        live_exits_df = realized_exits_df[realized_exits_df['symbol'].isin(live_trade_symbols)]
+    else:
+        live_exits_df = pd.DataFrame()
+
     realized_inv = realized_stocks_df['realized_profit_loss'].sum() if not realized_stocks_df.empty else 0
-    realized_trade = realized_exits_df['realized_profit_loss'].sum() if not realized_exits_df.empty else 0
+    realized_trade = live_exits_df['realized_profit_loss'].sum() if not live_exits_df.empty else 0
     realized_mf = 0  # No realized MF table, so it remains 0
 
     return {
@@ -705,6 +737,7 @@ def get_combined_returns():
         "realized_trade": round(float(realized_trade), 2),
         "realized_mf": round(float(realized_mf), 2)
     }
+# --- END REVISED get_combined_returns ---
 
 def get_mf_holdings_df():
     """Calculates current mutual fund holdings from transaction data."""
@@ -743,6 +776,8 @@ def get_current_portfolio_allocation():
     of Investment, Trading, and Mutual Fund holdings.
     """
     # 1. Fetch current values for each asset class
+    # NOTE: Using unfiltered data for full portfolio picture here.
+
     inv_df = get_holdings_df("portfolio")
     inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
 
@@ -770,10 +805,12 @@ def get_current_portfolio_allocation():
 
 def _calculate_mf_cumulative_return(transactions_df):
     """Calculates the cumulative return of a mutual fund portfolio over time."""
+    # We still need sip_marker_data to prevent breaking the function call, even if we don't use it.
     if transactions_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     all_schemes_daily_returns = []
+    sip_marker_data = [] # Retained for function compatibility, but markers won't be plotted.
     unique_schemes = transactions_df['scheme_name'].unique()
 
     for scheme_name in unique_schemes:
@@ -784,6 +821,7 @@ def _calculate_mf_cumulative_return(transactions_df):
         scheme_code = scheme_tx_df['yfinance_symbol'].iloc[0]
         historical_data = get_mf_historical_data(scheme_code)
 
+        # Skip if no historical data is available
         if historical_data.empty:
             continue
 
@@ -804,9 +842,24 @@ def _calculate_mf_cumulative_return(transactions_df):
                     if tx_row['type'] == 'Purchase':
                         units += tx_row['units']
                         invested_amount += (tx_row['units'] * tx_row['nav'])
+                        # Keep marker data creation but it won't be used for plotting
+                        sip_marker_data.append({
+                            'date': date,
+                            'scheme_name': scheme_name,
+                            'type': 'Purchase',
+                            'amount': round(tx_row['units'] * tx_row['nav'], 2)
+                        })
+
                     elif tx_row['type'] == 'Redemption':
                         units -= tx_row['units']
                         invested_amount -= (tx_row['units'] * tx_row['nav'])
+                        sip_marker_data.append({
+                            'date': date,
+                            'scheme_name': scheme_name,
+                            'type': 'Redemption',
+                            'amount': round(tx_row['units'] * tx_row['nav'], 2)
+                        })
+
 
                 current_value = units * nav if units > 0 else 0
 
@@ -824,9 +877,9 @@ def _calculate_mf_cumulative_return(transactions_df):
         all_schemes_daily_returns.append(pd.DataFrame(daily_records))
 
     if not all_schemes_daily_returns:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
-    return pd.concat(all_schemes_daily_returns)
+    return pd.concat(all_schemes_daily_returns), pd.DataFrame(sip_marker_data)
 
 
 def home_page():
@@ -835,20 +888,22 @@ def home_page():
     _update_existing_portfolio_info()
     returns_data = get_combined_returns()
 
+    st.subheader("Live Portfolio Overview (Excluding Paper Trades)")
+
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric(
-            label="Total Investment Value",
+            label="Total Live Investment Value",
             value=f"₹{returns_data['total_invested_value']:,.2f}",
         )
     with col2:
         st.metric(
-            label="Total Current Value",
+            label="Total Live Current Value",
             value=f"₹{returns_data['total_current_value']:,.2f}",
         )
     with col3:
         st.metric(
-            label="Total Portfolio Return",
+            label="Total Live Portfolio Return",
             value=f"₹{returns_data['total_return_amount']:,.2f}",
             delta=f"{returns_data['total_return_pct']:.2f}%"
         )
@@ -866,7 +921,7 @@ def home_page():
             label="Trading Return",
             value=f"₹{returns_data['trade_return_amount']:,.2f}",
             delta=f"{returns_data['trade_return_pct']:.2f}%",
-            help=f"Realized P&L: ₹{returns_data['realized_trade']:,.2f}"
+            help=f"Realized P&L (Live): ₹{returns_data['realized_trade']:,.2f}"
         )
     with col6:
         st.metric(
@@ -974,10 +1029,6 @@ def funds_page():
         col3.metric("Available Capital (Cash)", f"₹{available_capital:,.2f}")
 
         st.divider()
-
-        # --- REMOVED: TOTAL WEALTH ALLOCATION CHART/LOGIC ---
-        # No chart or table here now.
-        # ---------------------------------------------------
 
         st.subheader("Cumulative Fund Flow")
 
@@ -1445,11 +1496,11 @@ def expense_tracker_page():
             # The st.data_editor will display the data in this sorted order
             edited_df = st.data_editor(all_expenses_df, use_container_width=True, hide_index=True, num_rows="dynamic",
                                              column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
-                                                            "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                            "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
-                                                            # Use a selectbox for categories allowing user input of new ones
-                                                            "category": st.column_config.SelectboxColumn("Category", options=editable_categories, required=True),
-                                                            "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS], required=True)})
+                                                             "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                             "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
+                                                             # Use a selectbox for categories allowing user input of new ones
+                                                             "category": st.column_config.SelectboxColumn("Category", options=editable_categories, required=True),
+                                                             "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS], required=True)})
 
             # Manually convert 'date' column back to string for SQLite insertion
             edited_df['date'] = edited_df['date'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, datetime.date) else x)
@@ -1610,10 +1661,12 @@ def mutual_fund_page():
 
             if selected_schemes:
                 filtered_transactions = transactions_df[transactions_df['scheme_name'].isin(selected_schemes)]
-                cumulative_return_df = _calculate_mf_cumulative_return(filtered_transactions)
+                cumulative_return_df, sip_marker_df = _calculate_mf_cumulative_return(filtered_transactions)
 
                 if not cumulative_return_df.empty:
                     cumulative_return_df['date'] = pd.to_datetime(cumulative_return_df['date'])
+
+                    # The marker logic is intentionally skipped as per user request.
 
                     line_chart = alt.Chart(cumulative_return_df).mark_line().encode(
                         x=alt.X('date:T', title='Date'),
@@ -1627,6 +1680,8 @@ def mutual_fund_page():
                     ).properties(height=400).interactive()
 
                     zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+
+                    # Layer and display the charts (Only line_chart + zero_line)
                     st.altair_chart(line_chart + zero_line, use_container_width=True)
                 else:
                     st.info("Not enough data to generate the chart for the selected schemes.")
@@ -1641,13 +1696,13 @@ def mutual_fund_page():
             st.subheader("Edit Mutual Fund Transactions")
             edited_df = st.data_editor(transactions_df, use_container_width=True, hide_index=True, num_rows="dynamic",
                                              column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
-                                                            "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                            "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
-                                                            "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
-                                                            "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
-                                                            "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
-                                                            "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
-                                                                })
+                                                             "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                             "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
+                                                             "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
+                                                             "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
+                                                             "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
+                                                             "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
+                                                                 })
 
             if st.button("Save Mutual Fund Changes"):
                 c.execute("DELETE FROM mf_transactions")
@@ -1686,6 +1741,34 @@ def render_asset_page(config):
     key_prefix = config['key_prefix']
     is_trading_section = key_prefix == 'trade'
     st.title(config["title"])
+
+    # --- FIX: Initialize trade_mode_selection to prevent UnboundLocalError ---
+    trade_mode_selection = ""
+    # -----------------------------------------------------------------------
+
+    is_paper_trading = False
+    if is_trading_section:
+        # --- 1. Paper Trading Toggle (Controls Fund Linkage) ---
+        if f"{key_prefix}_paper_trading_state" not in st.session_state:
+            st.session_state[f"{key_prefix}_paper_trading_state"] = False
+        is_paper_trading = st.toggle("Enable Paper Trading (Transactions won't affect Funds)",
+                                     key=f"{key_prefix}_paper_trading_toggle",
+                                     value=st.session_state[f"{key_prefix}_paper_trading_state"])
+        st.session_state[f"{key_prefix}_paper_trading_state"] = is_paper_trading
+        if is_paper_trading:
+            st.warning("⚠️ **Paper Trading is active.** Buy/Sell transactions will **NOT** update your 'Funds' section.")
+        st.divider()
+
+        # --- 2. Live/Paper Filter Dropdown (Controls View Data) ---
+        trade_mode_selection = st.radio(
+            "Filter Trade Data",
+            ["All Trades", "Live Trades Only", "Paper Trades Only"],
+            horizontal=True,
+            key=f"{key_prefix}_trade_mode_filter"
+        )
+        st.divider()
+
+    # --- Sidebar forms for Add/Sell remain the same ---
 
     st.sidebar.header(f"Add {config['asset_name']}")
     with st.sidebar.form(f"{key_prefix}_add_form"):
@@ -1749,8 +1832,10 @@ def render_asset_page(config):
                         else:
                             c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, sector=?, market_cap=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, sector, _categorize_market_cap(market_cap), symbol))
 
-                        # Removed allocation_type from function call
-                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        # --- UPDATED: Conditional Fund Update ---
+                        if not is_trading_section or (is_trading_section and not is_paper_trading):
+                            update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        # --------------------------------------
 
                         st.success(f"Updated {symbol}. New quantity: {new_quantity}, New avg. price: {currency}{new_avg_price:,.2f}")
                     else:
@@ -1759,8 +1844,10 @@ def render_asset_page(config):
                         else:
                             c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, sector, market_cap) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, sector, _categorize_market_cap(market_cap)))
 
-                        # Removed allocation_type from function call
-                        update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        # --- UPDATED: Conditional Fund Update ---
+                        if not is_trading_section or (is_trading_section and not is_paper_trading):
+                            update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
+                        # --------------------------------------
 
                         st.success(f"{symbol} added successfully!")
                     DB_CONN.commit()
@@ -1822,8 +1909,10 @@ def render_asset_page(config):
                         c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                                   (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2)))
 
-                    # Removed allocation_type from function call
-                    update_funds_on_transaction("Deposit", round((sell_price * sell_qty) - sell_transaction_fee, 2), f"Sale of {sell_qty} units of {symbol_to_sell}", sell_date.strftime("%Y-%m-%d"))
+                    # --- UPDATED: Conditional Fund Update ---
+                    if not is_trading_section or (is_trading_section and not is_paper_trading):
+                        update_funds_on_transaction("Deposit", round((sell_price * sell_qty) - sell_transaction_fee, 2), f"Sale of {sell_qty} units of {symbol_to_sell}", sell_date.strftime("%Y-%m-%d"))
+                    # --------------------------------------
 
                     if sell_qty == current_qty:
                         c.execute(f"DELETE FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
@@ -1835,39 +1924,65 @@ def render_asset_page(config):
     else:
         st.sidebar.info(f"No open {config['asset_name_plural'].lower()}.")
 
-    view_options = ["Holdings", "Exited Positions"] if not is_trading_section else ["Open Trades", "Closed Trades"]
-    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view", label_visibility="hidden")
-    if table_view == view_options[0]:
-        holdings_df = pd.read_sql(f"SELECT * FROM {config['asset_table']}", DB_CONN)
+    # --- MAIN VIEW LOGIC ---
+    view_options = ["Open Trades", "Closed Trades"] # Simplified for Trading view
 
+    # Fetch Data
+    full_holdings_df = get_holdings_df(config['asset_table'])
+    full_realized_df = get_realized_df(config['realized_table']) # Fetch realized data
+
+    # Identify Live Trade Symbols (re-run logic from get_combined_returns for filtering)
+    live_trade_symbols = set()
+    if is_trading_section:
+        fund_tx = pd.read_sql("SELECT description FROM fund_transactions WHERE type='Withdrawal'", DB_CONN)
+        for desc in fund_tx['description']:
+            if desc.startswith("Purchase"):
+                parts = desc.split(' of ')
+                if len(parts) > 1:
+                    live_trade_symbols.add(parts[-1].strip())
+
+    # Apply Mode Filter
+    holdings_df = full_holdings_df.copy()
+    realized_df = full_realized_df.copy()
+
+    if is_trading_section:
+        if trade_mode_selection == "Live Trades Only":
+            holdings_df = holdings_df[holdings_df[config['asset_col']].isin(live_trade_symbols)]
+            realized_df = realized_df[realized_df[config['asset_col']].isin(live_trade_symbols)]
+        elif trade_mode_selection == "Paper Trades Only":
+            holdings_df = holdings_df[~holdings_df[config['asset_col']].isin(live_trade_symbols)]
+            realized_df = realized_df[~realized_df[config['asset_col']].isin(live_trade_symbols)]
+
+    # --- Render Open/Closed Trades ---
+    # The subheader uses the initialized variable and avoids the UnboundLocalError
+    st.subheader(f"{config['title']} - {trade_mode_selection if is_trading_section and trade_mode_selection else config['title']}")
+    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view_secondary", label_visibility="collapsed") # Re-use the existing selector
+
+    if table_view == view_options[0]:
+        # OPEN TRADES (HOLDINGS)
         if not holdings_df.empty:
-            df_to_display = get_holdings_df(config['asset_table'])
+            df_to_display = holdings_df.copy() # Use the already filtered data
 
             total_invested, total_current = df_to_display['invested_value'].sum(), df_to_display['current_value'].sum()
             total_return_amount = (total_current - total_invested).round(2)
             total_return_percent = (total_return_amount / total_invested * 100).round(2) if total_invested > 0 else 0
 
             col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Investment", f"₹{total_invested:,.2f}")
-            with col2:
-                st.metric("Current Value", f"₹{total_current:,.2f}")
-            with col3:
-                st.metric("Total Return", f"₹{total_return_amount:,.2f}", f"{total_return_percent:.2f}%")
+            with col1: st.metric("Total Investment", f"₹{total_invested:,.2f}")
+            with col2: st.metric("Current Value", f"₹{total_current:,.2f}")
+            with col3: st.metric("Total Return", f"₹{total_return_amount:,.2f}", f"{total_return_percent:.2f}%")
 
             if not is_trading_section:
-                benchmark_choice = 'Nifty 50'
-                metrics = calculate_portfolio_metrics(df_to_display, pd.DataFrame(), benchmark_choice)
-                col_alpha, col_beta, col_drawdown = st.columns(3)
-                with col_alpha:
-                    st.metric("Alpha", f"{metrics['alpha']}%")
-                with col_beta:
-                    st.metric("Beta", f"{metrics['beta']}")
-                with col_drawdown:
-                    st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
+                 # ... Alpha/Beta metrics display (Investment section only) ...
+                 benchmark_choice = 'Nifty 50'
+                 metrics = calculate_portfolio_metrics(df_to_display, pd.DataFrame(), benchmark_choice)
+                 col_alpha, col_beta, col_drawdown = st.columns(3)
+                 with col_alpha: st.metric("Alpha", f"{metrics['alpha']}%")
+                 with col_beta: st.metric("Beta", f"{metrics['beta']}")
+                 with col_drawdown: st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
 
             st.divider()
-            with st.expander("View Detailed Holdings"):
+            with st.expander(f"View Detailed {view_options[0]}"):
                 column_rename = {
                     'symbol': 'Stock Name', 'ticker': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date', 'quantity': 'Quantity',
                     'sector': 'Sector', 'market_cap': 'Market Cap', 'current_price': 'Current Price', 'return_%': 'Return (%)',
@@ -1885,7 +2000,6 @@ def render_asset_page(config):
                 })
                 st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
 
-            # --- START RESTORED CHART ---
             st.header("Return Chart")
             all_symbols_list = df_to_display["symbol"].tolist()
             selected_symbols = st.multiselect("Select assets for return chart", all_symbols_list, default=all_symbols_list, key=f"{key_prefix}_perf_symbols")
@@ -1910,13 +2024,11 @@ def render_asset_page(config):
                 st.altair_chart(chart + zero_line, use_container_width=True)
             else:
                 st.info("No data to display for selected assets.")
-            # --- END RESTORED CHART ---
-
         else:
-            st.info(f"No {view_options[0].lower()} to display. Add a {config['asset_name'].lower()} from the sidebar.")
+            st.info(f"No {trade_mode_selection.lower()} in {view_options[0].lower()} to display.")
 
     elif table_view == view_options[1]:
-        realized_df = get_realized_df(config['realized_table'])
+        # CLOSED TRADES (REALIZED)
         if not realized_df.empty:
             if is_trading_section:
                 trading_metrics = calculate_trading_metrics(realized_df)
@@ -1925,7 +2037,7 @@ def render_asset_page(config):
                 col2.metric("Profit Factor", f"{trading_metrics['profit_factor']}")
                 col3.metric("Expectancy", f"₹{trading_metrics['expectancy']}")
             st.divider()
-            with st.expander("View Detailed Realized Positions"):
+            with st.expander(f"View Detailed {view_options[1]}"):
                 df_to_style = realized_df.drop(columns=['transaction_id'], errors='ignore')
                 column_rename = {
                     'ticker': 'Stock Name', 'symbol': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date',
@@ -1954,9 +2066,9 @@ def render_asset_page(config):
             )
             st.altair_chart(bars, use_container_width=True)
         else:
-            st.info(f"No {view_options[1].lower()} to display.")
+            st.info(f"No {trade_mode_selection.lower()} in {view_options[1].lower()} to display.")
 
-    current_holdings = get_holdings_df(config['asset_table'])
+    current_holdings = holdings_df # Use the potentially filtered holdings for benchmark
 
     # Check if there is data to compare against a benchmark
     has_holdings_for_comparison = not current_holdings.empty and table_view == view_options[0]
