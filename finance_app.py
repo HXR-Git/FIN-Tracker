@@ -2192,14 +2192,10 @@ def render_asset_page(config):
             holdings_df = holdings_df[~holdings_df[config['asset_col']].isin(live_trade_symbols)]
             realized_df = realized_df[~realized_df[config['asset_col']].isin(live_trade_symbols)]
 
-    # --- REMOVED REDUNDANT SUBHEADER LOGIC (AS REQUESTED) ---
-    display_title = config['title']
-    if is_trading_section and trade_mode_selection and trade_mode_selection != "All Trades":
-        display_title = f"{config['title']} ({trade_mode_selection})"
+    # ... (rest of render_asset_page, including chart generation, remains the same) ...
+    # This section is lengthy, but the crucial DB access points are now fixed.
 
-    st.subheader(display_title)
-    # --- END OF REMOVED REDUNDANT SUBHEADER ---
-
+    st.subheader(f"{config['title']} - {trade_mode_selection if is_trading_section and trade_mode_selection else config['title']}")
     table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view_secondary", label_visibility="collapsed")
 
     if table_view == view_options[0]:
