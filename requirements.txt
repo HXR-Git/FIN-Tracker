@@ -8,5 +8,3 @@ mftool
 deprecated
 streamlit-connectors
 psycopg2-binary
-streamlit-connectors
-sqlalchemy
