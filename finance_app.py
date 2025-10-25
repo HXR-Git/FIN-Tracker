@@ -1,7 +1,7 @@
 import streamlit as st
 import yfinance as yf
 # REMOVED: import sqlite3
-from sqlalchemy import text, event # <-- ADDED 'event' here
+from sqlalchemy import text, event, create_engine # <-- ADDED 'create_engine' and 'event'
 from sqlalchemy.exc import IntegrityError
 import pandas as pd
 import datetime
@@ -90,43 +90,81 @@ def bollinger(close, period=20, std_dev=2):
     lower_band = rolling_mean - (rolling_std * std_dev)
     return upper_band, rolling_mean, lower_band
 
-# --- DATABASE SETUP (PostgreSQL/Supabase Conversion) ---
+# --- DATABASE SETUP (Manual Engine Creation - CRITICAL FIX) ---
+
+# Global variable to hold the engine instance
+GLOBAL_DB_ENGINE = None
+
+# Define the listener function to bypass version check
+def connect_listener(dbapi_connection, connection_record):
+    """Forces the PostgreSQL version to one SQLAlchemy accepts (e.g., 14.0)."""
+    # This function runs right after the connection is established via psycopg2
+    connection_record.info["server_version_info"] = (14, 0, 0)
+
+# Mock class for session context manager
+class MockSession:
+    def __init__(self, engine):
+        self.engine = engine
+
+    def __enter__(self):
+        self.connection = self.engine.connect()
+        self.transaction = self.connection.begin()
+        return self.connection
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.transaction.commit()
+        else:
+            self.transaction.rollback()
+        self.connection.close()
+
+# Mock class to replace st.connection object (only exposing engine and session)
+class MockConnection:
+    def __init__(self, engine):
+        self.engine = engine
+        self._session_maker = lambda: MockSession(engine)
+
+    @property
+    def session(self):
+        return self._session_maker()
+
+
 @st.cache_resource
 def get_db_connection():
-    """Establishes and caches the PostgreSQL database connection."""
+    """Manually creates and caches the SQLAlchemy Engine, forcing the version bypass."""
+    global GLOBAL_DB_ENGINE
 
-    # Define a listener function to trick SQLAlchemy into accepting the CockroachDB version
-    def connect_listener(dbapi_connection, connection_record):
-        """Forces the PostgreSQL version to one SQLAlchemy accepts (e.g., 14.0)."""
-        # This function runs right after the connection is established via psycopg2
-        # We inject the fake version info into the connection object's info cache
-        connection_record.info["server_version_info"] = (14, 0, 0)
+    if GLOBAL_DB_ENGINE is not None:
+        return GLOBAL_DB_ENGINE
 
     try:
         # 1. Fetch the URL from secrets
+        # st.secrets("connections") will automatically look for the [connections.finance_db] table in secrets
         url = st.secrets.get("connections", {}).get("finance_db", {}).get("url")
 
-        # 2. Force the PostgreSQL driver explicitly (Using the working psycopg2 driver)
+        # 2. Force the PostgreSQL driver explicitly (Fix for version parsing issue)
         # This replaces the prefix and forces SQLAlchemy to use the reliable psycopg2 driver.
         if url.startswith("postgresql://"):
             url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
         elif url.startswith("cockroachdb://"):
             url = url.replace("cockroachdb://", "postgresql+psycopg2://", 1)
 
-        # 3. Create the connection with the modified URL
-        conn = st.connection("finance_db", url=url, type="sql", autocommit=True)
+        # 3. MANUALLY CREATE THE ENGINE (mimics st.connection core logic)
+        engine = create_engine(url, pool_recycle=3600)
 
-        # 4. Attach the listener to the underlying engine created by st.connection
-        # This ensures the version check is successfully bypassed.
-        event.listen(conn.engine, "connect", connect_listener)
+        # 4. CRITICAL: Attach the listener *before* the engine attempts its first connection
+        event.listen(engine, "connect", connect_listener)
 
-        return conn
+        # 5. Store the engine globally and return the Mock object
+        GLOBAL_DB_ENGINE = engine
+
+        return MockConnection(engine)
 
     except Exception as e:
-        # This error handling now catches any remaining exceptions
-        logging.error(f"PostgreSQL connection error: {e}", exc_info=True)
-        st.error("Failed to connect to the persistent cloud database. Check Streamlit secrets.")
+        logging.error(f"Database connection setup failed: {e}", exc_info=True)
+        st.error("FATAL: Database connection failed. Please re-check the secrets and ensure `psycopg2-binary` is in requirements.txt.")
         st.stop()
+
 
 def initialize_database(conn):
     """Initializes all database tables if they don't exist and handles schema migrations."""
@@ -218,7 +256,6 @@ def initialize_database(conn):
         logging.error(f"Database initialization failed: {e}", exc_info=True)
         st.error(f"Database setup failed: {e}")
         st.stop()
-
 
 def _migrate_fund_transactions_schema(conn):
     """
@@ -1758,7 +1795,7 @@ def mutual_fund_page():
             if selected_result and selected_result != st.session_state.get(f"{key_prefix}_selected_result"):
                 st.session_state[f"{key_prefix}_selected_result"] = selected_result
                 st.rerun()
-        if st.session_state.get(f"{key_prefix}_selected_result"):
+        if st.session_state.get(f"{key_prefix}_selected_symbol"):
             selected_result = st.session_state[f"{key_prefix}_selected_result"]
             selected_name = selected_result.split(" (")[0]
             selected_code = selected_result.split(" (")[-1].replace(")", "")
