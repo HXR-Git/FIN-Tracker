@@ -6,3 +6,4 @@ numpy
 requests
 mftool
 deprecated
+sqlalchemy
