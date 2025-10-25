@@ -2130,7 +2130,7 @@ def render_asset_page(config):
     # ... (rest of render_asset_page, including chart generation, remains the same) ...
     # This section is lengthy, but the crucial DB access points are now fixed.
 
-    st.subheader(f"{config['title']} - {trade_mode_selection if is_trading_section and trade_mode_selection else config['title']}")
+    #st.subheader(f"{config['title']} - {trade_mode_selection if is_trading_section and trade_mode_selection else config['title']}")
     table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view_secondary", label_visibility="collapsed")
 
     if table_view == view_options[0]:
