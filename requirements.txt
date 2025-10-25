@@ -8,4 +8,4 @@ mftool
 deprecated
 sqlalchemy
 psycopg2-binary
-cockroachdb
+
