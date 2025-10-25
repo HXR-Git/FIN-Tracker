@@ -95,10 +95,28 @@ def bollinger(close, period=20, std_dev=2):
 def get_db_connection():
     """Establishes and caches the PostgreSQL database connection."""
     try:
-        # 'finance_db' securely retrieves the URL from Streamlit secrets
-        conn = st.connection("finance_db", type="sql", autocommit=True)
+        # 1. Fetch the URL from secrets
+        url = st.secrets.get("connections", {}).get("finance_db", {}).get("url")
+
+        # 2. Force the PostgreSQL driver explicitly (Fix for CockroachDB version parsing issue)
+        # This replaces the prefix and forces SQLAlchemy to use the reliable psycopg2 driver.
+        if url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        elif url.startswith("cockroachdb://"):
+            # If the secret was set to cockroachdb://, we override it to use the psycopg2 driver
+            url = url.replace("cockroachdb://", "postgresql+psycopg2://", 1)
+
+        # 3. Create the connection with the modified URL
+        conn = st.connection("finance_db", url=url, type="sql", autocommit=True)
         return conn
     except Exception as e:
+        # The failed version check still throws an error that may need parsing help
+        error_message = str(e)
+        if "Could not determine version from string" in error_message:
+            st.error("Database connection failed due to version incompatibility. Please ensure the latest deployment includes the dialect fix.")
+            logging.error(f"PostgreSQL connection error: {e}", exc_info=True)
+            st.stop()
+
         logging.error(f"PostgreSQL connection error: {e}", exc_info=True)
         st.error("Failed to connect to the persistent cloud database. Check Streamlit secrets.")
         st.stop()
@@ -190,7 +208,7 @@ def initialize_database(conn):
         _add_missing_columns(conn)
 
     except Exception as e:
-        logging.error(f"Database initialization failed: {e}")
+        logging.error(f"Database initialization failed: {e}", exc_info=True)
         st.error(f"Database setup failed: {e}")
         st.stop()
 
@@ -2192,10 +2210,14 @@ def render_asset_page(config):
             holdings_df = holdings_df[~holdings_df[config['asset_col']].isin(live_trade_symbols)]
             realized_df = realized_df[~realized_df[config['asset_col']].isin(live_trade_symbols)]
 
-    # ... (rest of render_asset_page, including chart generation, remains the same) ...
-    # This section is lengthy, but the crucial DB access points are now fixed.
+    # --- REMOVED REDUNDANT SUBHEADER LOGIC (AS REQUESTED) ---
+    display_title = config['title']
+    if is_trading_section and trade_mode_selection and trade_mode_selection != "All Trades":
+        display_title = f"{config['title']} ({trade_mode_selection})"
 
-    st.subheader(f"{config['title']} - {trade_mode_selection if is_trading_section and trade_mode_selection else config['title']}")
+    st.subheader(display_title)
+    # --- END OF REMOVED REDUNDANT SUBHEADER ---
+
     table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view_secondary", label_visibility="collapsed")
 
     if table_view == view_options[0]:
