@@ -98,8 +98,6 @@ GLOBAL_DB_ENGINE = None
 # Define the listener function to bypass version check
 def connect_listener(dbapi_connection, connection_record):
     """Forces the PostgreSQL version to one SQLAlchemy accepts (e.g., 14.0)."""
-    # This function runs right after the connection is established via psycopg2
-    # We inject the fake version info into the connection object's info cache
     connection_record.info["server_version_info"] = (14, 0, 0)
 
 # Mock class for session context manager
@@ -128,7 +126,17 @@ class MockConnection:
 
     @property
     def session(self):
+        # Provides the .session attribute for use in 'with conn.session as session'
         return self._session_maker()
+
+    @property
+    def engine(self):
+        # Provides the .engine attribute for use in pandas.read_sql
+        return self._engine
+
+    @engine.setter
+    def engine(self, engine):
+        self._engine = engine
 
 
 @st.cache_resource
@@ -140,7 +148,7 @@ def get_db_connection():
         return GLOBAL_DB_ENGINE
 
     try:
-        # 1. Fetch and fix the URL
+        # 1. Fetch the URL from secrets
         url = st.secrets.get("connections", {}).get("finance_db", {}).get("url")
 
         # 2. Force the PostgreSQL driver explicitly (Using the working psycopg2 driver)
@@ -151,13 +159,19 @@ def get_db_connection():
             url = url.replace("cockroachdb://", "postgresql+psycopg2://", 1)
 
         # 3. MANUALLY CREATE THE ENGINE
-        engine = create_engine(url, pool_recycle=3600)
+        # CRITICAL FIX: Add connect_args to set application_name, which is the key to bypassing
+        # CockroachDB's version check that causes the error.
+        engine = create_engine(
+            url,
+            pool_recycle=3600,
+            connect_args={'options': '-c application_name=CockroachStreamlit'}
+        )
 
-        # 4. CRITICAL: Attach the listener
+        # 4. Attach the listener (Though often unnecessary with connect_args, it's safer)
         event.listen(engine, "connect", connect_listener)
 
-        # 5. CRITICAL: Force a test connection now. This executes the listener and fixes
-        # the version permanently before the engine is used by initialize_database().
+        # 5. CRITICAL: Force a test connection now. This executes the listener/connect_args,
+        # permanently fixing the engine before the rest of the app uses it.
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
 
