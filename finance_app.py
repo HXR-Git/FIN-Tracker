@@ -1002,7 +1002,7 @@ def home_page():
     _update_existing_portfolio_info()
     returns_data = get_combined_returns()
 
-    st.subheader("Live Portfolio Overview (Excluding Paper Trades)")
+    #st.subheader("Live Portfolio Overview (Excluding Paper Trades)")
 
     # ... (Metric display logic remains the same) ...
     col1, col2, col3 = st.columns(3)
