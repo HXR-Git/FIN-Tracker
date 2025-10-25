@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
     page_title="Finance Dashboard",
-    #page_icon="pages/logo.png",
+    page_icon="pages/logo.png",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -123,6 +123,12 @@ def initialize_database(conn):
                 ticker TEXT, date TEXT, close_price DOUBLE PRECISION,
                 PRIMARY KEY (ticker, date)
             )"""),
+        # ADDED: Benchmark History Table for fast loading
+        text("""CREATE TABLE IF NOT EXISTS benchmark_history (
+                ticker TEXT NOT NULL, date TEXT NOT NULL,
+                close_price DOUBLE PRECISION,
+                PRIMARY KEY (ticker, date)
+            )"""),
         # Realized/Exits Tables
         text("""CREATE TABLE IF NOT EXISTS realized_stocks (
                 transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL,
@@ -196,14 +202,6 @@ def _migrate_fund_transactions_schema(conn):
     It now uses session.execute(text(...)).
     """
     table_name = 'fund_transactions'
-
-    # In PostgreSQL, checking column existence is done differently than PRAGMA,
-    # but we can rely on SQLAlchemy's reflection or simpler schema lookups.
-    # For simplicity, we'll try to execute an ALTER and catch the error if the column doesn't exist.
-
-    # Since we defined the PG schema above correctly, we primarily need the ADD COLUMN logic
-    # for *other* migrations if they were missed. For a fresh PG install, this function
-    # should ideally do nothing unless migrating from a bad PG schema.
 
     # We will skip the complex Copy-Rename-Drop for this column for now, as the main PG schema
     # has been corrected in initialize_database(). We keep it simple:
@@ -571,7 +569,7 @@ def _process_mf_sips():
 
                 if datetime.datetime.strptime(sip_date_this_month, '%Y-%m-%d').date() <= today:
                     existing_sip_tx = pd.read_sql(text("SELECT * FROM mf_transactions WHERE scheme_name = :name AND date LIKE :date_like"),
-                                                  DB_CONN.engine, params={"name": sip['scheme_name'], "date_like": f"{month_year}%"})
+                                                 DB_CONN.engine, params={"name": sip['scheme_name'], "date_like": f"{month_year}%"})
 
                     if existing_sip_tx.empty:
                         try:
@@ -605,11 +603,50 @@ def _process_mf_sips():
     except Exception as e:
         logging.error(f"Failed during MF SIP outer processing: {e}")
 
+# --- NEW/UPDATED BENCHMARK LOGIC ---
+
+def _update_benchmark_data(ticker, start_date):
+    """Fetches benchmark data from yfinance and saves it to the database."""
+    try:
+        today = datetime.date.today()
+        # Fetch data up to today + 1 day to ensure we get the latest close price
+        data = yf.download(ticker, start=start_date, end=today + datetime.timedelta(days=1), progress=False, auto_adjust=True)
+
+        if data.empty or 'Close' not in data.columns:
+            logging.warning(f"YFinance returned empty data for benchmark {ticker}.")
+            return pd.DataFrame()
+
+        data.reset_index(inplace=True)
+        df_to_insert = data[["Date", "Close"]].rename(columns={"Date": "date_col", "Close": "close_price"})
+
+        df_to_insert["ticker"] = ticker
+        df_to_insert["date"] = df_to_insert["date_col"].dt.strftime("%Y-%m-%d")
+
+        df_to_insert = df_to_insert[["ticker", "date", "close_price"]].copy()
+
+        # Use ON CONFLICT DO NOTHING to handle existing primary keys (ticker, date)
+        with DB_CONN.session as session:
+            insert_query = text("""
+                INSERT INTO benchmark_history (ticker, date, close_price)
+                VALUES (:ticker, :date, :close_price)
+                ON CONFLICT (ticker, date) DO NOTHING
+            """)
+
+            # Execute in batches by converting DataFrame rows to a list of dicts
+            params = df_to_insert.to_dict('records')
+            session.execute(insert_query, params)
+            session.commit()
+
+        logging.info(f"Successfully updated benchmark data for {ticker}.")
+        return df_to_insert
+
+    except Exception as e:
+        logging.error(f"Failed to fetch/save benchmark data for {ticker}: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def get_benchmark_comparison_data(holdings_df, benchmark_choice):
-    # Unchanged logic but ensures read_sql uses DB_CONN.engine (which it does via the function body)
-    # ... (function body remains the same, assuming `pd.read_sql` calls inside use DB_CONN.engine or query the connection object directly)
+    """Fetches benchmark data from DB/YFinance and compares it to portfolio performance."""
     if holdings_df.empty:
         return pd.DataFrame()
 
@@ -623,61 +660,81 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     if not selected_ticker:
         return pd.DataFrame()
 
-    all_tickers = holdings_df['symbol'].unique().tolist()
-
-    # CONVERTED: read_sql uses DB_CONN.engine
-    if not all_tickers:
-        return pd.DataFrame() # Handle case where all_tickers is empty
-
-    placeholders = ', '.join([f':t{i}' for i in range(len(all_tickers))])
-    params = {f't{i}': ticker for i, ticker in enumerate(all_tickers)}
-    params['start_date'] = start_date
-
-    price_data_query = text(f"""
-        SELECT date, ticker, close_price FROM price_history
-        WHERE ticker IN ({placeholders}) AND date >= :start_date
-    """)
-    all_prices = pd.read_sql(price_data_query, DB_CONN.engine, params=params)
-    # ... (rest of the calculation logic remains the same)
-
-    all_prices['date'] = pd.to_datetime(all_prices['date'])
-    price_pivot = all_prices.pivot(index='date', columns='ticker', values='close_price').ffill()
-    price_pivot = price_pivot.reindex(date_range).ffill()
-
-    daily_units = pd.DataFrame(0.0, index=date_range, columns=all_tickers)
-    daily_invested = pd.DataFrame(0.0, index=date_range, columns=all_tickers)
-
-    for _, row in holdings_df.iterrows():
-        buy_date = pd.to_datetime(row['buy_date'])
-        buy_date_index = daily_units.index.searchsorted(buy_date, side='left')
-        daily_units.iloc[buy_date_index:, daily_units.columns.get_loc(row['symbol'])] = row['quantity']
-        daily_invested.iloc[buy_date_index:, daily_invested.columns.get_loc(row['symbol'])] = row['quantity'] * row['buy_price']
-
-    daily_market_value = (price_pivot * daily_units).sum(axis=1)
-    total_daily_invested = daily_invested.sum(axis=1)
-    total_daily_invested_clean = total_daily_invested.replace(0, np.nan).ffill()
-
-    portfolio_return = ((daily_market_value - total_daily_invested) / total_daily_invested_clean * 100).rename('Portfolio').round(2)
-    portfolio_return = portfolio_return.dropna()
-
     try:
-        benchmark_df = yf.download(selected_ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
-        if benchmark_df.empty or 'Close' not in benchmark_df.columns:
-            logging.error(f"yfinance returned empty or invalid data for benchmark {selected_ticker}")
+        # 1. Try reading benchmark history from DB
+        benchmark_query = text("""
+            SELECT date, close_price FROM benchmark_history
+            WHERE ticker = :ticker AND date >= :start_date
+            ORDER BY date ASC
+        """)
+        benchmark_df_db = pd.read_sql(benchmark_query, DB_CONN.engine,
+                                      params={"ticker": selected_ticker, "start_date": start_date})
+
+        # 2. If data is missing or incomplete (older than today), fetch/update it
+        if benchmark_df_db.empty or benchmark_df_db['date'].max() < datetime.date.today().strftime('%Y-%m-%d'):
+            _update_benchmark_data(selected_ticker, start_date)
+            # Reread from DB after updating
+            benchmark_df_db = pd.read_sql(benchmark_query, DB_CONN.engine,
+                                          params={"ticker": selected_ticker, "start_date": start_date})
+
+        if benchmark_df_db.empty:
+            logging.error(f"Failed to fetch benchmark data for {selected_ticker} even after update.")
             return pd.DataFrame()
-        benchmarks = benchmark_df['Close'].copy()
-        benchmarks.ffill(inplace=True)
+
+        # Prepare benchmark data for calculation
+        benchmark_df_db['date'] = pd.to_datetime(benchmark_df_db['date'])
+        benchmarks = benchmark_df_db.set_index('date')['close_price'].ffill()
+
+        # --- EXISTING PORTFOLIO DATA FETCH LOGIC (Reads portfolio prices from price_history table) ---
+        all_tickers = holdings_df['symbol'].unique().tolist()
+        if not all_tickers:
+            return pd.DataFrame()
+
+        placeholders = ', '.join([f':t{i}' for i in range(len(all_tickers))])
+        params = {f't{i}': ticker for i, ticker in enumerate(all_tickers)}
+        params['start_date'] = start_date
+
+        price_data_query = text(f"""
+            SELECT date, ticker, close_price FROM price_history
+            WHERE ticker IN ({placeholders}) AND date >= :start_date
+        """)
+        all_prices = pd.read_sql(price_data_query, DB_CONN.engine, params=params)
+
+        all_prices['date'] = pd.to_datetime(all_prices['date'])
+        price_pivot = all_prices.pivot(index='date', columns='ticker', values='close_price').ffill()
+        price_pivot = price_pivot.reindex(date_range).ffill()
+
+        daily_units = pd.DataFrame(0.0, index=date_range, columns=all_tickers)
+        daily_invested = pd.DataFrame(0.0, index=date_range, columns=all_tickers)
+
+        for _, row in holdings_df.iterrows():
+            buy_date = pd.to_datetime(row['buy_date'])
+            buy_date_index = daily_units.index.searchsorted(buy_date, side='left')
+            daily_units.iloc[buy_date_index:, daily_units.columns.get_loc(row['symbol'])] = row['quantity']
+            daily_invested.iloc[buy_date_index:, daily_invested.columns.get_loc(row['symbol'])] = row['quantity'] * row['buy_price']
+
+        daily_market_value = (price_pivot * daily_units).sum(axis=1)
+        total_daily_invested = daily_invested.sum(axis=1)
+        total_daily_invested_clean = total_daily_invested.replace(0, np.nan).ffill()
+
+        portfolio_return = ((daily_market_value - total_daily_invested) / total_daily_invested_clean * 100).rename('Portfolio').round(2)
+        portfolio_return = portfolio_return.dropna()
+
+        # Final comparison calculation using DB-sourced benchmark data
         benchmark_returns = ((benchmarks / benchmarks.iloc[0] - 1) * 100).round(2)
         benchmark_returns.name = benchmark_choice
 
         final_df = pd.concat([portfolio_return, benchmark_returns], axis=1).reset_index().rename(columns={'index': 'Date'})
 
     except Exception as e:
-        logging.error(f"Failed to download benchmark data for {selected_ticker}: {e}", exc_info=True)
+        logging.error(f"Failed during benchmark calculation or portfolio merge: {e}", exc_info=True)
         return pd.DataFrame()
 
     final_df = final_df.melt(id_vars='Date', var_name='Type', value_name='Return %').dropna()
     return final_df
+
+# --- END OF NEW/UPDATED BENCHMARK LOGIC ---
+
 
 def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
     # Unchanged (reads data using DB_CONN.engine)
@@ -727,6 +784,7 @@ def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
     selected_ticker = benchmark_map.get(benchmark_choice)
     if selected_ticker:
         try:
+            # We fetch benchmark data directly here for metric calculation purposes (Alpha/Beta)
             benchmark_df = yf.download(selected_ticker, start=portfolio_value.index.min(), end=portfolio_value.index.max(), progress=False, auto_adjust=True)
             if not benchmark_df.empty:
                 benchmark_returns = benchmark_df['Close'].pct_change().dropna().squeeze()
@@ -1002,7 +1060,7 @@ def home_page():
     _update_existing_portfolio_info()
     returns_data = get_combined_returns()
 
-    st.subheader("Live Portfolio Overview (Excluding Paper Trades)")
+    #st.subheader("Live Portfolio Overview (Excluding Paper Trades)")
 
     # ... (Metric display logic remains the same) ...
     col1, col2, col3 = st.columns(3)
@@ -1066,6 +1124,13 @@ def home_page():
 
                 for symbol in all_tickers:
                     update_stock_data(symbol)
+
+                # Force refresh of benchmarks
+                benchmark_map = {'Nifty 50': '^NSEI', 'Nifty 100': '^CNX100', 'Nifty 200': '^CNX200', 'Nifty 500': '^CRSLDX'}
+                for symbol in benchmark_map.values():
+                    # Set start_date to a wide date to ensure fetching all history on manual refresh
+                    _update_benchmark_data(symbol, start_date="2020-01-01")
+
 
                 mf_symbols_query = text("SELECT DISTINCT yfinance_symbol FROM mf_transactions")
                 mf_symbols = pd.read_sql(mf_symbols_query, DB_CONN.engine)['yfinance_symbol'].tolist()
@@ -1734,9 +1799,9 @@ def mutual_fund_page():
 
             with st.expander("View Detailed Holdings"):
                  styled_df = holdings_df.drop(columns=['yfinance_symbol']).style.map(color_return_value, subset=['P&L %']).format({
-                    "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
-                    "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
-                 })
+                     "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
+                     "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
+                   })
                  st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
             # ... (Return Chart logic remains the same) ...
@@ -1784,7 +1849,7 @@ def mutual_fund_page():
                                "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
                                "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
                                "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
-                                    })
+                                     })
 
             # CONVERTED: MF History Save Logic (DELETE + to_sql)
             if st.button("Save Mutual Fund Changes"):
@@ -2127,10 +2192,14 @@ def render_asset_page(config):
             holdings_df = holdings_df[~holdings_df[config['asset_col']].isin(live_trade_symbols)]
             realized_df = realized_df[~realized_df[config['asset_col']].isin(live_trade_symbols)]
 
-    # ... (rest of render_asset_page, including chart generation, remains the same) ...
-    # This section is lengthy, but the crucial DB access points are now fixed.
+    # --- REMOVED REDUNDANT SUBHEADER LOGIC (AS REQUESTED) ---
+    display_title = config['title']
+    if is_trading_section and trade_mode_selection and trade_mode_selection != "All Trades":
+        display_title = f"{config['title']} ({trade_mode_selection})"
 
-    st.subheader(f"{config['title']} - {trade_mode_selection if is_trading_section and trade_mode_selection else config['title']}")
+    st.subheader(display_title)
+    # --- END OF REMOVED REDUNDANT SUBHEADER ---
+
     table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view_secondary", label_visibility="collapsed")
 
     if table_view == view_options[0]:
@@ -2310,4 +2379,3 @@ if st.session_state.logged_in:
     main_app()
 else:
     login_page()
-#may be end
