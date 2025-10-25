@@ -95,7 +95,7 @@ def bollinger(close, period=20, std_dev=2):
 # Global variable to hold the engine instance
 GLOBAL_DB_ENGINE = None
 
-# Define the listener function to bypass version check
+# Define the listener function to bypass version check (Injects PG version 14.0)
 def connect_listener(dbapi_connection, connection_record):
     """Forces the PostgreSQL version to one SQLAlchemy accepts (e.g., 14.0)."""
     connection_record.info["server_version_info"] = (14, 0, 0)
@@ -121,7 +121,7 @@ class MockSession:
 # Mock class to replace st.connection object (only exposing engine and session)
 class MockConnection:
     def __init__(self, engine):
-        self.engine = engine
+        self._engine = engine
         self._session_maker = lambda: MockSession(engine) # Callable for session context
 
     @property
@@ -148,7 +148,7 @@ def get_db_connection():
         return GLOBAL_DB_ENGINE
 
     try:
-        # 1. Fetch the URL from secrets
+        # 1. Fetch and fix the URL
         url = st.secrets.get("connections", {}).get("finance_db", {}).get("url")
 
         # 2. Force the PostgreSQL driver explicitly (Using the working psycopg2 driver)
@@ -159,15 +159,17 @@ def get_db_connection():
             url = url.replace("cockroachdb://", "postgresql+psycopg2://", 1)
 
         # 3. MANUALLY CREATE THE ENGINE
-        # CRITICAL FIX: Add connect_args to set application_name, which is the key to bypassing
-        # CockroachDB's version check that causes the error.
+        # CRITICAL FIX: Pass connect_args to set application_name, which is the key to bypassing
+        # CockroachDB's version check that causes the AssertionError.
         engine = create_engine(
             url,
             pool_recycle=3600,
-            connect_args={'options': '-c application_name=CockroachStreamlit'}
+            connect_args={
+                'options': '-c default_transaction_read_only=true -c search_path=public'
+            }
         )
 
-        # 4. Attach the listener (Though often unnecessary with connect_args, it's safer)
+        # 4. Attach the listener (Used to manually set version info)
         event.listen(engine, "connect", connect_listener)
 
         # 5. CRITICAL: Force a test connection now. This executes the listener/connect_args,
@@ -1811,11 +1813,6 @@ def mutual_fund_page():
                 st.session_state[f"{key_prefix}_search_results"] = []
             st.session_state[f"{key_prefix}_selected_scheme_code"] = None
             st.rerun()
-        if st.session_state.get(f"{key_prefix}_search_results"):
-            selected_result = st.sidebar.selectbox("Select Mutual Fund", options=[None] + st.session_state[f"{key_prefix}_search_results"], index=0, format_func=lambda x: "Select a fund..." if x is None else x)
-            if selected_result and selected_result != st.session_state.get(f"{key_prefix}_selected_result"):
-                st.session_state[f"{key_prefix}_selected_result"] = selected_result
-                st.rerun()
         if st.session_state.get(f"{key_prefix}_selected_result"):
             selected_result = st.session_state[f"{key_prefix}_selected_result"]
             selected_name = selected_result.split(" (")[0]
