@@ -6,5 +6,5 @@ numpy
 requests
 mftool
 deprecated
-streamlit-connectors
-psycopg2-binary
+sqlalchemy              
+psycopg2-binary         
