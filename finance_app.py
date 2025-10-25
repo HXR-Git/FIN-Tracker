@@ -99,6 +99,7 @@ GLOBAL_DB_ENGINE = None
 def connect_listener(dbapi_connection, connection_record):
     """Forces the PostgreSQL version to one SQLAlchemy accepts (e.g., 14.0)."""
     # This function runs right after the connection is established via psycopg2
+    # We inject the fake version info into the connection object's info cache
     connection_record.info["server_version_info"] = (14, 0, 0)
 
 # Mock class for session context manager
@@ -108,6 +109,7 @@ class MockSession:
 
     def __enter__(self):
         self.connection = self.engine.connect()
+        # Begin a transaction explicitly for session context
         self.transaction = self.connection.begin()
         return self.connection
 
@@ -122,7 +124,7 @@ class MockSession:
 class MockConnection:
     def __init__(self, engine):
         self.engine = engine
-        self._session_maker = lambda: MockSession(engine)
+        self._session_maker = lambda: MockSession(engine) # Callable for session context
 
     @property
     def session(self):
@@ -138,24 +140,28 @@ def get_db_connection():
         return GLOBAL_DB_ENGINE
 
     try:
-        # 1. Fetch the URL from secrets
-        # st.secrets("connections") will automatically look for the [connections.finance_db] table in secrets
+        # 1. Fetch and fix the URL
         url = st.secrets.get("connections", {}).get("finance_db", {}).get("url")
 
-        # 2. Force the PostgreSQL driver explicitly (Fix for version parsing issue)
+        # 2. Force the PostgreSQL driver explicitly (Using the working psycopg2 driver)
         # This replaces the prefix and forces SQLAlchemy to use the reliable psycopg2 driver.
         if url.startswith("postgresql://"):
             url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
         elif url.startswith("cockroachdb://"):
             url = url.replace("cockroachdb://", "postgresql+psycopg2://", 1)
 
-        # 3. MANUALLY CREATE THE ENGINE (mimics st.connection core logic)
+        # 3. MANUALLY CREATE THE ENGINE
         engine = create_engine(url, pool_recycle=3600)
 
-        # 4. CRITICAL: Attach the listener *before* the engine attempts its first connection
+        # 4. CRITICAL: Attach the listener
         event.listen(engine, "connect", connect_listener)
 
-        # 5. Store the engine globally and return the Mock object
+        # 5. CRITICAL: Force a test connection now. This executes the listener and fixes
+        # the version permanently before the engine is used by initialize_database().
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+
+        # 6. Store the engine globally and return the Mock object
         GLOBAL_DB_ENGINE = engine
 
         return MockConnection(engine)
@@ -256,6 +262,7 @@ def initialize_database(conn):
         logging.error(f"Database initialization failed: {e}", exc_info=True)
         st.error(f"Database setup failed: {e}")
         st.stop()
+
 
 def _migrate_fund_transactions_schema(conn):
     """
@@ -1795,7 +1802,7 @@ def mutual_fund_page():
             if selected_result and selected_result != st.session_state.get(f"{key_prefix}_selected_result"):
                 st.session_state[f"{key_prefix}_selected_result"] = selected_result
                 st.rerun()
-        if st.session_state.get(f"{key_prefix}_selected_symbol"):
+        if st.session_state.get(f"{key_prefix}_selected_result"):
             selected_result = st.session_state[f"{key_prefix}_selected_result"]
             selected_name = selected_result.split(" (")[0]
             selected_code = selected_result.split(" (")[-1].replace(")", "")
