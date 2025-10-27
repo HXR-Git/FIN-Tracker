@@ -2,3 +2,4 @@
 .DS_Store
 finance.db
 .streamlit/
+migration_env/

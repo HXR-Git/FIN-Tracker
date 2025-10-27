@@ -1,11 +1,9 @@
 streamlit
 yfinance
+sqlalchemy
 pandas
-altair
 numpy
 requests
+altair
+psycopg2-binary  # MUST be included for PostgreSQL connection
 mftool
-deprecated
-sqlalchemy
-psycopg2-binary
-
