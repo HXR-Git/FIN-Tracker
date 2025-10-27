@@ -1,18 +1,20 @@
 import streamlit as st
 import yfinance as yf
-# REMOVED: import sqlite3
-from sqlalchemy import text, event, create_engine # <-- ADDED 'create_engine' and 'event'
+import sqlite3
+from sqlalchemy import text, create_engine
 from sqlalchemy.exc import IntegrityError
 import pandas as pd
 import datetime
-import logging
+import logging         # <--- ADD/RESTORE THIS LINE
 import requests
 import altair as alt
 import uuid
 import numpy as np
 from mftool import Mftool
 import time
-import socket # <--- CRITICAL IMPORT ADDED FOR IPV4 FIX
+import contextlib      # (This was added previously)
+# REMOVED: import socket
+# REMOVED: import socket # <--- REMOVED CRITICAL IMPORT FOR IPV4 FIX
 
 # --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
@@ -91,130 +93,51 @@ def bollinger(close, period=20, std_dev=2):
     lower_band = rolling_mean - (rolling_std * std_dev)
     return upper_band, rolling_mean, lower_band
 
-# --- DATABASE SETUP (Manual Engine Creation - CRITICAL FIX) ---
+# --- DATABASE SETUP (SQLite Version - REVISED) ---
 
-# Global variable to hold the engine instance
-GLOBAL_DB_ENGINE = None
-
-# Define the listener function to bypass version check (Injects PG version 14.0)
-def connect_listener(dbapi_connection, connection_record):
-    """Forces the PostgreSQL version to one SQLAlchemy accepts (e.g., 14.0)."""
-    connection_record.info["server_version_info"] = (14, 0, 0)
-
-# Mock class for session context manager
-class MockSession:
+# Mock class to replicate st.connection behavior for SQLAlchemy Engine
+class StreamlitConnectionMock:
     def __init__(self, engine):
         self.engine = engine
 
-    def __enter__(self):
-        self.connection = self.engine.connect()
-        # Begin a transaction explicitly for session context
-        self.transaction = self.connection.begin()
-        return self.connection
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None:
-            self.transaction.commit()
-        else:
-            self.transaction.rollback()
-        self.connection.close()
-
-# Mock class to replace st.connection object (only exposing engine and session)
-class MockConnection:
-    def __init__(self, engine):
-        self._engine = engine
-        self._session_maker = lambda: MockSession(engine) # Callable for session context
-
-    @property
+    # Provides a context manager for manual connection/transaction management
+    @contextlib.contextmanager
     def session(self):
-        # Provides the .session attribute for use in 'with conn.session as session'
-        return self._session_maker()
+        conn = self.engine.connect()
+        # Begin a transaction explicitly for session context
+        transaction = conn.begin()
+        try:
+            yield conn
+            transaction.commit()
+        except Exception as e:
+            transaction.rollback()
+            raise e
+        finally:
+            conn.close()
 
-    @property
-    def engine(self):
-        # Provides the .engine attribute for use in pandas.read_sql
-        return self._engine
-
-    @engine.setter
-    def engine(self, engine):
-        self._engine = engine
-
+# Contextlib added for StreamlitConnectionMock
+import contextlib
 
 @st.cache_resource
-def get_db_connection():
+def get_db_connection(db_file="finance.db"):
     """
-    Manually creates and caches the SQLAlchemy Engine.
-    Includes a critical fix to force IPv4 connection when deploying on Streamlit Cloud.
+    Creates and caches the SQLite connection object using Streamlit's resource
+    caching. This will create a local 'finance_dashboard.db' file.
     """
-    global GLOBAL_DB_ENGINE
-
-    if GLOBAL_DB_ENGINE is not None:
-        return GLOBAL_DB_ENGINE
-
     try:
-        # 1. Fetch the URL from secrets
-        url = st.secrets.get("connections", {}).get("finance_db", {}).get("url")
-        url_to_use = url
+        # Use SQLAlchemy's create_engine for file-based SQLite
+        engine = create_engine(f"sqlite:///{db_file}")
 
-        # --- CRITICAL IPV4 FIX FOR STREAMLIT CLOUD NETWORK ISSUES ---
-        # 1a. Extract the host name from the URL to perform DNS lookup
-        # Look for @ and then the port number or end of string
-        host_start = url.find("@") + 1
-        host_end = url.find(":", host_start)
-
-        if host_end == -1:
-            host_end = len(url)
-
-        host_name = url[host_start:host_end]
-
-        # 1b. Look up the IPv4 address
-        try:
-            ipv4_address = socket.gethostbyname(host_name)
-        except socket.gaierror:
-            # If resolution fails (e.g., local testing or unknown error), fall back to original URL
-            logging.warning(f"Could not resolve {host_name} to IPv4. Trying original URL.")
-            ipv4_address = None
-
-        # 1c. Replace the original hostname in the URL with the IPv4 address to force connection
-        if ipv4_address:
-            # We replace only the host portion for the final URL
-            url_to_use = url.replace(host_name, ipv4_address)
-        # --- END OF IPV4 FIX ---
-
-        # 2. Force the PostgreSQL driver explicitly (psycopg2)
-        # This replaces the prefix and forces SQLAlchemy to use the reliable psycopg2 driver.
-        if url_to_use.startswith("postgresql://"):
-            url_final = url_to_use.replace("postgresql://", "postgresql+psycopg2://", 1)
-        elif url_to_use.startswith("cockroachdb://"):
-            url_final = url_to_use.replace("cockroachdb://", "postgresql+psycopg2://", 1)
-        else:
-            url_final = url_to_use
-
-
-        # 3. MANUALLY CREATE THE ENGINE
-        engine = create_engine(
-            url_final, # Use the URL which may now contain the IPv4 address
-            pool_recycle=3600,
-            connect_args={
-                'options': '-c default_transaction_read_only=true -c search_path=public'
-            }
-        )
-
-        # 4. Attach the listener (Used to manually set version info)
-        event.listen(engine, "connect", connect_listener)
-
-        # 5. CRITICAL: Force a test connection now.
+        # CRITICAL: Force a test connection now.
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
 
-        # 6. Store the engine globally and return the Mock object
-        GLOBAL_DB_ENGINE = engine
-
-        return MockConnection(engine)
+        # Return the mock object wrapping the engine
+        return StreamlitConnectionMock(engine)
 
     except Exception as e:
         logging.error(f"Database connection setup failed: {e}", exc_info=True)
-        st.error("FATAL: Database connection failed. Please re-check the secrets and ensure `psycopg2-binary` is in requirements.txt.")
+        st.error("FATAL: Database connection failed. Please ensure the 'sqlite3' library is functional.")
         st.stop()
 
 
@@ -222,84 +145,86 @@ def initialize_database(conn):
     """Initializes all database tables if they don't exist and handles schema migrations."""
 
     # Define SQL commands using SQLAlchemy text() wrapper for DDL
+    # NOTE: PRIMARY KEY definition changed for SQLite compatibility (INTEGER PRIMARY KEY AUTOINCREMENT
+    # replaces SERIAL PRIMARY KEY)
     create_tables_sql = [
         # Investment Tables (DOUBLE PRECISION for currency/price)
         text("""CREATE TABLE IF NOT EXISTS portfolio (
-                ticker TEXT PRIMARY KEY, buy_price DOUBLE PRECISION NOT NULL,
-                buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
-                sector TEXT, market_cap TEXT
-            )"""),
+                ticker TEXT PRIMARY KEY, buy_price REAL NOT NULL,
+                buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
+                sector TEXT, market_cap TEXT
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS trades (
-                symbol TEXT PRIMARY KEY, buy_price DOUBLE PRECISION NOT NULL,
-                buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
-                target_price DOUBLE PRECISION NOT NULL, stop_loss_price DOUBLE PRECISION NOT NULL
-            )"""),
+                symbol TEXT PRIMARY KEY, buy_price REAL NOT NULL,
+                buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
+                target_price REAL NOT NULL, stop_loss_price REAL NOT NULL
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS price_history (
-                ticker TEXT, date TEXT, close_price DOUBLE PRECISION,
-                PRIMARY KEY (ticker, date)
-            )"""),
+                ticker TEXT, date TEXT, close_price REAL,
+                PRIMARY KEY (ticker, date)
+            )"""),
         # ADDED: Benchmark History Table for fast loading
         text("""CREATE TABLE IF NOT EXISTS benchmark_history (
-                ticker TEXT NOT NULL, date TEXT NOT NULL,
-                close_price DOUBLE PRECISION,
-                PRIMARY KEY (ticker, date)
-            )"""),
+                ticker TEXT NOT NULL, date TEXT NOT NULL,
+                close_price REAL,
+                PRIMARY KEY (ticker, date)
+            )"""),
         # Realized/Exits Tables
         text("""CREATE TABLE IF NOT EXISTS realized_stocks (
-                transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL,
-                buy_price DOUBLE PRECISION NOT NULL, buy_date TEXT NOT NULL,
-                quantity INTEGER NOT NULL, sell_price DOUBLE PRECISION NOT NULL,
-                sell_date TEXT NOT NULL, realized_return_pct DOUBLE PRECISION NOT NULL
-            )"""),
+                transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL,
+                buy_price REAL NOT NULL, buy_date TEXT NOT NULL,
+                quantity INTEGER NOT NULL, sell_price REAL NOT NULL,
+                sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS exits (
-                transaction_id TEXT PRIMARY KEY, symbol TEXT NOT NULL,
-                buy_price DOUBLE PRECISION NOT NULL, buy_date TEXT NOT NULL,
-                quantity INTEGER NOT NULL, sell_price DOUBLE PRECISION NOT NULL,
-                sell_date TEXT NOT NULL, realized_return_pct DOUBLE PRECISION NOT NULL,
-                target_price DOUBLE PRECISION NOT NULL, stop_loss_price DOUBLE PRECISION NOT NULL
-            )"""),
-        # Funds & Expenses Tables (SERIAL PRIMARY KEY for auto-increment)
+                transaction_id TEXT PRIMARY KEY, symbol TEXT NOT NULL,
+                buy_price REAL NOT NULL, buy_date TEXT NOT NULL,
+                quantity INTEGER NOT NULL, sell_price REAL NOT NULL,
+                sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL,
+                target_price REAL NOT NULL, stop_loss_price REAL NOT NULL
+            )"""),
+        # Funds & Expenses Tables (INTEGER PRIMARY KEY AUTOINCREMENT for auto-increment)
         text("""CREATE TABLE IF NOT EXISTS fund_transactions (
-                transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL,
-                type TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
-                description TEXT
-            )"""),
+                transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL,
+                type TEXT NOT NULL, amount REAL NOT NULL,
+                description TEXT
+            )"""),
         # Added transfer_group_id column in initial creation
         text("""CREATE TABLE IF NOT EXISTS expenses (
-                expense_id TEXT PRIMARY KEY, date TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
-                category TEXT NOT NULL, payment_method TEXT, description TEXT,
-                type TEXT, transfer_group_id TEXT
-            )"""),
+                expense_id TEXT PRIMARY KEY, date TEXT NOT NULL, amount REAL NOT NULL,
+                category TEXT NOT NULL, payment_method TEXT, description TEXT,
+                type TEXT, transfer_group_id TEXT
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS budgets (
-                budget_id SERIAL PRIMARY KEY, month_year TEXT NOT NULL,
-                category TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
-                UNIQUE(month_year, category)
-            )"""),
+                budget_id INTEGER PRIMARY KEY AUTOINCREMENT, month_year TEXT NOT NULL,
+                category TEXT NOT NULL, amount REAL NOT NULL,
+                UNIQUE(month_year, category)
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS recurring_expenses (
-                recurring_id SERIAL PRIMARY KEY, description TEXT NOT NULL UNIQUE,
-                amount DOUBLE PRECISION NOT NULL, category TEXT NOT NULL,
-                payment_method TEXT, day_of_month INTEGER NOT NULL
-            )"""),
+                recurring_id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL UNIQUE,
+                amount REAL NOT NULL, category TEXT NOT NULL,
+                payment_method TEXT, day_of_month INTEGER NOT NULL
+            )"""),
         # Mutual Fund Tables
         text("""CREATE TABLE IF NOT EXISTS mf_transactions (
-                transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL,
-                scheme_name TEXT NOT NULL, yfinance_symbol TEXT NOT NULL,
-                type TEXT NOT NULL, units DOUBLE PRECISION NOT NULL,
-                nav DOUBLE PRECISION NOT NULL
-            )"""),
+                transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL,
+                scheme_name TEXT NOT NULL, yfinance_symbol TEXT NOT NULL,
+                type TEXT NOT NULL, units REAL NOT NULL,
+                nav REAL NOT NULL
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS mf_sips (
-                sip_id SERIAL PRIMARY KEY, scheme_name TEXT NOT NULL UNIQUE,
-                yfinance_symbol TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
-                day_of_month INTEGER NOT NULL
-            )""")
+                sip_id INTEGER PRIMARY KEY AUTOINCREMENT, scheme_name TEXT NOT NULL UNIQUE,
+                yfinance_symbol TEXT NOT NULL, amount REAL NOT NULL,
+                day_of_month INTEGER NOT NULL
+            )""")
     ]
 
     # Execute commands within a session
     try:
-        with conn.session as session:
+        with conn.session() as session:
             for command in create_tables_sql:
                 session.execute(command)
-            session.commit()
+            # Commit handled by context manager now
 
         # Handle migrations (this function must also use session.execute(text()))
         _add_missing_columns(conn)
@@ -312,24 +237,17 @@ def initialize_database(conn):
 
 def _migrate_fund_transactions_schema(conn):
     """
-    Performs schema migration for fund_transactions if needed (SQLite to PG column removal).
-    Note: For a fresh PG deployment, this logic is primarily a placeholder/safety check.
-    It now uses session.execute(text(...)).
+    Performs schema migration for fund_transactions if needed (placeholder/safety check).
     """
     table_name = 'fund_transactions'
-
-    # We will skip the complex Copy-Rename-Drop for this column for now, as the main PG schema
-    # has been corrected in initialize_database(). We keep it simple:
-    # If the column exists, it was likely an error in the previous PG migration attempt.
-
-    logging.info(f"Assuming {table_name} schema is correct post-PG migration.")
+    logging.info(f"Assuming {table_name} schema is correct post-initialization.")
 
 
 def _add_missing_columns(conn):
     """Handles database schema migrations by adding missing columns."""
 
-    with conn.session as session:
-        # Migration 1: Add sector and market_cap to portfolio (if coming from an old schema)
+    with conn.session() as session:
+        # Migration 1: Add sector and market_cap to portfolio
         try:
             session.execute(text("ALTER TABLE portfolio ADD COLUMN sector TEXT"))
             logging.info("Added 'sector' column to 'portfolio' table.")
@@ -357,35 +275,38 @@ def _add_missing_columns(conn):
         except Exception:
             pass
 
-        session.commit()
+        # Commit handled by context manager now
 
-# REPLACED DB_CONN initialization to use the new PG function
+# REPLACED DB_CONN initialization to use the new SQLite function
 DB_CONN = get_db_connection()
 initialize_database(DB_CONN)
 
 # CONVERTED: fund_transactions INSERT logic
 def update_funds_on_transaction(transaction_type, amount, description, date):
-    """Inserts a new transaction into the fund_transactions table using PostgreSQL."""
+    """Inserts a new transaction into the fund_transactions table using SQLite."""
 
     if description and description.startswith("ALLOCATION:"):
         description = description.split(' - ', 1)[-1].strip()
 
     # Use a session context manager for safe transaction execution
-    with DB_CONN.session as session:
-        session.execute(
-            text("""
-                INSERT INTO fund_transactions (transaction_id, date, type, amount, description)
-                VALUES (:id, :date, :type, :amount, :description)
-            """),
-            params={
-                "id": str(uuid.uuid4()),
-                "date": date,
-                "type": transaction_type,
-                "amount": round(amount, 2),
-                "description": description
-            }
-        )
-        session.commit()
+    try:
+        with DB_CONN.session() as session:
+            session.execute(
+                text("""
+                    INSERT INTO fund_transactions (transaction_id, date, type, amount, description)
+                    VALUES (:id, :date, :type, :amount, :description)
+                """),
+                params={
+                    "id": str(uuid.uuid4()),
+                    "date": date,
+                    "type": transaction_type,
+                    "amount": round(amount, 2),
+                    "description": description
+                }
+            )
+            # Commit handled by context manager now
+    except Exception as e:
+        logging.error(f"Failed to update funds on transaction: {e}")
 
 # --- API & DATA FUNCTIONS ---
 @st.cache_data(ttl=3600)
@@ -487,9 +408,9 @@ def get_mf_historical_data(scheme_code):
         logging.error(f"Failed to fetch historical data for scheme {scheme_code}: {e}")
         return pd.DataFrame()
 
-# CONVERTED: update_stock_data for bulk PostgreSQL insert (via to_sql)
+# CONVERTED: update_stock_data for bulk SQLite insert (via to_sql)
 def update_stock_data(symbol):
-    """Downloads and saves historical stock data (Close Price only) to the PostgreSQL database."""
+    """Downloads and saves historical stock data (Close Price only) to the SQLite database."""
     try:
         ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol and not symbol.endswith('.NS') else symbol
         today = datetime.date.today()
@@ -507,8 +428,9 @@ def update_stock_data(symbol):
 
         df_to_insert = data[["ticker", "date", "close_price"]].copy()
 
-        # Use the engine for bulk writes. PostgreSQL will handle the PRIMARY KEY
-        # conflict during the 'append' operation if a record with the same (ticker, date) exists.
+        # Use the engine for bulk writes. We use 'append' for SQLite, relying on the
+        # unique constraint (ticker, date) to prevent duplicates (though it may raise errors on conflict).
+        # A more robust solution might use ON CONFLICT in raw SQL, but to_sql is simpler.
         df_to_insert.to_sql(
             'price_history',
             DB_CONN.engine, # Use the engine for bulk writes
@@ -518,8 +440,11 @@ def update_stock_data(symbol):
         )
 
         return True
+    except IntegrityError:
+        logging.info(f"Integrity error (duplicate keys) for {symbol}. Data already exists. Skipping insertion.")
+        return True
     except Exception as e:
-        logging.error(f"PostgreSQL update_stock_data failed for {symbol}: {e}")
+        logging.error(f"SQLite update_stock_data failed for {symbol}: {e}")
         return False
 
 
@@ -528,19 +453,19 @@ def get_holdings_df(table_name):
     # Queries use DB_CONN.engine for reads, which is safe.
     if table_name == "trades":
         query = text("""
-            SELECT p.symbol, p.buy_price, p.buy_date, p.quantity, p.target_price, p.stop_loss_price, h.close_price AS current_price
-            FROM trades p
-            LEFT JOIN price_history h ON p.symbol = h.ticker
-            WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.symbol)
-        """)
+            SELECT p.symbol, p.buy_price, p.buy_date, p.quantity, p.target_price, p.stop_loss_price, h.close_price AS current_price
+            FROM trades p
+            LEFT JOIN price_history h ON p.symbol = h.ticker
+            WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.symbol)
+        """)
         df = pd.read_sql(query, DB_CONN.engine)
     else:
         query = text("""
-            SELECT p.ticker AS symbol, p.buy_price, p.buy_date, p.quantity, p.sector, p.market_cap, h.close_price AS current_price
-            FROM portfolio p
-            LEFT JOIN price_history h ON p.ticker = h.ticker
-            WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.ticker)
-        """)
+            SELECT p.ticker AS symbol, p.buy_price, p.buy_date, p.quantity, p.sector, p.market_cap, h.close_price AS current_price
+            FROM portfolio p
+            LEFT JOIN price_history h ON p.ticker = h.ticker
+            WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.ticker)
+        """)
         df = pd.read_sql(query, DB_CONN.engine)
 
     if df.empty:
@@ -552,6 +477,7 @@ def get_holdings_df(table_name):
     df["invested_value"] = (df["buy_price"] * df["quantity"]).round(2)
     df["current_value"] = (df["current_price"] * df["quantity"]).round(2)
     if table_name == "trades":
+        # Check for non-zero risk (denominator) to prevent division by zero for RRR calculation
         df["Expected RRR"] = np.where((df["buy_price"] - df["stop_loss_price"]) > 0, (df["target_price"] - df["buy_price"]) / (df["buy_price"] - df["stop_loss_price"]), np.inf).round(2)
     return df
 
@@ -579,36 +505,39 @@ def get_realized_df(table_name):
 def _update_existing_portfolio_info():
     """Fetches and updates missing sector and market cap data for existing stocks."""
 
-    with DB_CONN.session as session:
-        # 1. Fetch tickers with missing info
-        select_query = text("SELECT ticker, sector, market_cap FROM portfolio WHERE sector IS NULL OR market_cap IS NULL OR sector = 'N/A' OR market_cap = 'N/A'")
-        tickers_to_update = session.execute(select_query).fetchall()
+    try:
+        with DB_CONN.session() as session:
+            # 1. Fetch tickers with missing info
+            select_query = text("SELECT ticker, sector, market_cap FROM portfolio WHERE sector IS NULL OR market_cap IS NULL OR sector = 'N/A' OR market_cap = 'N/A'")
+            tickers_to_update = session.execute(select_query).fetchall()
 
-        if tickers_to_update:
-            update_query = text("UPDATE portfolio SET sector = :sector, market_cap = :mcap WHERE ticker = :ticker")
+            if tickers_to_update:
+                update_query = text("UPDATE portfolio SET sector = :sector, market_cap = :mcap WHERE ticker = :ticker")
 
-            for ticker, old_sector, old_market_cap in tickers_to_update:
-                try:
-                    stock_info = fetch_stock_info(ticker)
-                    sector, market_cap_raw = stock_info['sector'], stock_info['market_cap']
+                for ticker, old_sector, old_market_cap in tickers_to_update:
+                    try:
+                        stock_info = fetch_stock_info(ticker)
+                        sector, market_cap_raw = stock_info['sector'], stock_info['market_cap']
 
-                    if sector != 'N/A' or market_cap_raw != 'N/A':
-                        final_market_cap = _categorize_market_cap(market_cap_raw)
+                        if sector != 'N/A' or market_cap_raw != 'N/A':
+                            final_market_cap = _categorize_market_cap(market_cap_raw)
 
-                        # Preserve existing info if new info is 'N/A'
-                        final_sector = sector if sector != 'N/A' else old_sector
-                        final_market_cap = final_market_cap if final_market_cap != 'N/A' else old_market_cap
+                            # Preserve existing info if new info is 'N/A'
+                            final_sector = sector if sector != 'N/A' else old_sector
+                            final_market_cap = final_market_cap if final_market_cap != 'N/A' else old_market_cap
 
-                        session.execute(update_query, {
-                            "sector": final_sector,
-                            "mcap": final_market_cap,
-                            "ticker": ticker
-                        })
-                        logging.info(f"Updated sector and market cap for {ticker}.")
-                except Exception as e:
-                    logging.error(f"Failed to update info for {ticker}: {e}")
+                            session.execute(update_query, {
+                                "sector": final_sector,
+                                "mcap": final_market_cap,
+                                "ticker": ticker
+                            })
+                            logging.info(f"Updated sector and market cap for {ticker}.")
+                    except Exception as e:
+                        logging.error(f"Failed to update info for {ticker}: {e}")
 
-            session.commit()
+            # Commit handled by context manager now
+    except Exception as e:
+        logging.error(f"Error during portfolio info update: {e}")
 
 def _categorize_market_cap(market_cap_value):
     # Unchanged
@@ -637,7 +566,7 @@ def _process_recurring_expenses():
         logged_expenses_df = pd.read_sql(text("SELECT description FROM expenses WHERE date LIKE :month_year"), DB_CONN.engine, params={"month_year": f"{month_year}%"})
         logged_descriptions = logged_expenses_df['description'].tolist()
 
-        with DB_CONN.session as session:
+        with DB_CONN.session() as session:
             insert_query = text("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description) VALUES (:id, :date, :type, :amount, :category, :pmethod, :desc)")
 
             for _, row in recurring_df.iterrows():
@@ -659,7 +588,7 @@ def _process_recurring_expenses():
                 })
                 logging.info(f"Logged recurring expense: {row['description']}")
 
-            session.commit()
+            # Commit handled by context manager now
     except Exception as e:
         logging.error(f"Could not process recurring expenses: {e}")
 
@@ -677,25 +606,25 @@ def _process_mf_sips():
 
         mf_tx_insert_query = text("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (:id, :date, :name, :symbol, :type, :units, :nav)")
 
-        with DB_CONN.session as session:
-            for _, sip in sips_df.iterrows():
-                day = min(sip['day_of_month'], pd.Timestamp.now().days_in_month)
-                sip_date_this_month = today.replace(day=day).strftime('%Y-%m-%d')
+        for _, sip in sips_df.iterrows():
+            day = min(sip['day_of_month'], pd.Timestamp.now().days_in_month)
+            sip_date_this_month = today.replace(day=day).strftime('%Y-%m-%d')
 
-                if datetime.datetime.strptime(sip_date_this_month, '%Y-%m-%d').date() <= today:
-                    existing_sip_tx = pd.read_sql(text("SELECT * FROM mf_transactions WHERE scheme_name = :name AND date LIKE :date_like"),
-                                                 DB_CONN.engine, params={"name": sip['scheme_name'], "date_like": f"{month_year}%"})
+            if datetime.datetime.strptime(sip_date_this_month, '%Y-%m-%d').date() <= today:
+                existing_sip_tx = pd.read_sql(text("SELECT * FROM mf_transactions WHERE scheme_name = :name AND date LIKE :date_like"),
+                                             DB_CONN.engine, params={"name": sip['scheme_name'], "date_like": f"{month_year}%"})
 
-                    if existing_sip_tx.empty:
-                        try:
-                            nav = fetch_latest_mf_nav(sip['yfinance_symbol'])
-                            if nav:
-                                units = sip['amount'] / nav
+                if existing_sip_tx.empty:
+                    try:
+                        nav = fetch_latest_mf_nav(sip['yfinance_symbol'])
+                        if nav:
+                            units = sip['amount'] / nav
 
-                                # 1. Update Funds (already converted to PG)
-                                update_funds_on_transaction("Withdrawal", round(sip['amount'], 2), f"MF SIP: {sip['scheme_name']}", sip_date_this_month)
+                            # 1. Update Funds (already converted to SQLite)
+                            update_funds_on_transaction("Withdrawal", round(sip['amount'], 2), f"MF SIP: {sip['scheme_name']}", sip_date_this_month)
 
-                                # 2. Insert MF Transaction
+                            # 2. Insert MF Transaction
+                            with DB_CONN.session() as session:
                                 session.execute(mf_tx_insert_query, {
                                     "id": str(uuid.uuid4()),
                                     "date": sip_date_this_month,
@@ -705,15 +634,15 @@ def _process_mf_sips():
                                     "units": round(units, 4),
                                     "nav": round(nav, 4)
                                 })
-                                session.commit() # Commit each SIP immediately to reflect in logs/UI
+                                # Commit handled by context manager now
 
-                                logging.info(f"Auto-logged SIP for {sip['scheme_name']}")
-                                st.sidebar.success(f"Auto-logged SIP for {sip['scheme_name']}")
-                            else:
-                                st.sidebar.warning(f"Could not auto-log SIP for {sip['scheme_name']}. NAV fetch failed.")
-                        except Exception as e:
-                            st.sidebar.warning(f"Could not auto-log SIP for {sip['scheme_name']}. An error occurred: {e}")
-                            logging.error(f"Failed during MF SIP processing: {e}")
+                            logging.info(f"Auto-logged SIP for {sip['scheme_name']}")
+                            st.sidebar.success(f"Auto-logged SIP for {sip['scheme_name']}")
+                        else:
+                            st.sidebar.warning(f"Could not auto-log SIP for {sip['scheme_name']}. NAV fetch failed.")
+                    except Exception as e:
+                        st.sidebar.warning(f"Could not auto-log SIP for {sip['scheme_name']}. An error occurred: {e}")
+                        logging.error(f"Failed during MF SIP processing: {e}")
 
     except Exception as e:
         logging.error(f"Failed during MF SIP outer processing: {e}")
@@ -739,18 +668,16 @@ def _update_benchmark_data(ticker, start_date):
 
         df_to_insert = df_to_insert[["ticker", "date", "close_price"]].copy()
 
-        # Use ON CONFLICT DO NOTHING to handle existing primary keys (ticker, date)
-        with DB_CONN.session as session:
-            insert_query = text("""
-                INSERT INTO benchmark_history (ticker, date, close_price)
-                VALUES (:ticker, :date, :close_price)
-                ON CONFLICT (ticker, date) DO NOTHING
-            """)
-
-            # Execute in batches by converting DataFrame rows to a list of dicts
-            params = df_to_insert.to_dict('records')
-            session.execute(insert_query, params)
-            session.commit()
+        # Use bulk insert (to_sql) with replace to quickly update the entire benchmark
+        # history on every fetch. For benchmarks, this is often simpler than figuring
+        # out daily upsert logic for SQLite.
+        df_to_insert.to_sql(
+            'benchmark_history',
+            DB_CONN.engine, # Use the engine for bulk writes
+            if_exists='replace', # Use 'replace' for simplicity with benchmarks
+            index=False,
+            method='multi'
+        )
 
         logging.info(f"Successfully updated benchmark data for {ticker}.")
         return df_to_insert
@@ -778,16 +705,16 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     try:
         # 1. Try reading benchmark history from DB
         benchmark_query = text("""
-            SELECT date, close_price FROM benchmark_history
-            WHERE ticker = :ticker AND date >= :start_date
-            ORDER BY date ASC
-        """)
+            SELECT date, close_price FROM benchmark_history
+            WHERE ticker = :ticker AND date >= :start_date
+            ORDER BY date ASC
+        """)
         benchmark_df_db = pd.read_sql(benchmark_query, DB_CONN.engine,
                                      params={"ticker": selected_ticker, "start_date": start_date})
 
         # 2. If data is missing or incomplete (older than today), fetch/update it
         if benchmark_df_db.empty or benchmark_df_db['date'].max() < datetime.date.today().strftime('%Y-%m-%d'):
-            _update_benchmark_data(selected_ticker, start_date)
+            _update_benchmark_data(selected_ticker, "2020-01-01") # Use wide date for benchmark updates
             # Reread from DB after updating
             benchmark_df_db = pd.read_sql(benchmark_query, DB_CONN.engine,
                                          params={"ticker": selected_ticker, "start_date": start_date})
@@ -805,15 +732,15 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
         if not all_tickers:
             return pd.DataFrame()
 
-        placeholders = ', '.join([f':t{i}' for i in range(len(all_tickers))])
-        params = {f't{i}': ticker for i, ticker in enumerate(all_tickers)}
-        params['start_date'] = start_date
+        # Use explicit JOIN to fetch all prices for all required tickers since the start_date
+        placeholders = ', '.join([f"'{ticker}'" for ticker in all_tickers]) # Need explicit strings for SQLite IN clause
 
         price_data_query = text(f"""
-            SELECT date, ticker, close_price FROM price_history
-            WHERE ticker IN ({placeholders}) AND date >= :start_date
-        """)
-        all_prices = pd.read_sql(price_data_query, DB_CONN.engine, params=params)
+            SELECT date, ticker, close_price FROM price_history
+            WHERE ticker IN ({placeholders}) AND date >= :start_date
+        """)
+
+        all_prices = pd.read_sql(price_data_query, DB_CONN.engine, params={'start_date': start_date})
 
         all_prices['date'] = pd.to_datetime(all_prices['date'])
         price_pivot = all_prices.pivot(index='date', columns='ticker', values='close_price').ffill()
@@ -866,15 +793,14 @@ def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
     if not all_tickers:
         return metrics
 
-    placeholders = ', '.join([f':t{i}' for i in range(len(all_tickers))])
-    params = {f't{i}': ticker for i, ticker in enumerate(all_tickers)}
-    params['start_date'] = start_date
+    # Use explicit strings for SQLite IN clause
+    placeholders = ', '.join([f"'{ticker}'" for ticker in all_tickers])
 
     price_data_query = text(f"""
-        SELECT date, ticker, close_price FROM price_history
-        WHERE ticker IN ({placeholders}) AND date >= :start_date
-    """)
-    all_prices = pd.read_sql(price_data_query, DB_CONN.engine, params=params)
+        SELECT date, ticker, close_price FROM price_history
+        WHERE ticker IN ({placeholders}) AND date >= :start_date
+    """)
+    all_prices = pd.read_sql(price_data_query, DB_CONN.engine, params={'start_date': start_date})
 
     all_prices['date'] = pd.to_datetime(all_prices['date'])
     price_pivot = all_prices.pivot(index='date', columns='ticker', values='close_price').ffill()
@@ -909,13 +835,15 @@ def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
                 }).dropna()
                 if len(combined_returns) > 1:
                     cov_matrix = np.cov(combined_returns['portfolio'], combined_returns['benchmark'])
-                    beta = cov_matrix[0, 1] / cov_matrix[1, 1]
-                    metrics['beta'] = round(beta, 2)
-                    excess_portfolio_return = combined_returns['portfolio'].mean()
-                    excess_benchmark_return = combined_returns['benchmark'].mean()
-                    risk_free_rate = 0
-                    alpha = excess_portfolio_return - (risk_free_rate + beta * (excess_benchmark_return - risk_free_rate))
-                    metrics['alpha'] = round(alpha * 252 * 100, 2)
+                    # Check for zero variance in benchmark returns
+                    if cov_matrix[1, 1] > 1e-9:
+                        beta = cov_matrix[0, 1] / cov_matrix[1, 1]
+                        metrics['beta'] = round(beta, 2)
+                        excess_portfolio_return = combined_returns['portfolio'].mean()
+                        excess_benchmark_return = combined_returns['benchmark'].mean()
+                        risk_free_rate = 0
+                        alpha = excess_portfolio_return - (risk_free_rate + beta * (excess_benchmark_return - risk_free_rate))
+                        metrics['alpha'] = round(alpha * 252 * 100, 2)
         except Exception as e:
             logging.error(f"Failed to calculate Alpha/Beta for {selected_ticker}: {e}", exc_info=True)
     return metrics
@@ -961,14 +889,16 @@ def get_combined_returns():
     EXCLUDING data from paper trading.
     """
     # --- 1. Identify Live Trade Symbols (linked to fund transactions) ---
+    # SQLite compatible substring extraction (SUBSTR)
     live_trade_symbols_query = text("""
-    SELECT DISTINCT SUBSTRING(description FROM ' of (.*)')
-    FROM fund_transactions
-    WHERE type = 'Withdrawal' AND description LIKE 'Purchase % of %'
-    """)
+    SELECT DISTINCT SUBSTR(description, INSTR(description, ' of ') + 4)
+    FROM fund_transactions
+    WHERE type = 'Withdrawal' AND description LIKE 'Purchase % of %'
+    """)
     # CONVERTED: uses DB_CONN.engine for read
     live_trades_df = pd.read_sql(live_trade_symbols_query, DB_CONN.engine)
-    live_trade_symbols = set(live_trades_df.iloc[:, 0].tolist())
+    # Ensure the result column name is compatible (SQLite uses expression result name)
+    live_trade_symbols = set(live_trades_df.iloc[:, 0].str.strip().tolist() if not live_trades_df.empty else [])
 
     # --- 2. Investment Portfolio (Always considered 'live') ---
     inv_df = get_holdings_df("portfolio")
@@ -1262,6 +1192,10 @@ def funds_page():
     st.title("💰 Funds Management")
     st.sidebar.header("Add Transaction")
 
+    # --- USER INFORMATION: You want to use the "fund" section to monitor your bank account (finance account). ---
+    st.info("💡 Remember, you are using the Funds section to monitor your primary bank/finance account.")
+    # ---------------------------------------------------------------------------------------------------------
+
     with st.sidebar.form("deposit_form", clear_on_submit=True):
         st.subheader("Add Deposit")
         deposit_date = st.date_input("Date", max_value=datetime.date.today(), key="deposit_date")
@@ -1354,16 +1288,16 @@ def funds_page():
         # CONVERTED: Data editor save logic (DELETE + to_sql)
         if st.button("Save Changes to Transactions"):
             try:
-                with DB_CONN.session as session:
+                with DB_CONN.session() as session:
                     # 1. Delete all existing records
                     session.execute(text("DELETE FROM fund_transactions"))
 
                     # 2. Insert the full, edited data back into the table
+                    # We use raw execute for commit safety
                     edited_df.to_sql('fund_transactions', DB_CONN.engine, if_exists='append', index=False)
-                    session.commit()
 
-                    st.success("Funds transactions updated successfully! Rerunning to update the chart.")
-                    st.rerun()
+                st.success("Funds transactions updated successfully! Rerunning to update the chart.")
+                st.rerun()
 
             except Exception as e:
                 logging.error(f"Funds data editor save failed: {e}", exc_info=True)
@@ -1373,7 +1307,7 @@ def funds_page():
         st.info("No fund transactions logged yet.")
 
 def expense_tracker_page():
-    """Renders the Expense Tracker page with PostgreSQL logic."""
+    """Renders the Expense Tracker page with SQLite logic."""
     st.title("💸 Expense Tracker")
     _process_recurring_expenses()
 
@@ -1438,7 +1372,7 @@ def expense_tracker_page():
                 if trans_amount and final_cat and trans_pm:
 
                     # CONVERTED: Expense INSERT logic
-                    with DB_CONN.session as session:
+                    with DB_CONN.session() as session:
                         insert_query = text("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description) VALUES (:id, :date, :type, :amount, :category, :pmethod, :desc)")
                         session.execute(insert_query, {
                             "id": str(uuid.uuid4()),
@@ -1449,7 +1383,7 @@ def expense_tracker_page():
                             "pmethod": trans_pm,
                             "desc": trans_desc
                         })
-                        session.commit()
+                        # Commit handled by context manager now
 
                     st.success(f"{trans_type} added! Category: **{final_cat}**")
 
@@ -1521,11 +1455,11 @@ def expense_tracker_page():
 
         # ... (Chart logic remains the same) ...
 
-        # Monthly Spending Trend (CONVERTED query)
+        # Monthly Spending Trend (CONVERTED query - using SUBSTR for SQLite)
         monthly_spending_query = text("SELECT SUBSTR(date, 1, 7) AS month, SUM(amount) AS amount FROM expenses WHERE type='Expense' AND category != 'Transfer Out' GROUP BY month ORDER BY month DESC")
         monthly_spending_df = pd.read_sql(monthly_spending_query, DB_CONN.engine)
 
-        # Inflow vs. Outflow (CONVERTED query)
+        # Inflow vs. Outflow (CONVERTED query - using SUBSTR for SQLite)
         monthly_flows_query = text("SELECT SUBSTR(date, 1, 7) AS month, type, SUM(amount) AS amount FROM expenses WHERE (type='Income' AND category != 'Transfer In') OR (type='Expense' AND category != 'Transfer Out') GROUP BY month, type ORDER BY month DESC")
         monthly_flows_df = pd.read_sql(monthly_flows_query, DB_CONN.engine)
 
@@ -1554,7 +1488,7 @@ def expense_tracker_page():
                     group_id = str(uuid.uuid4())
 
                     # CONVERTED: Two-part Transfer INSERT logic
-                    with DB_CONN.session as session:
+                    with DB_CONN.session() as session:
                         insert_query = text("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (:id, :date, :type, :amount, :category, :pmethod, :desc, :group_id)")
 
                         # 1. Record Expense (Withdrawal) from Source
@@ -1570,7 +1504,7 @@ def expense_tracker_page():
                             "amount": round(transfer_amount, 2), "category": "Transfer In", "pmethod": dest_account,
                             "desc": f"Transfer from {source_account}" + (f" ({transfer_desc})" if transfer_desc else ""), "group_id": group_id
                         })
-                        session.commit()
+                        # Commit handled by context manager now
 
                     st.success(f"Transfer of ₹{transfer_amount:,.2f} recorded from **{source_account}** to **{dest_account}**.")
                     st.cache_data.clear()
@@ -1580,23 +1514,25 @@ def expense_tracker_page():
 
         st.subheader("Recent Consolidated Transfers (Read-Only)")
         # CONVERTED: Custom SQL to fetch transfers
+        # NOTE: SQLite uses simpler JOIN and lacks advanced string functions like SUBSTRING/FROM/FOR.
+        # We rely on joining the two legs via transfer_group_id.
         transfer_query = text("""
-        SELECT
-            T_OUT.transfer_group_id, T_OUT.date, T_OUT.amount,
-            T_OUT.payment_method AS from_account, T_IN.payment_method AS to_account,
-            T_OUT.description AS description
-        FROM
-            expenses AS T_OUT
-        INNER JOIN
-            expenses AS T_IN
-        ON
-            T_OUT.transfer_group_id = T_IN.transfer_group_id AND T_OUT.expense_id != T_IN.expense_id
-        WHERE
-            T_OUT.category = 'Transfer Out' AND T_IN.category = 'Transfer In'
-        ORDER BY
-            T_OUT.date DESC
-        LIMIT 10
-        """)
+        SELECT
+            T_OUT.transfer_group_id, T_OUT.date, T_OUT.amount,
+            T_OUT.payment_method AS from_account, T_IN.payment_method AS to_account,
+            T_OUT.description AS description
+        FROM
+            expenses AS T_OUT
+        INNER JOIN
+            expenses AS T_IN
+        ON
+            T_OUT.transfer_group_id = T_IN.transfer_group_id AND T_OUT.expense_id != T_IN.expense_id
+        WHERE
+            T_OUT.category = 'Transfer Out' AND T_IN.category = 'Transfer In'
+        ORDER BY
+            T_OUT.date DESC
+        LIMIT 10
+        """)
         transfer_df = pd.read_sql(transfer_query, DB_CONN.engine)
 
         # ... (rest of transfer display logic remains the same) ...
@@ -1633,7 +1569,7 @@ def expense_tracker_page():
             # CONVERTED: Save Changes to Transfers logic (DELETE + to_sql)
             if st.button("Save Changes to Transfers"):
                 try:
-                    with DB_CONN.session as session:
+                    with DB_CONN.session() as session:
                         # Re-fetch the non-transfer records before deleting everything
                         non_transfer_df = pd.read_sql(text("SELECT * FROM expenses WHERE category NOT IN ('Transfer Out', 'Transfer In')"), DB_CONN.engine)
 
@@ -1659,7 +1595,7 @@ def expense_tracker_page():
                         transfers_to_save = transfers_to_save[['expense_id', 'date', 'type', 'amount', 'category', 'payment_method', 'description', 'transfer_group_id']]
                         transfers_to_save.to_sql('expenses', DB_CONN.engine, if_exists='append', index=False)
 
-                        session.commit()
+                        # Commit handled by context manager now
                         st.success("Transfer transactions updated successfully! Rerunning to validate changes.")
                         st.rerun()
 
@@ -1694,7 +1630,7 @@ def expense_tracker_page():
             # CONVERTED: Expense History Save Logic (DELETE + to_sql)
             if st.button("Save Changes to Transactions"):
                 try:
-                    with DB_CONN.session as session:
+                    with DB_CONN.session() as session:
                         # 1. Fetch all existing transfers
                         transfers_df = pd.read_sql(text("SELECT * FROM expenses WHERE category IN ('Transfer Out', 'Transfer In')"), DB_CONN.engine)
 
@@ -1710,7 +1646,7 @@ def expense_tracker_page():
                             transfers_df['date'] = transfers_df['date'].astype(str)
                             transfers_df.to_sql('expenses', DB_CONN.engine, if_exists='append', index=False)
 
-                        session.commit()
+                        # Commit handled by context manager now
                         st.success("Expenses updated successfully! (Transfer records were preserved)")
                         st.cache_data.clear()
                         st.rerun()
@@ -1745,14 +1681,15 @@ def expense_tracker_page():
         # CONVERTED: Budget Save Logic (INSERT OR REPLACE)
         if st.button("Save Budgets"):
             try:
-                with DB_CONN.session as session:
-                    # PostgreSQL equivalent of INSERT OR REPLACE is ON CONFLICT, but we can simplify using a multi-step operation:
+                with DB_CONN.session() as session:
+                    # SQLite equivalent for INSERT OR REPLACE on a UNIQUE constraint
                     insert_or_replace_query = text("""
-                        INSERT INTO budgets (month_year, category, amount)
-                        VALUES (:month, :category, :amount)
-                        ON CONFLICT (month_year, category) DO UPDATE
-                        SET amount = EXCLUDED.amount
-                    """)
+                        INSERT OR REPLACE INTO budgets (budget_id, month_year, category, amount)
+                        VALUES (
+                            (SELECT budget_id FROM budgets WHERE month_year = :month AND category = :category),
+                            :month, :category, :amount
+                        )
+                    """)
 
                     for _, row in edited_budgets.iterrows():
                         if row['amount'] >= 0 and row['category']:
@@ -1762,7 +1699,7 @@ def expense_tracker_page():
                                 "amount": round(row['amount'], 2)
                             })
 
-                    session.commit()
+                    # Commit handled by context manager now
                     st.success("Budgets saved!")
                     st.rerun()
             except Exception as e:
@@ -1788,7 +1725,7 @@ def expense_tracker_page():
         # CONVERTED: Recurring Save Logic (DELETE + INSERT)
         if st.button("Save Recurring Rules"):
             try:
-                with DB_CONN.session as session:
+                with DB_CONN.session() as session:
                     # 1. Delete all existing records
                     session.execute(text("DELETE FROM recurring_expenses"))
 
@@ -1805,7 +1742,7 @@ def expense_tracker_page():
                                 "day": row['day_of_month']
                             })
 
-                    session.commit()
+                    # Commit handled by context manager now
                     st.success("Recurring expense rules saved!")
                     st.rerun()
             except Exception as e:
@@ -1868,7 +1805,7 @@ def mutual_fund_page():
                         update_funds_on_transaction(funds_change_type, round(amount + fund_adjustment, 2), f"MF {mf_type}: {selected_name}", mf_date.strftime("%Y-%m-%d"))
 
                         try:
-                            with DB_CONN.session as session:
+                            with DB_CONN.session() as session:
                                 insert_query = text("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (:id, :date, :name, :symbol, :type, :units, :nav)")
                                 session.execute(insert_query, {
                                     "id": str(uuid.uuid4()),
@@ -1879,7 +1816,7 @@ def mutual_fund_page():
                                     "units": round(units, 4),
                                     "nav": round(nav, 4)
                                 })
-                                session.commit()
+                                # Commit handled by context manager now
                         except Exception as e:
                             logging.error(f"MF transaction failed: {e}", exc_info=True)
                             st.error(f"Failed to record MF transaction: {e}")
@@ -1908,11 +1845,11 @@ def mutual_fund_page():
             st.divider()
 
             with st.expander("View Detailed Holdings"):
-                 styled_df = holdings_df.drop(columns=['yfinance_symbol']).style.map(color_return_value, subset=['P&L %']).format({
-                      "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
-                      "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
+                styled_df = holdings_df.drop(columns=['yfinance_symbol']).style.map(color_return_value, subset=['P&L %']).format({
+                     "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
+                     "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
                     })
-                 st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
             # ... (Return Chart logic remains the same) ...
             st.header("Return Chart")
@@ -1920,27 +1857,27 @@ def mutual_fund_page():
             selected_schemes = st.multiselect("Select schemes to compare", options=all_schemes, default=all_schemes)
 
             if selected_schemes:
-                 filtered_transactions = transactions_df[transactions_df['scheme_name'].isin(selected_schemes)]
-                 cumulative_return_df, sip_marker_df = _calculate_mf_cumulative_return(filtered_transactions)
+                filtered_transactions = transactions_df[transactions_df['scheme_name'].isin(selected_schemes)]
+                cumulative_return_df, sip_marker_df = _calculate_mf_cumulative_return(filtered_transactions)
 
-                 if not cumulative_return_df.empty:
-                      cumulative_return_df['date'] = pd.to_datetime(cumulative_return_df['date'])
+                if not cumulative_return_df.empty:
+                    cumulative_return_df['date'] = pd.to_datetime(cumulative_return_df['date'])
 
-                      line_chart = alt.Chart(cumulative_return_df).mark_line().encode(
-                          x=alt.X('date:T', title='Date'),
-                          y=alt.Y('cumulative_return:Q', title='Cumulative Return (%)'),
-                          color='scheme_name:N',
-                          tooltip=[
-                              alt.Tooltip('scheme_name', title='Scheme'),
-                              alt.Tooltip('date', title='Date', format='%Y-%m-%d'),
-                              alt.Tooltip('cumulative_return', title='Return %', format=".2f")
-                          ]
-                      ).properties(height=400).interactive()
+                    line_chart = alt.Chart(cumulative_return_df).mark_line().encode(
+                         x=alt.X('date:T', title='Date'),
+                         y=alt.Y('cumulative_return:Q', title='Cumulative Return (%)'),
+                         color='scheme_name:N',
+                         tooltip=[
+                             alt.Tooltip('scheme_name', title='Scheme'),
+                             alt.Tooltip('date', title='Date', format='%Y-%m-%d'),
+                             alt.Tooltip('cumulative_return', title='Return %', format=".2f")
+                         ]
+                     ).properties(height=400).interactive()
 
-                      zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
-                      st.altair_chart(line_chart + zero_line, use_container_width=True)
-                 else:
-                      st.info("Not enough data to generate the chart for the selected schemes.")
+                    zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                    st.altair_chart(line_chart + zero_line, use_container_width=True)
+                else:
+                    st.info("Not enough data to generate the chart for the selected schemes.")
             else:
                  st.info("No schemes selected to display the chart.")
         else:
@@ -1959,18 +1896,18 @@ def mutual_fund_page():
                                "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
                                "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
                                "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
-                                      })
+                                     })
 
             # CONVERTED: MF History Save Logic (DELETE + to_sql)
             if st.button("Save Mutual Fund Changes"):
                 try:
-                    with DB_CONN.session as session:
+                    with DB_CONN.session() as session:
                         session.execute(text("DELETE FROM mf_transactions"))
 
                         edited_df['date'] = edited_df['date'].astype(str)
                         edited_df.to_sql('mf_transactions', DB_CONN.engine, if_exists='append', index=False)
 
-                        session.commit()
+                        # Commit handled by context manager now
                         st.success("Mutual Fund transactions updated successfully!")
                         st.rerun()
                 except Exception as e:
@@ -2034,7 +1971,7 @@ def render_asset_page(config):
 
     st.sidebar.header(f"Add {config['asset_name']}")
     with st.sidebar.form(f"{key_prefix}_add_form"):
-        company_name = st.text_input(f"{config['asset_name']} Name", value="", key=f"{key_prefix}_add_company_name")
+        company_name = st.text_input(f"{config['asset_name']} Name", value=st.session_state.get(f"{key_prefix}_add_company_name", ""), key=f"{key_prefix}_add_company_name")
         search_button = st.form_submit_button("Search")
 
     if search_button and company_name:
@@ -2095,7 +2032,7 @@ def render_asset_page(config):
                     total_cost = (buy_price * quantity) + transaction_fee
 
                     try:
-                        with DB_CONN.session as session:
+                        with DB_CONN.session() as session:
 
                             # 1. CHECK IF ASSET ALREADY EXISTS (SELECT)
                             select_query = text(f"SELECT buy_price, buy_date, quantity, sector, market_cap, target_price, stop_loss_price FROM {config['asset_table']} WHERE {config['asset_col']}=:symbol")
@@ -2158,11 +2095,11 @@ def render_asset_page(config):
                             if not is_trading_section or (is_trading_section and not is_paper_trading):
                                 update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
 
-                            session.commit()
+                            # Commit handled by context manager now
                             st.rerun()
 
                     except Exception as e:
-                        logging.error(f"PostgreSQL Asset transaction failed for {symbol}: {e}", exc_info=True)
+                        logging.error(f"SQLite Asset transaction failed for {symbol}: {e}", exc_info=True)
                         st.error(f"Database error during purchase: {e}")
 
                 else:
@@ -2218,7 +2155,7 @@ def render_asset_page(config):
                     st.error("Quantity to sell must be positive.")
                 else:
                     try:
-                        with DB_CONN.session as session:
+                        with DB_CONN.session() as session:
 
                             # 1. FETCH BUY DETAILS (SELECT)
                             if is_trading_section:
@@ -2263,12 +2200,12 @@ def render_asset_page(config):
                                 update_open_query = text(f"UPDATE {config['asset_table']} SET quantity=:new_qty WHERE {config['asset_col']}=:symbol")
                                 session.execute(update_open_query, {"new_qty": current_qty - sell_qty, "symbol": symbol_to_sell})
 
-                            session.commit()
+                            # Commit handled by context manager now
                             st.success(f"Sold {sell_qty} units of {symbol_to_sell}.")
                             st.rerun()
 
                     except Exception as e:
-                        logging.error(f"PostgreSQL Asset Sell transaction failed for {symbol_to_sell}: {e}", exc_info=True)
+                        logging.error(f"SQLite Asset Sell transaction failed for {symbol_to_sell}: {e}", exc_info=True)
                         st.error(f"Database error during sale: {e}")
     else:
         st.sidebar.info(f"No open {config['asset_name_plural'].lower()}.")
@@ -2287,6 +2224,8 @@ def render_asset_page(config):
 
         for desc in fund_tx['description']:
             if desc and desc.startswith("Purchase"):
+                # SQLite substring function equivalent (SUBSTR(text, start, length))
+                # or rely on Python string splitting if SQL is too complex
                 parts = desc.split(' of ')
                 if len(parts) > 1:
                     live_trade_symbols.add(parts[-1].strip())
