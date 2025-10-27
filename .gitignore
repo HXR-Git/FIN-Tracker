@@ -1,5 +1,5 @@
 #finance.db
 .DS_Store
-finance.db
+#finance.db
 .streamlit/
 migration_env/
