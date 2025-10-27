@@ -1,20 +1,18 @@
 import streamlit as st
 import yfinance as yf
-import sqlite3
+import sqlite3 # <-- Added for SQLite
 from sqlalchemy import text, create_engine
 from sqlalchemy.exc import IntegrityError
 import pandas as pd
 import datetime
-import logging         # <--- ADD/RESTORE THIS LINE
+import logging # <-- Added for NameError fix
 import requests
 import altair as alt
 import uuid
 import numpy as np
 from mftool import Mftool
 import time
-import contextlib      # (This was added previously)
-# REMOVED: import socket
-# REMOVED: import socket # <--- REMOVED CRITICAL IMPORT FOR IPV4 FIX
+import contextlib # <-- Added for NameError fix
 
 # --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
@@ -115,11 +113,8 @@ class StreamlitConnectionMock:
         finally:
             conn.close()
 
-# Contextlib added for StreamlitConnectionMock
-import contextlib
-
 @st.cache_resource
-def get_db_connection(db_file="finance.db"):
+def get_db_connection(db_file="finance_dashboard.db"):
     """
     Creates and caches the SQLite connection object using Streamlit's resource
     caching. This will create a local 'finance_dashboard.db' file.
@@ -145,10 +140,8 @@ def initialize_database(conn):
     """Initializes all database tables if they don't exist and handles schema migrations."""
 
     # Define SQL commands using SQLAlchemy text() wrapper for DDL
-    # NOTE: PRIMARY KEY definition changed for SQLite compatibility (INTEGER PRIMARY KEY AUTOINCREMENT
-    # replaces SERIAL PRIMARY KEY)
     create_tables_sql = [
-        # Investment Tables (DOUBLE PRECISION for currency/price)
+        # Investment Tables (REAL replaces DOUBLE PRECISION)
         text("""CREATE TABLE IF NOT EXISTS portfolio (
                 ticker TEXT PRIMARY KEY, buy_price REAL NOT NULL,
                 buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
@@ -159,11 +152,13 @@ def initialize_database(conn):
                 buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
                 target_price REAL NOT NULL, stop_loss_price REAL NOT NULL
             )"""),
+        # IMPORTANT: Use simple, case-sensitive column names (ticker, date, close_price)
         text("""CREATE TABLE IF NOT EXISTS price_history (
                 ticker TEXT, date TEXT, close_price REAL,
                 PRIMARY KEY (ticker, date)
             )"""),
         # ADDED: Benchmark History Table for fast loading
+        # IMPORTANT: Use simple, case-sensitive column names (ticker, date, close_price)
         text("""CREATE TABLE IF NOT EXISTS benchmark_history (
                 ticker TEXT NOT NULL, date TEXT NOT NULL,
                 close_price REAL,
@@ -196,11 +191,13 @@ def initialize_database(conn):
                 type TEXT, transfer_group_id TEXT
             )"""),
         text("""CREATE TABLE IF NOT EXISTS budgets (
+                # Use AUTOINCREMENT for SQLite SERIAL equivalent
                 budget_id INTEGER PRIMARY KEY AUTOINCREMENT, month_year TEXT NOT NULL,
                 category TEXT NOT NULL, amount REAL NOT NULL,
                 UNIQUE(month_year, category)
             )"""),
         text("""CREATE TABLE IF NOT EXISTS recurring_expenses (
+                # Use AUTOINCREMENT for SQLite SERIAL equivalent
                 recurring_id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL UNIQUE,
                 amount REAL NOT NULL, category TEXT NOT NULL,
                 payment_method TEXT, day_of_month INTEGER NOT NULL
@@ -224,9 +221,8 @@ def initialize_database(conn):
         with conn.session() as session:
             for command in create_tables_sql:
                 session.execute(command)
-            # Commit handled by context manager now
 
-        # Handle migrations (this function must also use session.execute(text()))
+        # Handle migrations
         _add_missing_columns(conn)
 
     except Exception as e:
@@ -277,7 +273,7 @@ def _add_missing_columns(conn):
 
         # Commit handled by context manager now
 
-# REPLACED DB_CONN initialization to use the new SQLite function
+# Global variable to hold the connection object
 DB_CONN = get_db_connection()
 initialize_database(DB_CONN)
 
@@ -408,7 +404,25 @@ def get_mf_historical_data(scheme_code):
         logging.error(f"Failed to fetch historical data for scheme {scheme_code}: {e}")
         return pd.DataFrame()
 
-# CONVERTED: update_stock_data for bulk SQLite insert (via to_sql)
+# --- HELPER FUNCTION TO FIX to_sql COLUMN NAMING ---
+def insert_with_names(table, conn, keys, data_iter):
+    """Custom bulk insert for SQLite to ensure column names are correctly mapped."""
+    # Convert incoming data_iter to a list of tuples
+    data = [tuple(row) for row in data_iter]
+
+    # Use the actual column names (keys) from the DataFrame, enclosed in double quotes for safety
+    cols = ', '.join(f'"{c}"' for c in keys)
+
+    # Create placeholders for the values
+    placeholders = ', '.join('?' for _ in keys)
+
+    insert_query = f'INSERT INTO {table.name} ({cols}) VALUES ({placeholders})'
+
+    # Execute the query
+    with conn.begin() as conn_obj:
+        conn_obj.connection.executemany(insert_query, data)
+
+# CONVERTED & FIXED: update_stock_data for bulk SQLite insert (via custom method)
 def update_stock_data(symbol):
     """Downloads and saves historical stock data (Close Price only) to the SQLite database."""
     try:
@@ -426,17 +440,16 @@ def update_stock_data(symbol):
         data["ticker"] = symbol
         data["date"] = data["date_col"].dt.strftime("%Y-%m-%d")
 
+        # Ensure the DataFrame has only the final, correctly named columns
         df_to_insert = data[["ticker", "date", "close_price"]].copy()
 
-        # Use the engine for bulk writes. We use 'append' for SQLite, relying on the
-        # unique constraint (ticker, date) to prevent duplicates (though it may raise errors on conflict).
-        # A more robust solution might use ON CONFLICT in raw SQL, but to_sql is simpler.
+        # Use the custom method to ensure correct column name mapping on SQLite deployment
         df_to_insert.to_sql(
             'price_history',
             DB_CONN.engine, # Use the engine for bulk writes
             if_exists='append',
             index=False,
-            method='multi'
+            method=insert_with_names
         )
 
         return True
@@ -620,7 +633,7 @@ def _process_mf_sips():
                         if nav:
                             units = sip['amount'] / nav
 
-                            # 1. Update Funds (already converted to SQLite)
+                            # 1. Update Funds
                             update_funds_on_transaction("Withdrawal", round(sip['amount'], 2), f"MF SIP: {sip['scheme_name']}", sip_date_this_month)
 
                             # 2. Insert MF Transaction
@@ -647,10 +660,13 @@ def _process_mf_sips():
     except Exception as e:
         logging.error(f"Failed during MF SIP outer processing: {e}")
 
-# --- NEW/UPDATED BENCHMARK LOGIC ---
+# --- NEW/UPDATED BENCHMARK LOGIC (FIXED) ---
 
 def _update_benchmark_data(ticker, start_date):
-    """Fetches benchmark data from yfinance and saves it to the database."""
+    """
+    Fetches benchmark data from yfinance and saves it to the database.
+    Uses explicit INSERT logic to fix column naming errors on SQLite deployment.
+    """
     try:
         today = datetime.date.today()
         # Fetch data up to today + 1 day to ensure we get the latest close price
@@ -661,23 +677,27 @@ def _update_benchmark_data(ticker, start_date):
             return pd.DataFrame()
 
         data.reset_index(inplace=True)
-        df_to_insert = data[["Date", "Close"]].rename(columns={"Date": "date_col", "Close": "close_price"})
+        df_to_insert = data[["Date", "Close"]].rename(columns={"Date": "date", "Close": "close_price"})
 
         df_to_insert["ticker"] = ticker
-        df_to_insert["date"] = df_to_insert["date_col"].dt.strftime("%Y-%m-%d")
+        df_to_insert["date"] = df_to_insert["date"].dt.strftime("%Y-%m-%d")
 
         df_to_insert = df_to_insert[["ticker", "date", "close_price"]].copy()
 
-        # Use bulk insert (to_sql) with replace to quickly update the entire benchmark
-        # history on every fetch. For benchmarks, this is often simpler than figuring
-        # out daily upsert logic for SQLite.
-        df_to_insert.to_sql(
-            'benchmark_history',
-            DB_CONN.engine, # Use the engine for bulk writes
-            if_exists='replace', # Use 'replace' for simplicity with benchmarks
-            index=False,
-            method='multi'
-        )
+        # 1. Delete all existing data for this ticker (using session)
+        with DB_CONN.session() as session:
+            session.execute(text(f"DELETE FROM benchmark_history WHERE ticker = :ticker"), {"ticker": ticker})
+
+            # 2. Insert the new/updated data using explicit columns in SQL
+            # We use the to_sql method with the custom inserter helper to ensure correct column names.
+            df_to_insert.to_sql(
+                'benchmark_history',
+                DB_CONN.engine,
+                if_exists='append',
+                index=False,
+                method=insert_with_names
+            )
+            # Commit handled by context manager now
 
         logging.info(f"Successfully updated benchmark data for {ticker}.")
         return df_to_insert
@@ -714,7 +734,8 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
 
         # 2. If data is missing or incomplete (older than today), fetch/update it
         if benchmark_df_db.empty or benchmark_df_db['date'].max() < datetime.date.today().strftime('%Y-%m-%d'):
-            _update_benchmark_data(selected_ticker, "2020-01-01") # Use wide date for benchmark updates
+            # Use wide date for benchmark updates to ensure we get the full history for the delete/replace logic
+            _update_benchmark_data(selected_ticker, "2020-01-01")
             # Reread from DB after updating
             benchmark_df_db = pd.read_sql(benchmark_query, DB_CONN.engine,
                                          params={"ticker": selected_ticker, "start_date": start_date})
@@ -732,8 +753,8 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
         if not all_tickers:
             return pd.DataFrame()
 
-        # Use explicit JOIN to fetch all prices for all required tickers since the start_date
-        placeholders = ', '.join([f"'{ticker}'" for ticker in all_tickers]) # Need explicit strings for SQLite IN clause
+        # Use explicit strings for SQLite IN clause
+        placeholders = ', '.join([f"'{ticker}'" for ticker in all_tickers])
 
         price_data_query = text(f"""
             SELECT date, ticker, close_price FROM price_history
