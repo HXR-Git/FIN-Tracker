@@ -1,18 +1,19 @@
 import streamlit as st
 import yfinance as yf
-import sqlite3 # <-- Added for SQLite
+import sqlite3
 from sqlalchemy import text, create_engine
 from sqlalchemy.exc import IntegrityError
 import pandas as pd
 import datetime
-import logging # <-- Added for NameError fix
+import logging
 import requests
 import altair as alt
 import uuid
 import numpy as np
 from mftool import Mftool
 import time
-import contextlib # <-- Added for NameError fix
+import contextlib
+# REMOVED: import socket
 
 # --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
@@ -91,7 +92,7 @@ def bollinger(close, period=20, std_dev=2):
     lower_band = rolling_mean - (rolling_std * std_dev)
     return upper_band, rolling_mean, lower_band
 
-# --- DATABASE SETUP (SQLite Version - REVISED) ---
+# --- DATABASE SETUP (SQLite Version - FINALIZED) ---
 
 # Mock class to replicate st.connection behavior for SQLAlchemy Engine
 class StreamlitConnectionMock:
@@ -141,7 +142,7 @@ def initialize_database(conn):
 
     # Define SQL commands using SQLAlchemy text() wrapper for DDL
     create_tables_sql = [
-        # Investment Tables (REAL replaces DOUBLE PRECISION)
+        # Investment Tables
         text("""CREATE TABLE IF NOT EXISTS portfolio (
                 ticker TEXT PRIMARY KEY, buy_price REAL NOT NULL,
                 buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
@@ -152,13 +153,12 @@ def initialize_database(conn):
                 buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
                 target_price REAL NOT NULL, stop_loss_price REAL NOT NULL
             )"""),
-        # IMPORTANT: Use simple, case-sensitive column names (ticker, date, close_price)
+        # Price History Table
         text("""CREATE TABLE IF NOT EXISTS price_history (
                 ticker TEXT, date TEXT, close_price REAL,
                 PRIMARY KEY (ticker, date)
             )"""),
-        # ADDED: Benchmark History Table for fast loading
-        # IMPORTANT: Use simple, case-sensitive column names (ticker, date, close_price)
+        # Benchmark History Table
         text("""CREATE TABLE IF NOT EXISTS benchmark_history (
                 ticker TEXT NOT NULL, date TEXT NOT NULL,
                 close_price REAL,
@@ -178,26 +178,27 @@ def initialize_database(conn):
                 sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL,
                 target_price REAL NOT NULL, stop_loss_price REAL NOT NULL
             )"""),
-        # Funds & Expenses Tables (INTEGER PRIMARY KEY AUTOINCREMENT for auto-increment)
+        # Funds & Expenses Tables
         text("""CREATE TABLE IF NOT EXISTS fund_transactions (
                 transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL,
                 type TEXT NOT NULL, amount REAL NOT NULL,
                 description TEXT
             )"""),
-        # Added transfer_group_id column in initial creation
         text("""CREATE TABLE IF NOT EXISTS expenses (
                 expense_id TEXT PRIMARY KEY, date TEXT NOT NULL, amount REAL NOT NULL,
                 category TEXT NOT NULL, payment_method TEXT, description TEXT,
                 type TEXT, transfer_group_id TEXT
             )"""),
+        # Budgets Table (Fixed SQL comment)
         text("""CREATE TABLE IF NOT EXISTS budgets (
-                # Use AUTOINCREMENT for SQLite SERIAL equivalent
+                -- Use AUTOINCREMENT for SQLite SERIAL equivalent
                 budget_id INTEGER PRIMARY KEY AUTOINCREMENT, month_year TEXT NOT NULL,
                 category TEXT NOT NULL, amount REAL NOT NULL,
                 UNIQUE(month_year, category)
             )"""),
+        # Recurring Expenses Table (Fixed SQL comment)
         text("""CREATE TABLE IF NOT EXISTS recurring_expenses (
-                # Use AUTOINCREMENT for SQLite SERIAL equivalent
+                -- Use AUTOINCREMENT for SQLite SERIAL equivalent
                 recurring_id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL UNIQUE,
                 amount REAL NOT NULL, category TEXT NOT NULL,
                 payment_method TEXT, day_of_month INTEGER NOT NULL
@@ -232,9 +233,7 @@ def initialize_database(conn):
 
 
 def _migrate_fund_transactions_schema(conn):
-    """
-    Performs schema migration for fund_transactions if needed (placeholder/safety check).
-    """
+    """Placeholder/safety check."""
     table_name = 'fund_transactions'
     logging.info(f"Assuming {table_name} schema is correct post-initialization.")
 
@@ -247,7 +246,7 @@ def _add_missing_columns(conn):
         try:
             session.execute(text("ALTER TABLE portfolio ADD COLUMN sector TEXT"))
             logging.info("Added 'sector' column to 'portfolio' table.")
-        except Exception: # Catch exception if column already exists
+        except Exception:
             pass
 
         try:
@@ -270,8 +269,6 @@ def _add_missing_columns(conn):
             logging.info("Added 'transfer_group_id' column to 'expenses' table.")
         except Exception:
             pass
-
-        # Commit handled by context manager now
 
 # Global variable to hold the connection object
 DB_CONN = get_db_connection()
@@ -300,7 +297,6 @@ def update_funds_on_transaction(transaction_type, amount, description, date):
                     "description": description
                 }
             )
-            # Commit handled by context manager now
     except Exception as e:
         logging.error(f"Failed to update funds on transaction: {e}")
 
@@ -522,7 +518,7 @@ def _update_existing_portfolio_info():
         with DB_CONN.session() as session:
             # 1. Fetch tickers with missing info
             select_query = text("SELECT ticker, sector, market_cap FROM portfolio WHERE sector IS NULL OR market_cap IS NULL OR sector = 'N/A' OR market_cap = 'N/A'")
-            tickers_to_update = session.execute(select_query).fetchall()
+            tickers_to_update = session.execute(select_query, {}).fetchall()
 
             if tickers_to_update:
                 update_query = text("UPDATE portfolio SET sector = :sector, market_cap = :mcap WHERE ticker = :ticker")
@@ -647,7 +643,6 @@ def _process_mf_sips():
                                     "units": round(units, 4),
                                     "nav": round(nav, 4)
                                 })
-                                # Commit handled by context manager now
 
                             logging.info(f"Auto-logged SIP for {sip['scheme_name']}")
                             st.sidebar.success(f"Auto-logged SIP for {sip['scheme_name']}")
@@ -677,6 +672,7 @@ def _update_benchmark_data(ticker, start_date):
             return pd.DataFrame()
 
         data.reset_index(inplace=True)
+        # Rename columns to match the DB schema exactly
         df_to_insert = data[["Date", "Close"]].rename(columns={"Date": "date", "Close": "close_price"})
 
         df_to_insert["ticker"] = ticker
@@ -689,13 +685,12 @@ def _update_benchmark_data(ticker, start_date):
             session.execute(text(f"DELETE FROM benchmark_history WHERE ticker = :ticker"), {"ticker": ticker})
 
             # 2. Insert the new/updated data using explicit columns in SQL
-            # We use the to_sql method with the custom inserter helper to ensure correct column names.
             df_to_insert.to_sql(
                 'benchmark_history',
                 DB_CONN.engine,
                 if_exists='append',
                 index=False,
-                method=insert_with_names
+                method=insert_with_names # Use the custom inserter helper
             )
             # Commit handled by context manager now
 
