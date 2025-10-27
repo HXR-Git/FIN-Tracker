@@ -12,6 +12,7 @@ import uuid
 import numpy as np
 from mftool import Mftool
 import time
+import socket # <--- CRITICAL IMPORT ADDED FOR IPV4 FIX
 
 # --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
@@ -141,28 +142,58 @@ class MockConnection:
 
 @st.cache_resource
 def get_db_connection():
-    """Manually creates and caches the SQLAlchemy Engine, forcing the version bypass."""
+    """
+    Manually creates and caches the SQLAlchemy Engine.
+    Includes a critical fix to force IPv4 connection when deploying on Streamlit Cloud.
+    """
     global GLOBAL_DB_ENGINE
 
     if GLOBAL_DB_ENGINE is not None:
         return GLOBAL_DB_ENGINE
 
     try:
-        # 1. Fetch and fix the URL
+        # 1. Fetch the URL from secrets
         url = st.secrets.get("connections", {}).get("finance_db", {}).get("url")
+        url_to_use = url
 
-        # 2. Force the PostgreSQL driver explicitly (Using the working psycopg2 driver)
+        # --- CRITICAL IPV4 FIX FOR STREAMLIT CLOUD NETWORK ISSUES ---
+        # 1a. Extract the host name from the URL to perform DNS lookup
+        # Look for @ and then the port number or end of string
+        host_start = url.find("@") + 1
+        host_end = url.find(":", host_start)
+
+        if host_end == -1:
+            host_end = len(url)
+
+        host_name = url[host_start:host_end]
+
+        # 1b. Look up the IPv4 address
+        try:
+            ipv4_address = socket.gethostbyname(host_name)
+        except socket.gaierror:
+            # If resolution fails (e.g., local testing or unknown error), fall back to original URL
+            logging.warning(f"Could not resolve {host_name} to IPv4. Trying original URL.")
+            ipv4_address = None
+
+        # 1c. Replace the original hostname in the URL with the IPv4 address to force connection
+        if ipv4_address:
+            # We replace only the host portion for the final URL
+            url_to_use = url.replace(host_name, ipv4_address)
+        # --- END OF IPV4 FIX ---
+
+        # 2. Force the PostgreSQL driver explicitly (psycopg2)
         # This replaces the prefix and forces SQLAlchemy to use the reliable psycopg2 driver.
-        if url.startswith("postgresql://"):
-            url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-        elif url.startswith("cockroachdb://"):
-            url = url.replace("cockroachdb://", "postgresql+psycopg2://", 1)
+        if url_to_use.startswith("postgresql://"):
+            url_final = url_to_use.replace("postgresql://", "postgresql+psycopg2://", 1)
+        elif url_to_use.startswith("cockroachdb://"):
+            url_final = url_to_use.replace("cockroachdb://", "postgresql+psycopg2://", 1)
+        else:
+            url_final = url_to_use
+
 
         # 3. MANUALLY CREATE THE ENGINE
-        # CRITICAL FIX: Pass connect_args to set application_name, which is the key to bypassing
-        # CockroachDB's version check that causes the AssertionError.
         engine = create_engine(
-            url,
+            url_final, # Use the URL which may now contain the IPv4 address
             pool_recycle=3600,
             connect_args={
                 'options': '-c default_transaction_read_only=true -c search_path=public'
@@ -172,8 +203,7 @@ def get_db_connection():
         # 4. Attach the listener (Used to manually set version info)
         event.listen(engine, "connect", connect_listener)
 
-        # 5. CRITICAL: Force a test connection now. This executes the listener/connect_args,
-        # permanently fixing the engine before the rest of the app uses it.
+        # 5. CRITICAL: Force a test connection now.
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
 
@@ -195,73 +225,73 @@ def initialize_database(conn):
     create_tables_sql = [
         # Investment Tables (DOUBLE PRECISION for currency/price)
         text("""CREATE TABLE IF NOT EXISTS portfolio (
-                ticker TEXT PRIMARY KEY, buy_price DOUBLE PRECISION NOT NULL,
-                buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
-                sector TEXT, market_cap TEXT
-            )"""),
+                ticker TEXT PRIMARY KEY, buy_price DOUBLE PRECISION NOT NULL,
+                buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
+                sector TEXT, market_cap TEXT
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS trades (
-                symbol TEXT PRIMARY KEY, buy_price DOUBLE PRECISION NOT NULL,
-                buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
-                target_price DOUBLE PRECISION NOT NULL, stop_loss_price DOUBLE PRECISION NOT NULL
-            )"""),
+                symbol TEXT PRIMARY KEY, buy_price DOUBLE PRECISION NOT NULL,
+                buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
+                target_price DOUBLE PRECISION NOT NULL, stop_loss_price DOUBLE PRECISION NOT NULL
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS price_history (
-                ticker TEXT, date TEXT, close_price DOUBLE PRECISION,
-                PRIMARY KEY (ticker, date)
-            )"""),
+                ticker TEXT, date TEXT, close_price DOUBLE PRECISION,
+                PRIMARY KEY (ticker, date)
+            )"""),
         # ADDED: Benchmark History Table for fast loading
         text("""CREATE TABLE IF NOT EXISTS benchmark_history (
-                ticker TEXT NOT NULL, date TEXT NOT NULL,
-                close_price DOUBLE PRECISION,
-                PRIMARY KEY (ticker, date)
-            )"""),
+                ticker TEXT NOT NULL, date TEXT NOT NULL,
+                close_price DOUBLE PRECISION,
+                PRIMARY KEY (ticker, date)
+            )"""),
         # Realized/Exits Tables
         text("""CREATE TABLE IF NOT EXISTS realized_stocks (
-                transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL,
-                buy_price DOUBLE PRECISION NOT NULL, buy_date TEXT NOT NULL,
-                quantity INTEGER NOT NULL, sell_price DOUBLE PRECISION NOT NULL,
-                sell_date TEXT NOT NULL, realized_return_pct DOUBLE PRECISION NOT NULL
-            )"""),
+                transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL,
+                buy_price DOUBLE PRECISION NOT NULL, buy_date TEXT NOT NULL,
+                quantity INTEGER NOT NULL, sell_price DOUBLE PRECISION NOT NULL,
+                sell_date TEXT NOT NULL, realized_return_pct DOUBLE PRECISION NOT NULL
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS exits (
-                transaction_id TEXT PRIMARY KEY, symbol TEXT NOT NULL,
-                buy_price DOUBLE PRECISION NOT NULL, buy_date TEXT NOT NULL,
-                quantity INTEGER NOT NULL, sell_price DOUBLE PRECISION NOT NULL,
-                sell_date TEXT NOT NULL, realized_return_pct DOUBLE PRECISION NOT NULL,
-                target_price DOUBLE PRECISION NOT NULL, stop_loss_price DOUBLE PRECISION NOT NULL
-            )"""),
+                transaction_id TEXT PRIMARY KEY, symbol TEXT NOT NULL,
+                buy_price DOUBLE PRECISION NOT NULL, buy_date TEXT NOT NULL,
+                quantity INTEGER NOT NULL, sell_price DOUBLE PRECISION NOT NULL,
+                sell_date TEXT NOT NULL, realized_return_pct DOUBLE PRECISION NOT NULL,
+                target_price DOUBLE PRECISION NOT NULL, stop_loss_price DOUBLE PRECISION NOT NULL
+            )"""),
         # Funds & Expenses Tables (SERIAL PRIMARY KEY for auto-increment)
         text("""CREATE TABLE IF NOT EXISTS fund_transactions (
-                transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL,
-                type TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
-                description TEXT
-            )"""),
+                transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL,
+                type TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
+                description TEXT
+            )"""),
         # Added transfer_group_id column in initial creation
         text("""CREATE TABLE IF NOT EXISTS expenses (
-                expense_id TEXT PRIMARY KEY, date TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
-                category TEXT NOT NULL, payment_method TEXT, description TEXT,
-                type TEXT, transfer_group_id TEXT
-            )"""),
+                expense_id TEXT PRIMARY KEY, date TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
+                category TEXT NOT NULL, payment_method TEXT, description TEXT,
+                type TEXT, transfer_group_id TEXT
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS budgets (
-                budget_id SERIAL PRIMARY KEY, month_year TEXT NOT NULL,
-                category TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
-                UNIQUE(month_year, category)
-            )"""),
+                budget_id SERIAL PRIMARY KEY, month_year TEXT NOT NULL,
+                category TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
+                UNIQUE(month_year, category)
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS recurring_expenses (
-                recurring_id SERIAL PRIMARY KEY, description TEXT NOT NULL UNIQUE,
-                amount DOUBLE PRECISION NOT NULL, category TEXT NOT NULL,
-                payment_method TEXT, day_of_month INTEGER NOT NULL
-            )"""),
+                recurring_id SERIAL PRIMARY KEY, description TEXT NOT NULL UNIQUE,
+                amount DOUBLE PRECISION NOT NULL, category TEXT NOT NULL,
+                payment_method TEXT, day_of_month INTEGER NOT NULL
+            )"""),
         # Mutual Fund Tables
         text("""CREATE TABLE IF NOT EXISTS mf_transactions (
-                transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL,
-                scheme_name TEXT NOT NULL, yfinance_symbol TEXT NOT NULL,
-                type TEXT NOT NULL, units DOUBLE PRECISION NOT NULL,
-                nav DOUBLE PRECISION NOT NULL
-            )"""),
+                transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL,
+                scheme_name TEXT NOT NULL, yfinance_symbol TEXT NOT NULL,
+                type TEXT NOT NULL, units DOUBLE PRECISION NOT NULL,
+                nav DOUBLE PRECISION NOT NULL
+            )"""),
         text("""CREATE TABLE IF NOT EXISTS mf_sips (
-                sip_id SERIAL PRIMARY KEY, scheme_name TEXT NOT NULL UNIQUE,
-                yfinance_symbol TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
-                day_of_month INTEGER NOT NULL
-            )""")
+                sip_id SERIAL PRIMARY KEY, scheme_name TEXT NOT NULL UNIQUE,
+                yfinance_symbol TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL,
+                day_of_month INTEGER NOT NULL
+            )""")
     ]
 
     # Execute commands within a session
@@ -344,9 +374,9 @@ def update_funds_on_transaction(transaction_type, amount, description, date):
     with DB_CONN.session as session:
         session.execute(
             text("""
-                INSERT INTO fund_transactions (transaction_id, date, type, amount, description)
-                VALUES (:id, :date, :type, :amount, :description)
-            """),
+                INSERT INTO fund_transactions (transaction_id, date, type, amount, description)
+                VALUES (:id, :date, :type, :amount, :description)
+            """),
             params={
                 "id": str(uuid.uuid4()),
                 "date": date,
@@ -498,19 +528,19 @@ def get_holdings_df(table_name):
     # Queries use DB_CONN.engine for reads, which is safe.
     if table_name == "trades":
         query = text("""
-            SELECT p.symbol, p.buy_price, p.buy_date, p.quantity, p.target_price, p.stop_loss_price, h.close_price AS current_price
-            FROM trades p
-            LEFT JOIN price_history h ON p.symbol = h.ticker
-            WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.symbol)
-        """)
+            SELECT p.symbol, p.buy_price, p.buy_date, p.quantity, p.target_price, p.stop_loss_price, h.close_price AS current_price
+            FROM trades p
+            LEFT JOIN price_history h ON p.symbol = h.ticker
+            WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.symbol)
+        """)
         df = pd.read_sql(query, DB_CONN.engine)
     else:
         query = text("""
-            SELECT p.ticker AS symbol, p.buy_price, p.buy_date, p.quantity, p.sector, p.market_cap, h.close_price AS current_price
-            FROM portfolio p
-            LEFT JOIN price_history h ON p.ticker = h.ticker
-            WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.ticker)
-        """)
+            SELECT p.ticker AS symbol, p.buy_price, p.buy_date, p.quantity, p.sector, p.market_cap, h.close_price AS current_price
+            FROM portfolio p
+            LEFT JOIN price_history h ON p.ticker = h.ticker
+            WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.ticker)
+        """)
         df = pd.read_sql(query, DB_CONN.engine)
 
     if df.empty:
@@ -712,10 +742,10 @@ def _update_benchmark_data(ticker, start_date):
         # Use ON CONFLICT DO NOTHING to handle existing primary keys (ticker, date)
         with DB_CONN.session as session:
             insert_query = text("""
-                INSERT INTO benchmark_history (ticker, date, close_price)
-                VALUES (:ticker, :date, :close_price)
-                ON CONFLICT (ticker, date) DO NOTHING
-            """)
+                INSERT INTO benchmark_history (ticker, date, close_price)
+                VALUES (:ticker, :date, :close_price)
+                ON CONFLICT (ticker, date) DO NOTHING
+            """)
 
             # Execute in batches by converting DataFrame rows to a list of dicts
             params = df_to_insert.to_dict('records')
@@ -748,19 +778,19 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     try:
         # 1. Try reading benchmark history from DB
         benchmark_query = text("""
-            SELECT date, close_price FROM benchmark_history
-            WHERE ticker = :ticker AND date >= :start_date
-            ORDER BY date ASC
-        """)
+            SELECT date, close_price FROM benchmark_history
+            WHERE ticker = :ticker AND date >= :start_date
+            ORDER BY date ASC
+        """)
         benchmark_df_db = pd.read_sql(benchmark_query, DB_CONN.engine,
-                                      params={"ticker": selected_ticker, "start_date": start_date})
+                                     params={"ticker": selected_ticker, "start_date": start_date})
 
         # 2. If data is missing or incomplete (older than today), fetch/update it
         if benchmark_df_db.empty or benchmark_df_db['date'].max() < datetime.date.today().strftime('%Y-%m-%d'):
             _update_benchmark_data(selected_ticker, start_date)
             # Reread from DB after updating
             benchmark_df_db = pd.read_sql(benchmark_query, DB_CONN.engine,
-                                          params={"ticker": selected_ticker, "start_date": start_date})
+                                         params={"ticker": selected_ticker, "start_date": start_date})
 
         if benchmark_df_db.empty:
             logging.error(f"Failed to fetch benchmark data for {selected_ticker} even after update.")
@@ -780,9 +810,9 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
         params['start_date'] = start_date
 
         price_data_query = text(f"""
-            SELECT date, ticker, close_price FROM price_history
-            WHERE ticker IN ({placeholders}) AND date >= :start_date
-        """)
+            SELECT date, ticker, close_price FROM price_history
+            WHERE ticker IN ({placeholders}) AND date >= :start_date
+        """)
         all_prices = pd.read_sql(price_data_query, DB_CONN.engine, params=params)
 
         all_prices['date'] = pd.to_datetime(all_prices['date'])
@@ -841,9 +871,9 @@ def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
     params['start_date'] = start_date
 
     price_data_query = text(f"""
-        SELECT date, ticker, close_price FROM price_history
-        WHERE ticker IN ({placeholders}) AND date >= :start_date
-    """)
+        SELECT date, ticker, close_price FROM price_history
+        WHERE ticker IN ({placeholders}) AND date >= :start_date
+    """)
     all_prices = pd.read_sql(price_data_query, DB_CONN.engine, params=params)
 
     all_prices['date'] = pd.to_datetime(all_prices['date'])
@@ -932,10 +962,10 @@ def get_combined_returns():
     """
     # --- 1. Identify Live Trade Symbols (linked to fund transactions) ---
     live_trade_symbols_query = text("""
-    SELECT DISTINCT SUBSTRING(description FROM ' of (.*)')
-    FROM fund_transactions
-    WHERE type = 'Withdrawal' AND description LIKE 'Purchase % of %'
-    """)
+    SELECT DISTINCT SUBSTRING(description FROM ' of (.*)')
+    FROM fund_transactions
+    WHERE type = 'Withdrawal' AND description LIKE 'Purchase % of %'
+    """)
     # CONVERTED: uses DB_CONN.engine for read
     live_trades_df = pd.read_sql(live_trade_symbols_query, DB_CONN.engine)
     live_trade_symbols = set(live_trades_df.iloc[:, 0].tolist())
@@ -1551,22 +1581,22 @@ def expense_tracker_page():
         st.subheader("Recent Consolidated Transfers (Read-Only)")
         # CONVERTED: Custom SQL to fetch transfers
         transfer_query = text("""
-        SELECT
-            T_OUT.transfer_group_id, T_OUT.date, T_OUT.amount,
-            T_OUT.payment_method AS from_account, T_IN.payment_method AS to_account,
-            T_OUT.description AS description
-        FROM
-            expenses AS T_OUT
-        INNER JOIN
-            expenses AS T_IN
-        ON
-            T_OUT.transfer_group_id = T_IN.transfer_group_id AND T_OUT.expense_id != T_IN.expense_id
-        WHERE
-            T_OUT.category = 'Transfer Out' AND T_IN.category = 'Transfer In'
-        ORDER BY
-            T_OUT.date DESC
-        LIMIT 10
-        """)
+        SELECT
+            T_OUT.transfer_group_id, T_OUT.date, T_OUT.amount,
+            T_OUT.payment_method AS from_account, T_IN.payment_method AS to_account,
+            T_OUT.description AS description
+        FROM
+            expenses AS T_OUT
+        INNER JOIN
+            expenses AS T_IN
+        ON
+            T_OUT.transfer_group_id = T_IN.transfer_group_id AND T_OUT.expense_id != T_IN.expense_id
+        WHERE
+            T_OUT.category = 'Transfer Out' AND T_IN.category = 'Transfer In'
+        ORDER BY
+            T_OUT.date DESC
+        LIMIT 10
+        """)
         transfer_df = pd.read_sql(transfer_query, DB_CONN.engine)
 
         # ... (rest of transfer display logic remains the same) ...
@@ -1718,11 +1748,11 @@ def expense_tracker_page():
                 with DB_CONN.session as session:
                     # PostgreSQL equivalent of INSERT OR REPLACE is ON CONFLICT, but we can simplify using a multi-step operation:
                     insert_or_replace_query = text("""
-                        INSERT INTO budgets (month_year, category, amount)
-                        VALUES (:month, :category, :amount)
-                        ON CONFLICT (month_year, category) DO UPDATE
-                        SET amount = EXCLUDED.amount
-                    """)
+                        INSERT INTO budgets (month_year, category, amount)
+                        VALUES (:month, :category, :amount)
+                        ON CONFLICT (month_year, category) DO UPDATE
+                        SET amount = EXCLUDED.amount
+                    """)
 
                     for _, row in edited_budgets.iterrows():
                         if row['amount'] >= 0 and row['category']:
@@ -1846,8 +1876,8 @@ def mutual_fund_page():
                                     "name": selected_name,
                                     "symbol": selected_code,
                                     "type": mf_type,
-                                    "units": round(mf_units, 4),
-                                    "nav": round(mf_nav, 4)
+                                    "units": round(units, 4),
+                                    "nav": round(nav, 4)
                                 })
                                 session.commit()
                         except Exception as e:
@@ -1879,9 +1909,9 @@ def mutual_fund_page():
 
             with st.expander("View Detailed Holdings"):
                  styled_df = holdings_df.drop(columns=['yfinance_symbol']).style.map(color_return_value, subset=['P&L %']).format({
-                     "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
-                     "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
-                   })
+                      "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
+                      "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
+                    })
                  st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
             # ... (Return Chart logic remains the same) ...
@@ -1894,23 +1924,23 @@ def mutual_fund_page():
                  cumulative_return_df, sip_marker_df = _calculate_mf_cumulative_return(filtered_transactions)
 
                  if not cumulative_return_df.empty:
-                     cumulative_return_df['date'] = pd.to_datetime(cumulative_return_df['date'])
+                      cumulative_return_df['date'] = pd.to_datetime(cumulative_return_df['date'])
 
-                     line_chart = alt.Chart(cumulative_return_df).mark_line().encode(
-                         x=alt.X('date:T', title='Date'),
-                         y=alt.Y('cumulative_return:Q', title='Cumulative Return (%)'),
-                         color='scheme_name:N',
-                         tooltip=[
-                             alt.Tooltip('scheme_name', title='Scheme'),
-                             alt.Tooltip('date', title='Date', format='%Y-%m-%d'),
-                             alt.Tooltip('cumulative_return', title='Return %', format=".2f")
-                         ]
-                     ).properties(height=400).interactive()
+                      line_chart = alt.Chart(cumulative_return_df).mark_line().encode(
+                          x=alt.X('date:T', title='Date'),
+                          y=alt.Y('cumulative_return:Q', title='Cumulative Return (%)'),
+                          color='scheme_name:N',
+                          tooltip=[
+                              alt.Tooltip('scheme_name', title='Scheme'),
+                              alt.Tooltip('date', title='Date', format='%Y-%m-%d'),
+                              alt.Tooltip('cumulative_return', title='Return %', format=".2f")
+                          ]
+                      ).properties(height=400).interactive()
 
-                     zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
-                     st.altair_chart(line_chart + zero_line, use_container_width=True)
+                      zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                      st.altair_chart(line_chart + zero_line, use_container_width=True)
                  else:
-                     st.info("Not enough data to generate the chart for the selected schemes.")
+                      st.info("Not enough data to generate the chart for the selected schemes.")
             else:
                  st.info("No schemes selected to display the chart.")
         else:
@@ -1929,7 +1959,7 @@ def mutual_fund_page():
                                "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
                                "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
                                "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
-                                     })
+                                      })
 
             # CONVERTED: MF History Save Logic (DELETE + to_sql)
             if st.button("Save Mutual Fund Changes"):
