@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import sqlite3
 from sqlalchemy import text, create_engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError as SQLAlchemyOperationalError
 import pandas as pd
 import datetime
 import logging
@@ -13,7 +13,8 @@ import numpy as np
 from mftool import Mftool
 import time
 import contextlib
-# REMOVED: import socket
+# FIX: Import tenacity for database retries
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
 # --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
@@ -99,9 +100,20 @@ class StreamlitConnectionMock:
     def __init__(self, engine):
         self.engine = engine
 
-    # Provides a context manager for manual connection/transaction management
+    # FIX: Apply retry decorator to handle transient 'database is locked' errors
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_fixed(1),
+        # Retry specifically on the low-level SQLite OperationalError or the SQLAlchemy wrapper
+        retry=retry_if_exception_type((sqlite3.OperationalError, SQLAlchemyOperationalError)),
+        reraise=True
+    )
     @contextlib.contextmanager
     def session(self):
+        """
+        Provides a context manager for manual connection/transaction management.
+        Retries on 'database is locked' errors.
+        """
         conn = self.engine.connect()
         # Begin a transaction explicitly for session context
         transaction = conn.begin()
@@ -109,6 +121,9 @@ class StreamlitConnectionMock:
             yield conn
             transaction.commit()
         except Exception as e:
+            # Check for specific lock error before rollback and re-raise
+            if isinstance(e, (sqlite3.OperationalError, SQLAlchemyOperationalError)) and 'database is locked' in str(e):
+                logging.warning("Database locked detected, attempting retry...")
             transaction.rollback()
             raise e
         finally:
@@ -416,6 +431,7 @@ def insert_with_names(table, conn, keys, data_iter):
 
     # Execute the query
     with conn.begin() as conn_obj:
+        # Use the raw connection for executemany, which works well with SQLite and pandas to_sql method
         conn_obj.connection.executemany(insert_query, data)
 
 # CONVERTED & FIXED: update_stock_data for bulk SQLite insert (via custom method)
@@ -1796,8 +1812,20 @@ def mutual_fund_page():
                 st.session_state[f"{key_prefix}_search_results"] = []
             st.session_state[f"{key_prefix}_selected_scheme_code"] = None
             st.rerun()
-        if st.session_state.get(f"{key_prefix}_selected_result"):
-            selected_result = st.session_state[f"{key_prefix}_selected_result"]
+        if st.session_state.get(f"{key_prefix}_search_results"):
+            selected_result = st.sidebar.selectbox(
+                "Select Scheme",
+                options=[None] + st.session_state[f"{key_prefix}_search_results"],
+                index=0,
+                key=f"{key_prefix}_selected_result",
+                format_func=lambda x: x if x else "Select a scheme..."
+            )
+            if selected_result and selected_result != st.session_state.get(f"{key_prefix}_prev_selected_result"):
+                st.session_state[f"{key_prefix}_prev_selected_result"] = selected_result
+                st.rerun()
+
+        if st.session_state.get(f"{key_prefix}_prev_selected_result") and st.session_state[f"{key_prefix}_prev_selected_result"] is not None:
+            selected_result = st.session_state[f"{key_prefix}_prev_selected_result"]
             selected_name = selected_result.split(" (")[0]
             selected_code = selected_result.split(" (")[-1].replace(")", "")
             st.session_state[f"{key_prefix}_selected_scheme_code"] = selected_code
@@ -1829,8 +1857,8 @@ def mutual_fund_page():
                                     "name": selected_name,
                                     "symbol": selected_code,
                                     "type": mf_type,
-                                    "units": round(units, 4),
-                                    "nav": round(nav, 4)
+                                    "units": round(mf_units, 4),
+                                    "nav": round(mf_nav, 4)
                                 })
                                 # Commit handled by context manager now
                         except Exception as e:
@@ -1838,7 +1866,7 @@ def mutual_fund_page():
                             st.error(f"Failed to record MF transaction: {e}")
 
                         st.success(f"{mf_type} of {selected_name} logged!")
-                        st.session_state[f"{key_prefix}_selected_result"] = None
+                        st.session_state[f"{key_prefix}_prev_selected_result"] = None
                         st.session_state[f"{key_prefix}_search_results"] = []
                         st.session_state[f"{key_prefix}_search_term_input"] = ""
                         st.rerun()
@@ -1888,7 +1916,7 @@ def mutual_fund_page():
                              alt.Tooltip('date', title='Date', format='%Y-%m-%d'),
                              alt.Tooltip('cumulative_return', title='Return %', format=".2f")
                          ]
-                     ).properties(height=400).interactive()
+                       ).properties(height=400).interactive()
 
                     zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
                     st.altair_chart(line_chart + zero_line, use_container_width=True)
@@ -1912,7 +1940,7 @@ def mutual_fund_page():
                                "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
                                "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
                                "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
-                                     })
+                                      })
 
             # CONVERTED: MF History Save Logic (DELETE + to_sql)
             if st.button("Save Mutual Fund Changes"):
