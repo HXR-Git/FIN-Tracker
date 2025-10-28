@@ -115,7 +115,7 @@ class StreamlitConnectionMock:
             conn.close()
 
 @st.cache_resource
-def get_db_connection(db_file="finance_dashboard.db"):
+def get_db_connection(db_file="finance.db"):
     """
     Creates and caches the SQLite connection object using Streamlit's resource
     caching. This will create a local 'finance_dashboard.db' file.
