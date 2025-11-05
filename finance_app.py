@@ -248,8 +248,8 @@ def search_for_ticker(company_name):
         # Fallback to local secrets access
         api_key = st.secrets.get("api_keys", {}).get("finnhub")
         if not api_key:
-             logging.warning("Finnhub API key not found in st.secrets.")
-             return []
+            logging.warning("Finnhub API key not found in st.secrets.")
+            return []
 
         url = f"https://finnhub.io/api/v1/search?q={company_name}&token={api_key}"
         response = requests.get(url, timeout=10)
@@ -1496,11 +1496,11 @@ def expense_tracker_page():
             # The st.data_editor will display the data in this sorted order
             edited_df = st.data_editor(all_expenses_df, use_container_width=True, hide_index=True, num_rows="dynamic",
                                              column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
-                                                             "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                             "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
-                                                             # Use a selectbox for categories allowing user input of new ones
-                                                             "category": st.column_config.SelectboxColumn("Category", options=editable_categories, required=True),
-                                                             "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS], required=True)})
+                                                            "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                            "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
+                                                            # Use a selectbox for categories allowing user input of new ones
+                                                            "category": st.column_config.SelectboxColumn("Category", options=editable_categories, required=True),
+                                                            "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS], required=True)})
 
             # Manually convert 'date' column back to string for SQLite insertion
             edited_df['date'] = edited_df['date'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, datetime.date) else x)
@@ -1696,12 +1696,12 @@ def mutual_fund_page():
             st.subheader("Edit Mutual Fund Transactions")
             edited_df = st.data_editor(transactions_df, use_container_width=True, hide_index=True, num_rows="dynamic",
                                              column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
-                                                             "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                             "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
-                                                             "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
-                                                             "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
-                                                             "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
-                                                             "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
+                                                            "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                            "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
+                                                            "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
+                                                            "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
+                                                            "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
+                                                            "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
                                                                  })
 
             if st.button("Save Mutual Fund Changes"):
@@ -1743,7 +1743,7 @@ def render_asset_page(config):
     st.title(config["title"])
 
     # --- FIX: Initialize trade_mode_selection to prevent UnboundLocalError ---
-    trade_mode_selection = ""
+    trade_mode_selection = "All Trades"
     # -----------------------------------------------------------------------
 
     is_paper_trading = False
@@ -1751,10 +1751,15 @@ def render_asset_page(config):
         # --- 1. Paper Trading Toggle (Controls Fund Linkage) ---
         if f"{key_prefix}_paper_trading_state" not in st.session_state:
             st.session_state[f"{key_prefix}_paper_trading_state"] = False
+
+        # Read the state from the toggle
         is_paper_trading = st.toggle("Enable Paper Trading (Transactions won't affect Funds)",
                                      key=f"{key_prefix}_paper_trading_toggle",
                                      value=st.session_state[f"{key_prefix}_paper_trading_state"])
+
+        # Immediately save the new toggle state back to session state
         st.session_state[f"{key_prefix}_paper_trading_state"] = is_paper_trading
+
         if is_paper_trading:
             st.warning("⚠️ **Paper Trading is active.** Buy/Sell transactions will **NOT** update your 'Funds' section.")
         st.divider()
@@ -1816,26 +1821,33 @@ def render_asset_page(config):
                 stop_loss_price = st.number_input("Stop Loss Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_stop_loss_price")
             add_button = st.form_submit_button(f"Add to {config['asset_name_plural']}")
             if add_button:
+                # --- START OF FIX ---
+                # Retrieve the paper trading state directly from session state for robustness in the form submit block
+                is_paper_trading_on_submit = st.session_state.get(f"trade_paper_trading_state", False) if is_trading_section else False
+
                 if not (buy_price and buy_price > 0 and quantity and quantity > 0):
                     st.error("Buy Price and Quantity must be positive.")
                 elif update_stock_data(symbol):
                     total_cost = (buy_price * quantity) + transaction_fee
                     c.execute(f"SELECT * FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol,))
                     existing = c.fetchone()
+
                     if existing:
                         old_buy_price, old_quantity = existing[1], existing[3]
                         old_total_cost = old_buy_price * old_quantity
                         new_quantity = old_quantity + quantity
-                        new_avg_price = (old_total_cost + total_cost - transaction_fee) / new_quantity
+                        # Total investment excluding fees for avg price calculation
+                        new_avg_price = (old_total_cost + (buy_price * quantity)) / new_quantity
+
                         if is_trading_section:
                             c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, target_price=?, stop_loss_price=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, round(target_price, 2), round(stop_loss_price, 2), symbol))
                         else:
                             c.execute(f"UPDATE {config['asset_table']} SET buy_price=?, quantity=?, sector=?, market_cap=? WHERE {config['asset_col']}=?", (round(new_avg_price, 2), new_quantity, sector, _categorize_market_cap(market_cap), symbol))
 
-                        # --- UPDATED: Conditional Fund Update ---
-                        if not is_trading_section or (is_trading_section and not is_paper_trading):
+                        # --- FUND UPDATE LOGIC (BUY) ---
+                        if not is_trading_section or (is_trading_section and not is_paper_trading_on_submit):
                             update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
-                        # --------------------------------------
+                        # -------------------------------
 
                         st.success(f"Updated {symbol}. New quantity: {new_quantity}, New avg. price: {currency}{new_avg_price:,.2f}")
                     else:
@@ -1844,16 +1856,19 @@ def render_asset_page(config):
                         else:
                             c.execute(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, sector, market_cap) VALUES (?, ?, ?, ?, ?, ?)", (symbol, round(buy_price, 2), buy_date.strftime("%Y-%m-%d"), quantity, sector, _categorize_market_cap(market_cap)))
 
-                        # --- UPDATED: Conditional Fund Update ---
-                        if not is_trading_section or (is_trading_section and not is_paper_trading):
+                        # --- FUND UPDATE LOGIC (BUY) ---
+                        if not is_trading_section or (is_trading_section and not is_paper_trading_on_submit):
                             update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
-                        # --------------------------------------
+                        # -------------------------------
 
                         st.success(f"{symbol} added successfully!")
+
                     DB_CONN.commit()
                     st.rerun()
                 else:
                     st.error(f"Failed to fetch historical data for {symbol}. Cannot add.")
+                # --- END OF FIX ---
+
 
     st.sidebar.header(f"Sell {config['asset_name']}")
     all_symbols = pd.read_sql(f"SELECT {config['asset_col']} FROM {config['asset_table']}", DB_CONN)[config['asset_col']].tolist()
@@ -1885,6 +1900,10 @@ def render_asset_page(config):
             sell_transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_sell_transaction_fee", disabled=is_disabled, value=0.0)
             sell_button = st.form_submit_button(f"Sell {config['asset_name']}")
             if sell_button:
+                # --- START OF FIX ---
+                # Retrieve the paper trading state directly from session state for robustness in the form submit block
+                is_paper_trading_on_submit = st.session_state.get(f"trade_paper_trading_state", False) if is_trading_section else False
+
                 if not symbol_to_sell:
                     st.warning(f"Please select a {config['asset_name']} to sell.")
                 elif not (sell_price and sell_price > 0):
@@ -1909,10 +1928,10 @@ def render_asset_page(config):
                         c.execute(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                                   (transaction_id, symbol_to_sell, round(buy_price, 2), buy_date, sell_qty, round(sell_price, 2), sell_date.strftime("%Y-%m-%d"), round(realized_return, 2)))
 
-                    # --- UPDATED: Conditional Fund Update ---
-                    if not is_trading_section or (is_trading_section and not is_paper_trading):
+                    # --- FUND UPDATE LOGIC (SELL) ---
+                    if not is_trading_section or (is_trading_section and not is_paper_trading_on_submit):
                         update_funds_on_transaction("Deposit", round((sell_price * sell_qty) - sell_transaction_fee, 2), f"Sale of {sell_qty} units of {symbol_to_sell}", sell_date.strftime("%Y-%m-%d"))
-                    # --------------------------------------
+                    # --------------------------------
 
                     if sell_qty == current_qty:
                         c.execute(f"DELETE FROM {config['asset_table']} WHERE {config['asset_col']}=?", (symbol_to_sell,))
@@ -1921,6 +1940,7 @@ def render_asset_page(config):
                     DB_CONN.commit()
                     st.success(f"Sold {sell_qty} units of {symbol_to_sell}.")
                     st.rerun()
+                # --- END OF FIX ---
     else:
         st.sidebar.info(f"No open {config['asset_name_plural'].lower()}.")
 
@@ -1973,13 +1993,13 @@ def render_asset_page(config):
             with col3: st.metric("Total Return", f"₹{total_return_amount:,.2f}", f"{total_return_percent:.2f}%")
 
             if not is_trading_section:
-                 # ... Alpha/Beta metrics display (Investment section only) ...
-                 benchmark_choice = 'Nifty 50'
-                 metrics = calculate_portfolio_metrics(df_to_display, pd.DataFrame(), benchmark_choice)
-                 col_alpha, col_beta, col_drawdown = st.columns(3)
-                 with col_alpha: st.metric("Alpha", f"{metrics['alpha']}%")
-                 with col_beta: st.metric("Beta", f"{metrics['beta']}")
-                 with col_drawdown: st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
+                # ... Alpha/Beta metrics display (Investment section only) ...
+                benchmark_choice = 'Nifty 50'
+                metrics = calculate_portfolio_metrics(df_to_display, pd.DataFrame(), benchmark_choice)
+                col_alpha, col_beta, col_drawdown = st.columns(3)
+                with col_alpha: st.metric("Alpha", f"{metrics['alpha']}%")
+                with col_beta: st.metric("Beta", f"{metrics['beta']}")
+                with col_drawdown: st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
 
             st.divider()
             with st.expander(f"View Detailed {view_options[0]}"):
