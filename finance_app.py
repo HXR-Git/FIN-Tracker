@@ -219,23 +219,22 @@ initialize_database(DB_CONN)
 def update_funds_on_transaction(transaction_type, amount, description, date):
     """Inserts a new transaction into the fund_transactions table."""
 
-    # Clean up description if it contains the old ALLOCATION tag for new entries
+
     if description and description.startswith("ALLOCATION:"):
         description = description.split(' - ', 1)[-1].strip()
 
     c = DB_CONN.cursor()
-    # The SQL INSERT statement now excludes the allocation_type column
+
     c.execute("INSERT INTO fund_transactions (transaction_id, date, type, amount, description) VALUES (?, ?, ?, ?, ?)",
               (str(uuid.uuid4()), date, transaction_type, amount, description))
     DB_CONN.commit()
 
-# --- API & DATA FUNCTIONS ---
+
 @st.cache_data(ttl=3600)
 def search_for_ticker(company_name):
     """Searches for a stock ticker using a company name via Finnhub API."""
     try:
-        # Assuming st.secrets["api_keys"]["finnhub"] is correctly configured in your environment
-        # Fallback to local secrets access
+
         api_key = st.secrets.get("api_keys", {}).get("finnhub")
         if not api_key:
             logging.warning("Finnhub API key not found in st.secrets.")
@@ -252,7 +251,7 @@ def search_for_ticker(company_name):
 
 @st.cache_data(ttl=600)
 def fetch_stock_info(symbol):
-    """Fetches key stock information including price, sector, and market cap using yfinance."""
+
     max_retries = 3
     retry_delay = 5
     for attempt in range(max_retries):
@@ -263,7 +262,7 @@ def fetch_stock_info(symbol):
             price = info.get('currentPrice') or info.get('regularMarketPrice')
 
             if price is None:
-                # Fallback to fetching latest closing price from historical data
+
                 data = ticker_obj.history(period='1d', auto_adjust=True)
                 if not data.empty:
                     price = data['Close'].iloc[-1]
@@ -276,7 +275,7 @@ def fetch_stock_info(symbol):
             if sector == 'N/A' and ('fundFamily' in info or 'category' in info):
                 sector = info.get('fundFamily') or info.get('category')
 
-            # Use data from the latest download if price from info failed, just for robustness
+
             if price is None:
                 latest_db_price = pd.read_sql("SELECT close_price FROM price_history WHERE ticker = ? ORDER BY date DESC LIMIT 1", DB_CONN, params=(symbol,))
                 if not latest_db_price.empty:
@@ -293,7 +292,7 @@ def fetch_stock_info(symbol):
 
 @st.cache_data(ttl=3600)
 def fetch_mf_schemes():
-    """Fetches all mutual fund scheme codes and names using mftool."""
+
     try:
         mf = Mftool()
         schemes = mf.get_scheme_codes()
@@ -304,7 +303,7 @@ def fetch_mf_schemes():
 
 @st.cache_data(ttl=600)
 def fetch_latest_mf_nav(scheme_code):
-    """Fetches the latest NAV for a given scheme code."""
+
     try:
         mf = Mftool()
         data = mf.get_scheme_quote(scheme_code)
@@ -317,7 +316,7 @@ def fetch_latest_mf_nav(scheme_code):
 
 @st.cache_data(ttl=86400)
 def get_mf_historical_data(scheme_code):
-    """Fetches historical NAV data for a mutual fund."""
+
     try:
         mf = Mftool()
         data = mf.get_scheme_historical_nav(scheme_code)
@@ -334,7 +333,7 @@ def get_mf_historical_data(scheme_code):
         return pd.DataFrame()
 
 def update_stock_data(symbol):
-    """Downloads and saves historical stock data (Close Price only) to the database."""
+
     try:
         ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol and not symbol.endswith('.NS') else symbol
         today = datetime.date.today()
@@ -387,7 +386,7 @@ def get_holdings_df(table_name):
         return pd.DataFrame()
 
 def get_realized_df(table_name):
-    """Fetches and calculates realized profits/losses from the database."""
+
     try:
         df = pd.read_sql(f"SELECT * FROM {table_name}", DB_CONN)
         if df.empty:
@@ -405,7 +404,7 @@ def get_realized_df(table_name):
         return pd.DataFrame()
 
 def _update_existing_portfolio_info():
-    """Fetches and updates missing sector and market cap data for existing stocks."""
+
     c = DB_CONN.cursor()
     c.execute("SELECT ticker FROM portfolio WHERE sector IS NULL OR market_cap IS NULL OR sector = 'N/A' OR market_cap = 'N/A'")
     tickers_to_update = [row[0] for row in c.fetchall()]
@@ -422,7 +421,7 @@ def _update_existing_portfolio_info():
         DB_CONN.commit()
 
 def _categorize_market_cap(market_cap_value):
-    """Categorizes a market cap value into Large, Mid, or Small Cap."""
+
     if isinstance(market_cap_value, (int, float)):
         if market_cap_value >= 10000000000:
             return "Large Cap"
@@ -432,9 +431,9 @@ def _categorize_market_cap(market_cap_value):
             return "Small Cap"
     return "N/A"
 
-# --- HELPER FUNCTIONS ---
+
 def _process_recurring_expenses():
-    """Adds recurring expenses to the database if not already logged for the current month."""
+
     c = DB_CONN.cursor()
     month_year = datetime.date.today().strftime("%Y-%m")
     try:
@@ -457,7 +456,7 @@ def _process_recurring_expenses():
         logging.error(f"Could not process recurring expenses: {e}")
 
 def _process_mf_sips():
-    """Automatically logs mutual fund SIP transactions if the date is passed."""
+
     c = DB_CONN.cursor()
     today = datetime.date.today()
     month_year = today.strftime("%Y-%m")
@@ -492,10 +491,7 @@ def _process_mf_sips():
 
 @st.cache_data(ttl=3600)
 def get_benchmark_comparison_data(holdings_df, benchmark_choice):
-    """
-    Generates portfolio vs. benchmark return data for charting.
-    Updated to handle only standard index benchmarks after removing MV-X.
-    """
+
     if holdings_df.empty:
         return pd.DataFrame()
 
@@ -507,13 +503,13 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     selected_ticker = benchmark_map.get(benchmark_choice)
 
     if not selected_ticker:
-        # If a non-index benchmark is selected (which shouldn't happen now, but as a safeguard)
+
         return pd.DataFrame()
 
-    # 1. Calculate Portfolio Returns (Required for all benchmarks)
+
     all_tickers = holdings_df['symbol'].unique().tolist()
 
-    # Query all prices, not just close price, in case it's needed later. But for portfolio return, close is enough.
+
     price_data_query = f"""SELECT date, ticker, close_price FROM price_history WHERE ticker IN ({','.join(['?']*len(all_tickers))}) AND date >= ?"""
     all_prices = pd.read_sql(price_data_query, DB_CONN, params=[*all_tickers, start_date])
     all_prices['date'] = pd.to_datetime(all_prices['date'])
@@ -533,11 +529,11 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     total_daily_invested = daily_invested.sum(axis=1)
     total_daily_invested_clean = total_daily_invested.replace(0, np.nan).ffill()
 
-    # Total Value-Weighted Return (This is the 'Portfolio' return line)
+
     portfolio_return = ((daily_market_value - total_daily_invested) / total_daily_invested_clean * 100).rename('Portfolio').round(2)
     portfolio_return = portfolio_return.dropna() # Ensure we only use dates where we have invested capital
 
-    # 2. Calculate Standard Index Benchmark Returns
+
     try:
         benchmark_df = yf.download(selected_ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
         if benchmark_df.empty or 'Close' not in benchmark_df.columns:
@@ -557,10 +553,9 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     final_df = final_df.melt(id_vars='Date', var_name='Type', value_name='Return %').dropna()
     return final_df
 
-# --- NEW METRICS CALCULATION FUNCTIONS ---
+
 
 def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
-    """Calculates alpha, beta, and max drawdown."""
     metrics = {
         'alpha': 'N/A', 'beta': 'N/A', 'max_drawdown': 'N/A'
     }
@@ -612,7 +607,7 @@ def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
     return metrics
 
 def calculate_trading_metrics(realized_df):
-    """Calculates win ratio, profit factor, and expectancy."""
+
     metrics = {
         'win_ratio': 'N/A', 'profit_factor': 'N/A', 'expectancy': 'N/A'
     }
@@ -646,15 +641,12 @@ def set_page(page):
     """Sets the current page in session state."""
     st.session_state.page = page
 
-# --- REVISED get_combined_returns to exclude Paper Trading ---
+
 def get_combined_returns():
-    """
-    Calculates and returns combined returns for all asset types,
-    EXCLUDING data from paper trading (trades not linked to fund withdrawals).
-    """
-    # --- 1. Identify Live Trade Symbols (linked to fund transactions) ---
+
+
     c = DB_CONN.cursor()
-    # Find all symbols linked to a 'Purchase' withdrawal in the funds log
+
     live_trade_symbols_query = """
     SELECT DISTINCT SUBSTR(description, INSTR(description, ' of ') + 4)
     FROM fund_transactions
@@ -663,12 +655,12 @@ def get_combined_returns():
     live_trades_df = pd.read_sql(live_trade_symbols_query, DB_CONN)
     live_trade_symbols = set(live_trades_df.iloc[:, 0].tolist())
 
-    # --- 2. Investment Portfolio (Always considered 'live') ---
+
     inv_df = get_holdings_df("portfolio")
     inv_invested = inv_df['invested_value'].sum() if not inv_df.empty else 0
     inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
 
-    # --- 3. Trading Book (Filter for 'live' only) ---
+
     trade_df = get_holdings_df("trades")
     if not trade_df.empty:
         live_trade_df = trade_df[trade_df['symbol'].isin(live_trade_symbols)]
@@ -678,12 +670,12 @@ def get_combined_returns():
     trade_invested = live_trade_df['invested_value'].sum() if not live_trade_df.empty else 0
     trade_current = live_trade_df['current_value'].sum() if not live_trade_df.empty else 0
 
-    # --- 4. Mutual Funds (Always considered 'live' due to SIP/manual withdrawal link) ---
+
     mf_df = get_mf_holdings_df()
     mf_invested = mf_df['Investment'].sum() if not mf_df.empty else 0
     mf_current = mf_df['Current Value'].sum() if not mf_df.empty else 0
 
-    # --- 5. Calculate Returns for Display ---
+
     inv_return_amount = round(float(inv_current - inv_invested), 2)
     inv_return_pct = round(float(inv_return_amount / inv_invested * 100), 2) if inv_invested > 0 else 0
 
@@ -698,11 +690,11 @@ def get_combined_returns():
     total_return_amount = round(float(total_current - total_invested), 2)
     total_return_pct = round(float(total_return_amount / total_invested * 100), 2) if total_invested > 0 else 0
 
-    # --- 6. Calculate Realized P&L (Filter 'exits' table for live trades only) ---
+
     realized_stocks_df = get_realized_df("realized_stocks")
     realized_exits_df = get_realized_df("exits")
 
-    # Filter realized exits using the same live symbols
+
     if not realized_exits_df.empty:
         live_exits_df = realized_exits_df[realized_exits_df['symbol'].isin(live_trade_symbols)]
     else:
@@ -727,7 +719,7 @@ def get_combined_returns():
         "realized_trade": round(float(realized_trade), 2),
         "realized_mf": round(float(realized_mf), 2)
     }
-# --- END REVISED get_combined_returns ---
+
 
 def get_mf_holdings_df():
     """Calculates current mutual fund holdings from transaction data."""
@@ -758,15 +750,10 @@ def get_mf_holdings_df():
             })
     return pd.DataFrame(holdings)
 
-# --- NEW FUNCTION FOR PORTFOLIO ALLOCATION CHART (BASED ON CURRENT VALUE) ---
+
 @st.cache_data(ttl=3600)
 def get_current_portfolio_allocation():
-    """
-    Calculates portfolio allocation based on the CURRENT VALUE
-    of Investment, Trading, and Mutual Fund holdings.
-    """
-    # 1. Fetch current values for each asset class
-    # NOTE: Using unfiltered data for full portfolio picture here.
+
 
     inv_df = get_holdings_df("portfolio")
     inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
@@ -777,7 +764,7 @@ def get_current_portfolio_allocation():
     mf_df = get_mf_holdings_df()
     mf_current = mf_df['Current Value'].sum() if not mf_df.empty else 0
 
-    # 2. Compile data
+
     allocation_data = [
         {"Category": "Investment", "Amount": inv_current},
         {"Category": "Trading", "Amount": trade_current},
@@ -786,21 +773,21 @@ def get_current_portfolio_allocation():
 
     allocation_df = pd.DataFrame(allocation_data)
 
-    # 3. Filter and sort
+
     final_df = allocation_df[allocation_df['Amount'] > 0.01].copy()
     final_df['Amount'] = final_df['Amount'].round(2)
 
     return final_df.sort_values('Amount', ascending=False)
-# -------------------------------------------------------------------------
+
 
 def _calculate_mf_cumulative_return(transactions_df):
     """Calculates the cumulative return of a mutual fund portfolio over time."""
-    # We still need sip_marker_data to prevent breaking the function call, even if we don't use it.
+
     if transactions_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     all_schemes_daily_returns = []
-    sip_marker_data = [] # Retained for function compatibility, but markers won't be plotted.
+    sip_marker_data = []
     unique_schemes = transactions_df['scheme_name'].unique()
 
     for scheme_name in unique_schemes:
@@ -811,7 +798,7 @@ def _calculate_mf_cumulative_return(transactions_df):
         scheme_code = scheme_tx_df['yfinance_symbol'].iloc[0]
         historical_data = get_mf_historical_data(scheme_code)
 
-        # Skip if no historical data is available
+
         if historical_data.empty:
             continue
 
@@ -832,7 +819,7 @@ def _calculate_mf_cumulative_return(transactions_df):
                     if tx_row['type'] == 'Purchase':
                         units += tx_row['units']
                         invested_amount += (tx_row['units'] * tx_row['nav'])
-                        # Keep marker data creation but it won't be used for plotting
+
                         sip_marker_data.append({
                             'date': date,
                             'scheme_name': scheme_name,
