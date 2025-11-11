@@ -22,8 +22,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# --- USER AUTHENTICATION ---
-# Hardcoded credentials for demonstration
 USERNAME = "HXR"
 PASSWORD = "Rossph"
 
@@ -32,14 +30,13 @@ def login_page():
     st.title("Login to Finance Dashboard")
     st.markdown("Please enter your credentials to access the dashboard.")
 
-    # Callback to clear the input fields
+
     def reset_login_fields():
         if "username" in st.session_state:
             st.session_state.username = ""
         if "password" in st.session_state:
             st.session_state.password = ""
 
-    # The login form now only contains the submit button
     with st.form("login_form"):
         st.subheader("Login")
         username = st.text_input("Username", key="username")
@@ -47,7 +44,7 @@ def login_page():
 
         submit_button = st.form_submit_button("Login")
 
-    # The reset button is now outside the form
+
     if st.button("Reset", on_click=reset_login_fields):
         pass
 
@@ -59,13 +56,12 @@ def login_page():
         else:
             st.error("Invalid username or password.")
 
-# --- INDICATOR FUNCTIONS (UNUSED AGAIN) ---
+
 def rsi(close, period=14):
     """Calculates the Relative Strength Index (RSI)."""
     delta = close.diff(1)
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
-    # Use exponential moving average for smoothing (standard practice)
     avg_gain = gain.ewm(span=period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(span=period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss
@@ -89,7 +85,7 @@ def bollinger(close, period=20, std_dev=2):
     lower_band = rolling_mean - (rolling_std * std_dev)
     return upper_band, rolling_mean, lower_band
 
-# --- DATABASE SETUP ---
+
 @st.cache_resource
 def get_db_connection():
     """Establishes and caches the database connection."""
@@ -106,11 +102,10 @@ def initialize_database(conn):
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS portfolio (ticker TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, sector TEXT, market_cap TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS trades (symbol TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, target_price REAL NOT NULL, stop_loss_price REAL NOT NULL)""")
-    # REVERTED: price_history back to storing only close_price
+
     c.execute("""CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close_price REAL, PRIMARY KEY (ticker, date))""")
     c.execute("""CREATE TABLE IF NOT EXISTS realized_stocks (transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL, sell_price REAL NOT NULL, sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS exits (transaction_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL, sell_price REAL NOT NULL, sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL, target_price REAL NOT NULL, stop_loss_price REAL NOT NULL)""")
-    # IMPORTANT: The 'fund_transactions' table is now defined WITHOUT 'allocation_type'
     c.execute("""CREATE TABLE IF NOT EXISTS fund_transactions (transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL, type TEXT NOT NULL, amount REAL NOT NULL, description TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS expenses (expense_id TEXT PRIMARY KEY, date TEXT NOT NULL, amount REAL NOT NULL, category TEXT NOT NULL, payment_method TEXT, description TEXT, type TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS budgets (budget_id INTEGER PRIMARY KEY AUTOINCREMENT, month_year TEXT NOT NULL, category TEXT NOT NULL, amount REAL NOT NULL, UNIQUE(month_year, category))""")
@@ -121,15 +116,12 @@ def initialize_database(conn):
     _add_missing_columns(conn)
 
 def _migrate_fund_transactions_schema(conn):
-    """
-    Performs the Copy-Rename-Drop migration to remove 'allocation_type'
-    from fund_transactions while preserving data.
-    """
+
     c = conn.cursor()
     table_name = 'fund_transactions'
     temp_table_name = f'{table_name}_old'
 
-    # 1. Check if 'allocation_type' column exists
+
     c.execute(f"PRAGMA table_info({table_name})")
     columns = [info[1] for info in c.fetchall()]
 
@@ -137,10 +129,10 @@ def _migrate_fund_transactions_schema(conn):
         logging.info(f"Starting schema migration for {table_name}: dropping 'allocation_type'.")
 
         try:
-            # 2. Rename the old table
+
             c.execute(f"ALTER TABLE {table_name} RENAME TO {temp_table_name}")
 
-            # 3. Create the new table with the desired schema (without allocation_type)
+
             c.execute(f"""
                 CREATE TABLE {table_name} (
                     transaction_id TEXT PRIMARY KEY,
@@ -151,7 +143,7 @@ def _migrate_fund_transactions_schema(conn):
                 )
             """)
 
-            # 4. Copy data from the old table to the new one, excluding 'allocation_type'
+
             c.execute(f"""
                 INSERT INTO {table_name}
                 (transaction_id, date, type, amount, description)
@@ -159,7 +151,7 @@ def _migrate_fund_transactions_schema(conn):
                 FROM {temp_table_name}
             """)
 
-            # 5. Drop the old table
+
             c.execute(f"DROP TABLE {temp_table_name}")
 
             conn.commit()
@@ -167,7 +159,7 @@ def _migrate_fund_transactions_schema(conn):
 
         except sqlite3.Error as e:
             logging.error(f"Schema migration failed: {e}. Attempting rollback.")
-            # If anything fails, it's safer to attempt a rollback and inform the user.
+
             conn.rollback()
             logging.error("Migration failed and rolled back. Please check your database integrity.")
             st.error(f"Database schema update failed: {e}")
@@ -180,7 +172,7 @@ def _add_missing_columns(conn):
     """Handles database schema migrations by adding missing columns."""
     c = conn.cursor()
 
-    # Migration 1: Add sector and market_cap to portfolio
+
     c.execute("PRAGMA table_info(portfolio)")
     columns = [info[1] for info in c.fetchall()]
     if 'sector' not in columns:
@@ -190,7 +182,7 @@ def _add_missing_columns(conn):
         c.execute("ALTER TABLE portfolio ADD COLUMN market_cap TEXT")
         logging.info("Added 'market_cap' column to 'portfolio' table.")
 
-    # Migration 2: Add type to expenses
+
     c.execute("PRAGMA table_info(expenses)")
     expense_columns = [info[1] for info in c.fetchall()]
     if 'type' not in expense_columns:
@@ -199,33 +191,31 @@ def _add_missing_columns(conn):
         c.execute("UPDATE expenses SET type = 'Expense' WHERE type IS NULL")
         logging.info("Set 'type' to 'Expense' for existing records.")
 
-    # Migration 3: Add transfer_group_id to expenses table
+
     if 'transfer_group_id' not in expense_columns:
         c.execute("ALTER TABLE expenses ADD COLUMN transfer_group_id TEXT")
         logging.info("Added 'transfer_group_id' column to 'expenses' table.")
 
-    # Migration 4: Remove allocation_type from fund_transactions
+
     _migrate_fund_transactions_schema(conn)
 
-    # REVERTED Migration 5: Check if price_history has ONLY the required columns (close_price)
     c.execute("PRAGMA table_info(price_history)")
     price_history_columns = [info[1] for info in c.fetchall()]
 
-    # Simple check to see if it still contains the OHLCV columns that should have been removed
-    # If the table structure is wrong (i.e., too many columns), drop and recreate it simply
+
     if len(price_history_columns) != 3 or price_history_columns[2] != 'close_price':
         logging.warning("Price history schema is incorrect. Recreating table to single column.")
         c.execute("DROP TABLE IF EXISTS price_history")
         c.execute("""CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close_price REAL, PRIMARY KEY (ticker, date))""")
         logging.info("Recreated price_history table with only 'close_price'.")
-        # Note: All existing data needs to be redownloaded.
+
 
     conn.commit()
 
 DB_CONN = get_db_connection()
 initialize_database(DB_CONN)
 
-# REMOVED allocation_type parameter from function signature and SQL for fund_transactions
+
 def update_funds_on_transaction(transaction_type, amount, description, date):
     """Inserts a new transaction into the fund_transactions table."""
 
