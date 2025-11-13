@@ -554,6 +554,101 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     return final_df
 
 
+def calculate_mf_portfolio_return_data(mf_holdings_df):
+    """
+    Calculates the daily cumulative portfolio return for the mutual fund holdings
+    for plotting against a benchmark.
+
+    NOTE: This is a simplified calculation that combines transactions and historical NAVs.
+    """
+    if mf_holdings_df.empty:
+        return pd.DataFrame()
+
+    # 1. Fetch all MF transactions
+    transactions_df = pd.read_sql("SELECT date, scheme_name, yfinance_symbol, type, units, nav FROM mf_transactions", DB_CONN)
+    if transactions_df.empty:
+        return pd.DataFrame()
+
+    transactions_df['date'] = pd.to_datetime(transactions_df['date'], format='%Y-%m-%d', errors='coerce')
+    transactions_df = transactions_df.sort_values('date').reset_index(drop=True)
+
+    start_date = transactions_df['date'].min()
+    end_date = datetime.date.today()
+    date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date, freq='D'))
+
+    daily_values = pd.DataFrame(index=date_range)
+    daily_invested = pd.DataFrame(index=date_range)
+
+    unique_schemes = mf_holdings_df['yfinance_symbol'].unique()
+
+    # Pre-fetch all historical NAVs
+    historical_navs = {}
+    for code in unique_schemes:
+        df_nav = get_mf_historical_data(code)
+        if not df_nav.empty:
+            historical_navs[code] = df_nav['NAV'].reindex(date_range).ffill()
+
+    if not historical_navs:
+        return pd.DataFrame()
+
+    # 2. Daily calculation loop (Slow, but necessary for XIRR-style calculation)
+    for date in date_range:
+        current_invested_value = 0
+        current_market_value = 0
+
+        # Calculate daily holdings
+        for scheme_code in unique_schemes:
+            if scheme_code not in historical_navs:
+                continue
+
+            # Filter transactions up to and including this date
+            scheme_tx = transactions_df[
+                (transactions_df['yfinance_symbol'] == scheme_code) &
+                (transactions_df['date'] <= date)
+            ].copy()
+
+            if scheme_tx.empty:
+                continue
+
+            purchases = scheme_tx[scheme_tx['type'] == 'Purchase']
+            redemptions = scheme_tx[scheme_tx['type'] == 'Redemption']
+
+            total_units = purchases['units'].sum() - redemptions['units'].sum()
+
+            if total_units > 0.001:
+                # Calculate effective cost: Sum(Units * NAV) - Sum(Redemption Units * NAV)
+                cost_purchases = (purchases['units'] * purchases['nav']).sum()
+                cost_redemptions = (redemptions['units'] * redemptions['nav']).sum()
+
+                # We track cumulative net cash flow into the fund.
+                net_investment = cost_purchases - cost_redemptions
+
+                current_invested_value += net_investment
+
+                # Current market value
+                if date in historical_navs[scheme_code].index:
+                    current_nav = historical_navs[scheme_code].loc[date]
+                else:
+                    # Fallback to the last available NAV
+                    current_nav = historical_navs[scheme_code].iloc[-1] if not historical_navs[scheme_code].empty else 0
+
+                current_market_value += (total_units * current_nav)
+
+        # Record daily totals
+        daily_values.loc[date, 'Total_Invested'] = current_invested_value
+        daily_values.loc[date, 'Total_Value'] = current_market_value
+
+    # 3. Calculate Cumulative Return %
+    daily_values = daily_values.replace(0, np.nan).ffill().dropna()
+
+    if daily_values.empty:
+        return pd.DataFrame()
+
+    # The true portfolio return is calculated based on cumulative cash flow (Total_Value - Total_Invested) / Total_Invested
+    daily_values['Return %'] = ((daily_values['Total_Value'] - daily_values['Total_Invested']) / daily_values['Total_Invested'] * 100).round(2)
+    daily_values['Type'] = 'MF Portfolio'
+
+    return daily_values.reset_index().rename(columns={'index': 'Date'})
 
 def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
     metrics = {
@@ -1599,7 +1694,7 @@ def mutual_fund_page():
             if selected_result and selected_result != st.session_state.get(f"{key_prefix}_selected_result"):
                 st.session_state[f"{key_prefix}_selected_result"] = selected_result
                 st.rerun()
-        if st.session_state.get(f"{key_prefix}_selected_result"):
+        if st.session_state.get(f"{key_prefix}_selected_symbol"):
             selected_result = st.session_state[f"{key_prefix}_selected_result"]
             selected_name = selected_result.split(" (")[0]
             selected_code = selected_result.split(" (")[-1].replace(")", "")
@@ -1651,7 +1746,7 @@ def mutual_fund_page():
                 })
                 st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
-            st.header("Return Chart")
+            st.header("Return Chart (Individual Schemes)")
 
             all_schemes = transactions_df['scheme_name'].unique().tolist() if not transactions_df.empty else []
             selected_schemes = st.multiselect("Select schemes to compare", options=all_schemes, default=all_schemes)
@@ -1684,6 +1779,69 @@ def mutual_fund_page():
                     st.info("Not enough data to generate the chart for the selected schemes.")
             else:
                 st.info("No schemes selected to display the chart.")
+
+            # --- NEW BENCHMARK COMPARISON ---
+            st.divider()
+            st.header("Performance vs Benchmark (Overall MF Portfolio)")
+
+            benchmark_options = ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500']
+            mf_benchmark_choice = st.selectbox("Select Benchmark for MF Portfolio", benchmark_options, key=f"{key_prefix}_benchmark_choice_mf")
+
+            with st.spinner("Loading MF Benchmark Data..."):
+                mf_portfolio_data = calculate_mf_portfolio_return_data(holdings_df)
+
+                if not mf_portfolio_data.empty:
+                    # 1. Fetch benchmark data
+                    mf_benchmark_map = {'Nifty 50': '^NSEI', 'Nifty 100': '^CNX100', 'Nifty 200': '^CNX200', 'Nifty 500': '^CRSLDX'}
+                    selected_ticker = mf_benchmark_map.get(mf_benchmark_choice)
+
+                    start_date = mf_portfolio_data['Date'].min()
+                    end_date = mf_portfolio_data['Date'].max()
+
+                    benchmark_df = yf.download(selected_ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
+
+                    if not benchmark_df.empty and 'Close' in benchmark_df.columns:
+                        benchmarks = benchmark_df['Close'].copy()
+                        benchmarks.ffill(inplace=True)
+                        # Ensure we align and calculate returns from the starting date of the MF portfolio data
+                        benchmarks = benchmarks.reindex(mf_portfolio_data['Date']).ffill()
+
+                        # Find the first non-NaN value in the aligned benchmark data to use as the base for return calculation
+                        first_valid_index = benchmarks.first_valid_index()
+
+                        # FIX APPLIED HERE: Use .item() to explicitly extract the single scalar value before comparison
+                        if (first_valid_index is not None and
+                            not pd.isnull(benchmarks.loc[first_valid_index]) and
+                            benchmarks.loc[first_valid_index].item() != 0):
+
+                            benchmark_returns = ((benchmarks / benchmarks.loc[first_valid_index].item() - 1) * 100).round(2)
+                            benchmark_returns.name = 'Return %'
+
+                            benchmark_data_for_plot = benchmark_returns.reset_index().rename(columns={'index': 'Date'})
+                            benchmark_data_for_plot['Type'] = mf_benchmark_choice
+
+                            # 2. Combine and Plot
+                            combined_data = pd.concat([
+                                mf_portfolio_data[['Date', 'Return %', 'Type']],
+                                benchmark_data_for_plot[['Date', 'Return %', 'Type']]
+                            ]).dropna()
+
+                            mf_benchmark_chart = alt.Chart(combined_data).mark_line().encode(
+                                x=alt.X('Date:T', title='Date'),
+                                y=alt.Y('Return %:Q', title='Cumulative Return %'),
+                                color=alt.Color('Type:N', title='Legend')
+                            ).properties(height=300).interactive()
+
+                            zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+                            st.altair_chart(mf_benchmark_chart + zero_line, use_container_width=True)
+                        else:
+                            st.warning("Benchmark data is invalid, zero-based, or alignment failed.")
+                    else:
+                        st.warning("Failed to download or process benchmark data.")
+                else:
+                    st.info("Not enough MF transaction data to calculate overall portfolio performance for benchmark comparison.")
+            # --- END NEW BENCHMARK COMPARISON ---
+
         else:
             st.info("No mutual fund holdings to display.")
 
@@ -2090,36 +2248,6 @@ def render_asset_page(config):
             st.altair_chart(bars, use_container_width=True)
         else:
             st.info(f"No {trade_mode_selection.lower()} in {view_options[1].lower()} to display.")
-
-    current_holdings = holdings_df # Use the potentially filtered holdings for benchmark
-
-    # Check if there is data to compare against a benchmark
-    has_holdings_for_comparison = not current_holdings.empty and table_view == view_options[0]
-
-    if has_holdings_for_comparison:
-        st.divider()
-        st.header("Performance vs Benchmark")
-
-        # UPDATED: Removed MV-10, MV-20, MV-30 from the benchmark selection
-        benchmark_options = ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500']
-        benchmark_choice = st.selectbox("Select Benchmark", benchmark_options, key=f"{key_prefix}_benchmark_choice")
-
-        with st.spinner("Loading Benchmark Data..."):
-            holdings_df = current_holdings
-
-            benchmark_data = get_benchmark_comparison_data(holdings_df, benchmark_choice)
-            if not benchmark_data.empty:
-                benchmark_chart = alt.Chart(benchmark_data).mark_line().encode(
-                    x=alt.X('Date:T', title='Date'),
-                    y=alt.Y('Return %:Q', title='Total Return %'),
-                    color=alt.Color('Type:N', title='Legend')
-                ).properties(height=300).interactive()
-                zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
-                st.altair_chart(benchmark_chart + zero_line, use_container_width=True)
-            else:
-                st.warning("Could not generate benchmark data. Ensure you have at least one position.")
-    else:
-        st.info("No data to compare against a benchmark.")
 
 
 # --- MAIN APP LOGIC ---
