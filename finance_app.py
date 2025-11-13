@@ -1010,7 +1010,7 @@ def funds_page():
         st.subheader("Cumulative Fund Flow")
 
 
-        # Cumulative Fund Flow Chart
+
         chart_df = chronological_df[['date', 'cumulative_balance']].drop_duplicates(subset=['date'], keep='last')
         chart = alt.Chart(chart_df).mark_line().encode(
             x=alt.X('date', title='Date'),
@@ -1024,7 +1024,7 @@ def funds_page():
 
         st.subheader("Transaction History")
 
-        # --- UPDATED: Data editor now only includes core columns ---
+
         edited_df = st.data_editor(
             fund_df[['transaction_id', 'date', 'type', 'amount', 'description']],
             use_container_width=True,
@@ -1037,18 +1037,14 @@ def funds_page():
             }
         )
 
-        # Manually convert 'date' column back to string for SQLite insertion
+
         edited_df['date'] = edited_df['date'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, datetime.date) else x)
 
 
         if st.button("Save Changes to Transactions"):
-            # 1. Delete all existing records
+
             c.execute("DELETE FROM fund_transactions")
 
-            # 2. Prepare the DataFrame for SQL insertion
-            # The 'date' conversion is already handled above
-
-            # 3. Insert the full, edited data back into the table
             edited_df.to_sql('fund_transactions', DB_CONN, if_exists='append', index=False)
             DB_CONN.commit()
 
@@ -1063,13 +1059,13 @@ def expense_tracker_page():
     _process_recurring_expenses()
     c = DB_CONN.cursor()
 
-    # --- 1. Define and Fetch Categories (Using Session State for Persistence) ---
+
     if 'expense_categories_list' not in st.session_state:
         try:
             expense_categories = pd.read_sql("SELECT DISTINCT category FROM expenses WHERE type='Expense'", DB_CONN)['category'].tolist()
             default_categories = ["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"]
             all_categories = list(set([c for c in expense_categories if c and c != 'N/A'] + default_categories))
-            # EXCLUDED_CATEGORIES ensure these categories are *only* used internally for transfers
+
             EXCLUDED_CATEGORIES = ["Transfer Out", "Transfer In"]
             all_categories = [c for c in all_categories if c not in EXCLUDED_CATEGORIES]
             st.session_state.expense_categories_list = sorted(all_categories)
@@ -1079,16 +1075,16 @@ def expense_tracker_page():
     CATEGORIES = st.session_state.expense_categories_list
 
     PAYMENT_METHODS = ["UPI", "Credit Card", "Debit Card", "Cash", "Net Banking", "N/A"]
-    # Only use actual payment methods for transfer/expense input
+
     PAYMENT_ACCOUNTS = [pm for pm in PAYMENT_METHODS if pm != 'N/A']
 
-    # Placeholder for unselected accounts in the Transfer form
+
     ACCOUNT_PLACEHOLDER = "Select Account..."
 
-    # --- UPDATED: Add "Transfer" to the radio button options ---
+
     view = st.radio("Select View", ["Dashboard", "Transaction History", "Manage Budgets", "Manage Recurring", "Transfer"], horizontal=True, label_visibility="hidden")
 
-    # --- SIDEBAR: ADD TRANSACTION FORM ---
+
     if view != "Transfer":
         st.sidebar.header("Add Transaction")
         with st.sidebar.form("new_transaction_form", clear_on_submit=True):
@@ -1096,7 +1092,7 @@ def expense_tracker_page():
             trans_date = st.date_input("Date", max_value=datetime.date.today(), value=datetime.date.today())
             trans_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None)
 
-            # --- Enhanced Category Selection ---
+
             category_options = ['Select Category...'] + CATEGORIES
 
             selected_category = st.selectbox(
@@ -1113,7 +1109,7 @@ def expense_tracker_page():
                 key="custom_cat"
             )
 
-            # Determine the final category used in the transaction
+
             if custom_category:
                 final_cat = custom_category
             elif selected_category and selected_category != 'Select Category...':
@@ -1131,13 +1127,13 @@ def expense_tracker_page():
 
             if st.form_submit_button("Add Transaction"):
                 if trans_amount and final_cat and trans_pm:
-                    # NOTE: Regular transactions do NOT include transfer_group_id
+
                     c.execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
                               (str(uuid.uuid4()), trans_date.strftime("%Y-%m-%d"), trans_type, round(trans_amount, 2), final_cat, trans_pm, trans_desc))
                     DB_CONN.commit()
                     st.success(f"{trans_type} added! Category: **{final_cat}**")
 
-                    # Add new custom category to session state immediately for future dropdown use
+
                     if final_cat not in st.session_state.expense_categories_list:
                         st.session_state.expense_categories_list.append(final_cat)
                         st.session_state.expense_categories_list.sort()
@@ -1150,16 +1146,16 @@ def expense_tracker_page():
                 else:
                     st.warning("Please fill all required fields (Amount, Category, and Payment Method).")
 
-    # --- END OF SIDEBAR: ADD TRANSACTION FORM ---
+
 
 
     if view == "Dashboard":
         today = datetime.date.today()
         start_date_7days = today - datetime.timedelta(days=6)
 
-        # Fetch all expense data for the current month and last 7 days
+
         month_year = today.strftime("%Y-%m")
-        # Reading data directly from DB to ensure it's fresh after cache clear/rerun
+
         expenses_df = pd.read_sql(f"SELECT * FROM expenses WHERE date LIKE '{month_year}-%'", DB_CONN)
         all_time_expenses_df = pd.read_sql("SELECT * FROM expenses", DB_CONN)
         all_time_expenses_df['date'] = pd.to_datetime(all_time_expenses_df['date'])
@@ -1172,29 +1168,27 @@ def expense_tracker_page():
         inflows_df = expenses_df[expenses_df['type'] == 'Income']
         outflows_df = expenses_df[expenses_df['type'] == 'Expense']
 
-        # Exclude internal transfers from total spent/income calculations for a clearer view of external cash flow
+
         total_spent = outflows_df[outflows_df['category'] != 'Transfer Out']['amount'].sum()
         total_income = inflows_df[inflows_df['category'] != 'Transfer In']['amount'].sum()
 
         total_budget = budgets_df['amount'].sum()
         net_flow = total_income - total_spent
 
-        # --- Metric Calculation and Formatting ---
 
-        # 1. Spent Breakdown (Outflows) - Excluding internal transfers
+
+
         spent_breakdown_df = outflows_df[outflows_df['category'] != 'Transfer Out'].groupby('payment_method')['amount'].sum().reset_index()
         spent_help_text = "\n".join([f"{row['payment_method']}: ₹{row['amount']:,.2f}" for _, row in spent_breakdown_df.iterrows()])
 
-        # 2. Remaining Breakdown (Net Flow per Payment Method) - Including transfers for cash flow accuracy
-        # Calculate current balance in each payment method
         flow_df = all_time_expenses_df.groupby(['type', 'payment_method'])['amount'].sum().unstack(level=0, fill_value=0).fillna(0)
-        # Note: 'Income' here is money arriving to the PM, 'Expense' is money leaving the PM
+
         flow_df['Remaining'] = flow_df['Income'] - flow_df['Expense']
 
-        # Filter out 'N/A' for payment methods and methods with near zero remaining
+
         remaining_breakdown_df = flow_df[(flow_df['Remaining'].abs() > 0.01) & (flow_df.index != 'N/A')].sort_values('payment_method').reset_index()
 
-        # Build remaining help text
+
         remaining_help_text = "\n".join([f"{row['payment_method']}: ₹{row['Remaining']:,.2f}" for _, row in remaining_breakdown_df.iterrows()])
         if not remaining_help_text:
              remaining_help_text = "All flows balanced, or no categorized transactions."
@@ -1203,11 +1197,11 @@ def expense_tracker_page():
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Income (Excl. Transfers)", f"₹{total_income:,.2f}")
 
-        # UPDATED: Total Spent with hover breakdown
+
         col2.metric("Total Spent this Month (Excl. Transfers)", f"₹{total_spent:,.2f}",
                      help=f"**Spent Breakdown (This Month, Excl. Transfers):**\n{spent_help_text}")
 
-        # Remaining Amount metric
+
         col3.metric("Net Flow (Excl. Transfers)", f"₹{net_flow:,.2f}",
                      delta_color="inverse" if net_flow >= 0 else "normal",
                      help=f"**Net Remaining Breakdown (Includes all time funds movements):**\n{remaining_help_text}")
@@ -1215,18 +1209,18 @@ def expense_tracker_page():
         col4.metric("Total Budget for Month", f"₹{total_budget:,.2f}")
         st.divider()
 
-        # --- 1. Daily Bar Chart (Last 7 Days) ---
+
         st.subheader("Daily Spending: Last 7 Days (Excl. Transfers)")
 
-        # Prepare the 7-day data (excluding transfers)
+
         daily_spending = all_time_expenses_df[
             (all_time_expenses_df['type'] == 'Expense') &
-            (all_time_expenses_df['category'] != 'Transfer Out') & # Exclude transfers
+            (all_time_expenses_df['category'] != 'Transfer Out') &
             (all_time_expenses_df['date'].dt.date >= start_date_7days)
         ].groupby(all_time_expenses_df['date'].dt.date)['amount'].sum().reset_index()
         daily_spending.rename(columns={'date': 'Date', 'amount': 'Spent'}, inplace=True)
 
-        # Create a full 7-day range for display purposes
+
         date_range = pd.date_range(start_date_7days, today)
         daily_df_full = pd.DataFrame({'Date': date_range.date})
         daily_df_full = daily_df_full.merge(daily_spending, on='Date', how='left').fillna(0)
@@ -1234,7 +1228,7 @@ def expense_tracker_page():
         daily_df_full['DayLabel'] = daily_df_full['Date'].apply(lambda x: "Today" if x == today else x.strftime('%a'))
 
         if not daily_df_full.empty:
-            # Sort by date for display order (left to right, past to present)
+
             daily_df_full.sort_values('Date', ascending=True, inplace=True)
 
             bar_chart = alt.Chart(daily_df_full).mark_bar().encode(
@@ -1253,13 +1247,13 @@ def expense_tracker_page():
 
         st.divider()
 
-        # --- 2. Pie Chart Labels Update (FIXED) ---
+
         st.subheader(f"Category-wise Spending (Current Month: {month_year}, Excl. Transfers)")
-        # Exclude internal transfers from the pie chart
+
         spending_by_category = outflows_df[outflows_df['category'] != 'Transfer Out'].groupby('category')['amount'].sum().reset_index()
 
         if not spending_by_category.empty:
-            # Calculate percentage for tooltip
+
             total_spent_for_chart = spending_by_category['amount'].sum()
             spending_by_category['percentage'] = (spending_by_category['amount'] / total_spent_for_chart * 100).round(2)
 
@@ -1269,19 +1263,19 @@ def expense_tracker_page():
 
             pie = base.mark_arc(outerRadius=120).encode(
                 color=alt.Color("category"),
-                # Tooltip corrected: shows category, amount and percentage on hover
+
                 tooltip=["category",
                          alt.Tooltip('amount', format='.2f', title='Amount (₹)'),
                          alt.Tooltip('percentage', format='.2f', title='Percentage (%)')],
                 order=alt.Order("amount", sort="descending")
             )
 
-            # Text layer to show ONLY the category name (as requested)
+
             text = base.mark_text(radius=140).encode(
-                text=alt.Text("category:N"), # Display ONLY the category name
+                text=alt.Text("category:N"),
                 order=alt.Order("amount", sort="descending"),
-                color=alt.value("black") # Set the color of the labels
-            ).transform_filter(alt.datum.amount > total_spent_for_chart * 0.05) # Only show labels for slices > 5%
+                color=alt.value("black")
+            ).transform_filter(alt.datum.amount > total_spent_for_chart * 0.05)
 
             st.altair_chart(pie + text, use_container_width=True)
         else:
@@ -1291,7 +1285,7 @@ def expense_tracker_page():
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Monthly Spending Trend")
-            # Exclude transfers from trend chart
+
             monthly_spending_df = pd.read_sql("SELECT SUBSTR(date, 1, 7) AS month, SUM(amount) AS amount FROM expenses WHERE type='Expense' AND category != 'Transfer Out' GROUP BY month ORDER BY month DESC", DB_CONN)
             if not monthly_spending_df.empty:
                 bar_chart = alt.Chart(monthly_spending_df).mark_bar().encode(
@@ -1304,7 +1298,7 @@ def expense_tracker_page():
                 st.info("No expenses logged for this month.")
         with col2:
             st.subheader("Inflow vs. Outflow (Excl. Transfers)")
-            # Exclude internal transfers from this chart to show external cash flow
+
             monthly_flows_df = pd.read_sql("SELECT SUBSTR(date, 1, 7) AS month, type, SUM(amount) AS amount FROM expenses WHERE (type='Income' AND category != 'Transfer In') OR (type='Expense' AND category != 'Transfer Out') GROUP BY month, type ORDER BY month DESC", DB_CONN)
             if not monthly_flows_df.empty:
                 bar_chart = alt.Chart(monthly_flows_df).mark_bar().encode(
@@ -1317,8 +1311,7 @@ def expense_tracker_page():
             else:
                 st.info("No income or expenses to compare.")
 
-    # ----------------------------------------------------------------------
-    # --- UPDATED: TRANSFER VIEW (ROBUST FIX) ---
+
     elif view == "Transfer":
         st.header("🔄 Internal Account Transfer")
         st.info("Record a transfer of funds between your payment methods (e.g., from Net Banking to UPI).")
@@ -1327,29 +1320,29 @@ def expense_tracker_page():
             transfer_date = st.date_input("Date", max_value=datetime.date.today(), value=datetime.date.today())
             transfer_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None)
 
-            # Use index=None for robust selection
+
             source_account = st.selectbox("From Account (Source)", options=PAYMENT_ACCOUNTS, index=None, key="source_acc_final", placeholder="Select Source Account")
 
-            # Filter options for destination account (excluding source)
+
             current_dest_options = [acc for acc in PAYMENT_ACCOUNTS if acc != source_account]
             dest_account = st.selectbox("To Account (Destination)", options=current_dest_options, index=None, key="dest_acc_final", placeholder="Select Destination Account")
 
             transfer_desc = st.text_input("Description (Optional)", value="")
 
             if st.form_submit_button("Record Transfer"):
-                # Validation check against None values
+
                 if (transfer_amount and transfer_amount > 0 and
                     source_account is not None and dest_account is not None and
                     source_account != dest_account):
 
-                    # Generate a unique ID to group the two transaction legs
+
                     group_id = str(uuid.uuid4())
 
-                    # 1. Record Expense (Withdrawal) from Source
+
                     c.execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                               (str(uuid.uuid4()), transfer_date.strftime("%Y-%m-%d"), "Expense", round(transfer_amount, 2), "Transfer Out", source_account, f"Transfer to {dest_account}" + (f" ({transfer_desc})" if transfer_desc else ""), group_id))
 
-                    # 2. Record Income (Deposit) to Destination
+
                     c.execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                               (str(uuid.uuid4()), transfer_date.strftime("%Y-%m-%d"), "Income", round(transfer_amount, 2), "Transfer In", dest_account, f"Transfer from {source_account}" + (f" ({transfer_desc})" if transfer_desc else ""), group_id))
 
@@ -1361,7 +1354,7 @@ def expense_tracker_page():
                     st.warning("Please select valid, different source and destination accounts and a positive amount.")
 
         st.subheader("Recent Consolidated Transfers (Read-Only)")
-        # Custom SQL to fetch two rows and combine them into one for display
+
         transfer_query = """
         SELECT
             T_OUT.transfer_group_id,
@@ -1387,7 +1380,7 @@ def expense_tracker_page():
         if not transfer_df.empty:
             transfer_df.rename(columns={'amount': 'Amount', 'date': 'Date', 'from_account': 'From Account', 'to_account': 'To Account', 'description': 'Description'}, inplace=True)
             transfer_df['Amount'] = transfer_df['Amount'].apply(lambda x: f"₹{x:,.2f}")
-            # Hide the group ID for display
+
             st.dataframe(transfer_df.drop(columns=['transfer_group_id']), hide_index=True, use_container_width=True)
         else:
             st.info("No transfers recorded yet.")
@@ -1397,14 +1390,14 @@ def expense_tracker_page():
         st.subheader("Edit Underlying Transfer Transactions")
         st.warning("Editing these directly requires careful attention. Ensure both 'Transfer Out' (Expense) and 'Transfer In' (Income) rows for a single transfer group have the same **Amount**, **Date**, and are linked by the same **Transfer Group ID**.")
 
-        # Query to fetch both legs of ALL transfers
+
         all_transfer_legs_df = pd.read_sql("SELECT expense_id, date, type, amount, category, payment_method, transfer_group_id, description FROM expenses WHERE category IN ('Transfer Out', 'Transfer In') ORDER BY date DESC, transfer_group_id DESC, type DESC", DB_CONN)
 
         if not all_transfer_legs_df.empty:
-            # Drop redundant/disabled columns for cleaner editing view, but keep expense_id and transfer_group_id
+
             df_for_editing = all_transfer_legs_df.drop(columns=['category', 'type']).copy()
 
-            # FIX: CONVERT 'date' COLUMN TO PANDAS DATETIME OBJECTS (REQUIRED FOR st.column_config.DateColumn)
+
             df_for_editing['date'] = pd.to_datetime(df_for_editing['date'], format='%Y-%m-%d', errors='coerce').dt.date
 
             edited_transfer_df = st.data_editor(df_for_editing, use_container_width=True, hide_index=True, num_rows="dynamic",
@@ -1418,16 +1411,16 @@ def expense_tracker_page():
                 })
 
             if st.button("Save Changes to Transfers"):
-                # Re-fetch the non-transfer records before deleting everything
+
                 non_transfer_df = pd.read_sql("SELECT * FROM expenses WHERE category NOT IN ('Transfer Out', 'Transfer In')", DB_CONN)
 
-                # Need to manually re-add the disabled columns before saving the transfers back
+
                 transfers_to_save = edited_transfer_df.copy()
 
-                # Check for required columns and re-add default values if needed (based on original data)
+
                 original_transfer_data = all_transfer_legs_df[['expense_id', 'type', 'category']].set_index('expense_id')
 
-                # Merge the required disabled columns back
+
                 transfers_to_save = transfers_to_save.merge(original_transfer_data, on='expense_id', how='left')
 
                 if transfers_to_save['type'].isnull().any() or transfers_to_save['category'].isnull().any():
@@ -1435,17 +1428,17 @@ def expense_tracker_page():
                     st.stop()
 
 
-                # Delete all existing records
+
                 c.execute("DELETE FROM expenses")
 
-                # Insert the non-transfer records back first (as a safeguard)
+
                 if not non_transfer_df.empty:
                     non_transfer_df['date'] = non_transfer_df['date'].astype(str)
                     non_transfer_df.to_sql('expenses', DB_CONN, if_exists='append', index=False)
 
-                # Insert the edited transfer records back
+
                 transfers_to_save['date'] = transfers_to_save['date'].astype(str)
-                # Ensure all columns exist before insert
+
                 transfers_to_save = transfers_to_save[['expense_id', 'date', 'type', 'amount', 'category', 'payment_method', 'description', 'transfer_group_id']]
 
                 transfers_to_save.to_sql('expenses', DB_CONN, if_exists='append', index=False)
@@ -1456,18 +1449,16 @@ def expense_tracker_page():
         else:
             st.info("No transfers logged yet to edit.")
 
-    # --- END OF UPDATED: TRANSFER VIEW ---
+
 
     elif view == "Transaction History":
         st.header("Transaction History")
-        # FIX: Filter out the two legs of the internal transfer from main history
+
         all_expenses_df = pd.read_sql("SELECT expense_id, date, type, amount, category, payment_method, description FROM expenses WHERE category NOT IN ('Transfer Out', 'Transfer In') ORDER BY date DESC, expense_id DESC", DB_CONN)
 
         if not all_expenses_df.empty:
             all_expenses_df['date'] = pd.to_datetime(all_expenses_df['date'], format='%Y-%m-%d', errors='coerce').dt.date
 
-            # Combine categories for easier editing in the data editor
-            # The editable categories now only include the allowed expense categories
             editable_categories = sorted(list(set(all_expenses_df['category'].unique().tolist() + CATEGORIES)))
 
             # The st.data_editor will display the data in this sorted order
