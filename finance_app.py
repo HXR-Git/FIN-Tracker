@@ -1026,7 +1026,7 @@ def funds_page():
 
 
         edited_df = st.data_editor(
-            fund_df[['transaction_id', 'date', 'type', 'amount', 'description']],
+            fund_df[['transaction_id', 'date', 'type', 'amount', 'description', 'cumulative_balance']],
             use_container_width=True,
             hide_index=True,
             num_rows="dynamic",
@@ -1034,6 +1034,7 @@ def funds_page():
                 "transaction_id": st.column_config.TextColumn("ID", disabled=True),
                 "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
                 "type": st.column_config.SelectboxColumn("Type", options=["Deposit", "Withdrawal"], required=True),
+                "cumulative_balance": st.column_config.TextColumn("Balance", disabled=True)
             }
         )
 
@@ -1045,7 +1046,7 @@ def funds_page():
 
             c.execute("DELETE FROM fund_transactions")
 
-            edited_df.to_sql('fund_transactions', DB_CONN, if_exists='append', index=False)
+            edited_df[['transaction_id', 'date', 'type', 'amount', 'description']].to_sql('fund_transactions', DB_CONN, if_exists='append', index=False)
             DB_CONN.commit()
 
             st.success("Funds transactions updated successfully! Rerunning to update the chart.")
@@ -1172,10 +1173,7 @@ def expense_tracker_page():
         total_spent = outflows_df[outflows_df['category'] != 'Transfer Out']['amount'].sum()
         total_income = inflows_df[inflows_df['category'] != 'Transfer In']['amount'].sum()
 
-        total_budget = budgets_df['amount'].sum()
         net_flow = total_income - total_spent
-
-
 
 
         spent_breakdown_df = outflows_df[outflows_df['category'] != 'Transfer Out'].groupby('payment_method')['amount'].sum().reset_index()
@@ -1206,7 +1204,38 @@ def expense_tracker_page():
                      delta_color="inverse" if net_flow >= 0 else "normal",
                      help=f"**Net Remaining Breakdown (Includes all time funds movements):**\n{remaining_help_text}")
 
-        col4.metric("Total Budget for Month", f"₹{total_budget:,.2f}")
+
+        # --- NEW METRIC: Available Amount (Budget - Spent) ---
+
+        # 1. Calculate Available for Budgeted Categories (Budget - Spent)
+        spent_by_category_df = outflows_df[outflows_df['category'] != 'Transfer Out'].groupby('category')['amount'].sum().reset_index().set_index('category')
+
+        # Merge budgets and spending, fill NaN (for categories spent but not budgeted, or budgeted but not spent)
+        available_df = budgets_df.copy().rename(columns={'amount': 'budget'})
+
+        # Reindex spent_by_category_df to match budgets_df index and fill NaN with 0
+        available_df['spent'] = spent_by_category_df.reindex(available_df.index)['amount'].fillna(0)
+
+        available_df['available'] = available_df['budget'] - available_df['spent']
+
+        # Calculate total available amount for all budgeted categories
+        total_available = available_df['available'].sum()
+
+        # Generate hover text
+        available_help_text = "\n".join([
+            f"{cat}: Budget ₹{row['budget']:,.2f} - Spent ₹{row['spent']:,.2f} = **Available ₹{row['available']:,.2f}**"
+            for cat, row in available_df.iterrows()
+        ])
+
+        if not available_help_text:
+             available_help_text = "No budgets set for this month."
+
+        # 2. Update col4 metric
+        col4.metric("Available Amount (Budget)", f"₹{total_available:,.2f}",
+                    help=f"**Available Amount Breakdown (Budget - Spent this month):**\n{available_help_text}")
+
+        # --- END NEW METRIC ---
+
         st.divider()
 
 
@@ -1265,8 +1294,8 @@ def expense_tracker_page():
                 color=alt.Color("category"),
 
                 tooltip=["category",
-                         alt.Tooltip('amount', format='.2f', title='Amount (₹)'),
-                         alt.Tooltip('percentage', format='.2f', title='Percentage (%)')],
+                          alt.Tooltip('amount', format='.2f', title='Amount (₹)'),
+                          alt.Tooltip('percentage', format='.2f', title='Percentage (%)')],
                 order=alt.Order("amount", sort="descending")
             )
 
@@ -1670,7 +1699,7 @@ def mutual_fund_page():
                                                             "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
                                                             "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
                                                             "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
-                                                                 })
+                                                                })
 
             if st.button("Save Mutual Fund Changes"):
                 c.execute("DELETE FROM mf_transactions")
@@ -1745,7 +1774,7 @@ def render_asset_page(config):
 
     st.sidebar.header(f"Add {config['asset_name']}")
     with st.sidebar.form(f"{key_prefix}_add_form"):
-        company_name = st.text_input(f"{config['asset_name']} Name", value="", key=f"{key_prefix}_add_company_name")
+        company_name = st.text_input(f"{config['asset_name']} Name", value=st.session_state.get(f"{key_prefix}_add_company_name_input", ""), key=f"{key_prefix}_add_company_name_input")
         search_button = st.form_submit_button("Search")
     if search_button and company_name:
         st.session_state[f"{key_prefix}_search_results"] = search_for_ticker(company_name)
@@ -1789,7 +1818,7 @@ def render_asset_page(config):
                 stop_loss_price = st.number_input("Stop Loss Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_stop_loss_price")
             add_button = st.form_submit_button(f"Add to {config['asset_name_plural']}")
             if add_button:
-                # --- START OF FIX ---
+                # --- START OF FUND INTEGRATION FIX ---
                 # Retrieve the paper trading state directly from session state for robustness in the form submit block
                 is_paper_trading_on_submit = st.session_state.get(f"trade_paper_trading_state", False) if is_trading_section else False
 
@@ -1835,7 +1864,7 @@ def render_asset_page(config):
                     st.rerun()
                 else:
                     st.error(f"Failed to fetch historical data for {symbol}. Cannot add.")
-                # --- END OF FIX ---
+                # --- END OF FUND INTEGRATION FIX ---
 
 
     st.sidebar.header(f"Sell {config['asset_name']}")
@@ -1868,7 +1897,7 @@ def render_asset_page(config):
             sell_transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_sell_transaction_fee", disabled=is_disabled, value=0.0)
             sell_button = st.form_submit_button(f"Sell {config['asset_name']}")
             if sell_button:
-                # --- START OF FIX ---
+                # --- START OF FUND INTEGRATION FIX ---
                 # Retrieve the paper trading state directly from session state for robustness in the form submit block
                 is_paper_trading_on_submit = st.session_state.get(f"trade_paper_trading_state", False) if is_trading_section else False
 
@@ -1908,7 +1937,7 @@ def render_asset_page(config):
                     DB_CONN.commit()
                     st.success(f"Sold {sell_qty} units of {symbol_to_sell}.")
                     st.rerun()
-                # --- END OF FIX ---
+                # --- END OF FUND INTEGRATION FIX ---
     else:
         st.sidebar.info(f"No open {config['asset_name_plural'].lower()}.")
 
@@ -1933,13 +1962,19 @@ def render_asset_page(config):
     holdings_df = full_holdings_df.copy()
     realized_df = full_realized_df.copy()
 
+    # FIX APPLIED HERE: Check if DataFrame is not empty before attempting filtering/slicing
     if is_trading_section:
-        if trade_mode_selection == "Live Trades Only":
-            holdings_df = holdings_df[holdings_df[config['asset_col']].isin(live_trade_symbols)]
-            realized_df = realized_df[realized_df[config['asset_col']].isin(live_trade_symbols)]
-        elif trade_mode_selection == "Paper Trades Only":
-            holdings_df = holdings_df[~holdings_df[config['asset_col']].isin(live_trade_symbols)]
-            realized_df = realized_df[~realized_df[config['asset_col']].isin(live_trade_symbols)]
+        if not holdings_df.empty:
+            if trade_mode_selection == "Live Trades Only":
+                holdings_df = holdings_df[holdings_df[config['asset_col']].isin(live_trade_symbols)]
+            elif trade_mode_selection == "Paper Trades Only":
+                holdings_df = holdings_df[~holdings_df[config['asset_col']].isin(live_trade_symbols)]
+
+        if not realized_df.empty:
+            if trade_mode_selection == "Live Trades Only":
+                realized_df = realized_df[realized_df[config['asset_col']].isin(live_trade_symbols)]
+            elif trade_mode_selection == "Paper Trades Only":
+                realized_df = realized_df[~realized_df[config['asset_col']].isin(live_trade_symbols)]
 
     # --- Render Open/Closed Trades ---
     # The subheader uses the initialized variable and avoids the UnboundLocalError
