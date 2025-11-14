@@ -526,7 +526,6 @@ def get_benchmark_data(ticker, start_date):
 def calculate_portfolio_metrics(holdings_df, portfolio_data, benchmark_choice):
     # This function relies on the benchmark comparison logic but is stubbed/simplified
     # to prevent excessive YF calls unless necessary.
-    # We will use the portfolio_data returned by get_benchmark_comparison_data for accurate metrics.
 
     metrics = {
         "alpha": 0.00,
@@ -534,17 +533,20 @@ def calculate_portfolio_metrics(holdings_df, portfolio_data, benchmark_choice):
         "max_drawdown": 0.00
     }
 
-    if not portfolio_data.empty and 'Portfolio_Return' in portfolio_data.columns:
-        # Calculate daily returns
-        returns = portfolio_data.set_index('Date')['Portfolio_Return'].pct_change().dropna()
+    if not portfolio_data.empty and 'Return %' in portfolio_data.columns:
+        portfolio_returns = portfolio_data[portfolio_data['Type'] == 'Portfolio'].set_index('Date')['Return %']
 
-        # Calculate max drawdown
-        cumulative_return = (1 + returns).cumprod()
-        peak = cumulative_return.expanding(min_periods=1).max()
-        drawdown = (cumulative_return - peak) / peak
-        max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0.0
+        if not portfolio_returns.empty:
+            # Calculate daily returns (change in cumulative return)
+            # Must first convert the percentage returns back to index values (1 + returns/100)
+            index_values = 1 + (portfolio_returns / 100)
 
-        metrics["max_drawdown"] = round(max_drawdown, 2)
+            # Calculate max drawdown
+            peak = index_values.expanding(min_periods=1).max()
+            drawdown = (index_values - peak) / peak
+            max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0.0
+
+            metrics["max_drawdown"] = round(max_drawdown, 2)
 
     return metrics
 
@@ -829,7 +831,6 @@ def home_page():
 
     col1, col2 = st.columns(2)
     with col1:
-        # FIX APPLIED: Replaced use_container_width=True with width='stretch'
         st.button("📈 Investment", width='stretch', on_click=set_page, args=("investment",))
         st.button("💰 Funds", width='stretch', on_click=set_page, args=("funds",))
     with col2:
@@ -950,7 +951,6 @@ def funds_page():
 
 
         if st.button("Save Changes to Transactions"):
-            # WARNING: This DELETE and re-INSERT approach is inefficient.
             # Using session.execute for DML
             with get_session() as session:
                 session.execute(_sql_text('DELETE FROM fund_transactions'))
@@ -1513,7 +1513,7 @@ def mutual_fund_page():
             if selected_result and selected_result != st.session_state.get(f"{key_prefix}_selected_result"):
                 st.session_state[f"{key_prefix}_selected_result"] = selected_result
                 st.rerun()
-        if st.session_state.get(f"{key_prefix}_selected_symbol"): # NOTE: Fixed variable name (was selected_scheme_code) to match usage
+        if st.session_state.get(f"{key_prefix}_selected_result"):
             selected_result = st.session_state[f"{key_prefix}_selected_result"]
             selected_name = selected_result.split(" (")[0]
             selected_code = selected_result.split(" (")[-1].replace(")", "")
@@ -1922,6 +1922,7 @@ def render_asset_page(config):
                 # Fetch comparison data first to calculate metrics accurately
                 comparison_df = get_benchmark_comparison_data(df_to_display, st.session_state[f"{key_prefix}_benchmark_choice"])
 
+                # The portfolio_data needs to be passed to calculate_portfolio_metrics
                 metrics = calculate_portfolio_metrics(df_to_display, comparison_df, st.session_state[f"{key_prefix}_benchmark_choice"])
                 col_alpha, col_beta, col_drawdown = st.columns(3)
                 with col_alpha: st.metric("Alpha", f"{metrics['alpha']}%")
@@ -1941,13 +1942,18 @@ def render_asset_page(config):
                     }
                     df_to_style = df_to_display.rename(columns=column_rename)
                     df_to_style = df_to_style.drop(columns=['Target Price', 'Stop Loss', 'Expected RRR'], errors='ignore')
+
+                    # FIX APPLIED: Handles Timestamp objects correctly
+                    date_formatter = lambda t: t.strftime("%d/%m/%Y") if isinstance(t, (pd.Timestamp, datetime.date)) else datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y")
+
                     styled_holdings_df = df_to_style.style.map(color_return_value, subset=['Return (%)']).format({
                         'Buy Price': '₹{:.2f}', 'Current Price': '₹{:.2f}', 'Return (Amount)': '₹{:.2f}',
                         'Investment Value': '₹{:.2f}', 'Current Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
-                        'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                        'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}',
+                        'Buy Date': date_formatter,
                         'Expected RRR': '{:.2f}'
                     })
-                    st.dataframe(styled_holdings_df, width='stretch', hide_index=True) # FIX APPLIED
+                    st.dataframe(styled_holdings_df, width='stretch', hide_index=True)
             # --- END: DETAILED HOLDINGS ---
 
             # --- START: Portfolio vs Benchmark Chart (Investment only) ---
@@ -1968,7 +1974,7 @@ def render_asset_page(config):
 
                 st.session_state[f"{key_prefix}_benchmark_choice"] = benchmark_choice
 
-                # Use the already calculated comparison_df from the metrics section
+                # Recalculate comparison data after selectbox update
                 comparison_df = get_benchmark_comparison_data(df_to_display, benchmark_choice)
 
                 if not comparison_df.empty:
@@ -1986,7 +1992,7 @@ def render_asset_page(config):
 
                     zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
 
-                    st.altair_chart(chart + zero_line, width='stretch') # FIX APPLIED
+                    st.altair_chart(chart + zero_line, width='stretch')
                 else:
                     st.info(f"Cannot generate benchmark chart. Either market data is unavailable for {benchmark_choice} or buy dates are too recent.")
                 st.divider()
@@ -2003,13 +2009,18 @@ def render_asset_page(config):
                     }
                     df_to_style = df_to_display.rename(columns=column_rename)
 
+                    # FIX APPLIED: Handles Timestamp objects correctly
+                    date_formatter = lambda t: t.strftime("%d/%m/%Y") if isinstance(t, (pd.Timestamp, datetime.date)) else datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y")
+
+
                     styled_holdings_df = df_to_style.style.map(color_return_value, subset=['Return (%)']).format({
                         'Buy Price': '₹{:.2f}', 'Current Price': '₹{:.2f}', 'Return (Amount)': '₹{:.2f}',
                         'Investment Value': '₹{:.2f}', 'Current Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
-                        'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                        'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}',
+                        'Buy Date': date_formatter,
                         'Expected RRR': '{:.2f}'
                     })
-                    st.dataframe(styled_holdings_df, width='stretch', hide_index=True) # FIX APPLIED
+                    st.dataframe(styled_holdings_df, width='stretch', hide_index=True)
             # --- END: DETAILED HOLDINGS (TRADING) ---
 
 
@@ -2039,7 +2050,7 @@ def render_asset_page(config):
                     tooltip=['symbol', 'date', alt.Tooltip('return_%', format=".2f")]
                 ).properties(height=300).interactive()
                 zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
-                st.altair_chart(chart + zero_line, width='stretch') # FIX APPLIED
+                st.altair_chart(chart + zero_line, width='stretch')
             else:
                 st.info("No data to display for selected assets.")
         else:
@@ -2064,14 +2075,19 @@ def render_asset_page(config):
                     'invested_value': 'Investment Value', 'realized_value': 'Realized Value',
                     'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
                 }
+
+                # FIX APPLIED: Handles Timestamp objects correctly
+                date_formatter = lambda t: t.strftime("%d/%m/%Y") if isinstance(t, (pd.Timestamp, datetime.date)) else datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y")
+
                 styled_realized_df = df_to_style.rename(columns=column_rename).style.map(color_return_value, subset=['Return (%)']).format({
                     'Buy Price': '₹{:.2f}', 'Sell Price': '₹{:.2f}', 'P/L (Amount)': '₹{:.2f}',
                     'Investment Value': '₹{:.2f}', 'Realized Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
-                    'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
-                    'Sell Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                    'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}',
+                    'Buy Date': date_formatter,
+                    'Sell Date': date_formatter,
                     'Expected RRR': '{:.2f}', 'Actual RRR': '{:.2f}'
                 })
-                st.dataframe(styled_realized_df, width='stretch', hide_index=True) # FIX APPLIED
+                st.dataframe(styled_realized_df, width='stretch', hide_index=True)
             st.header("Return Chart")
             realized_df['color'] = realized_df['realized_return_pct'].apply(lambda x: 'Profit' if x >= 0 else 'Loss')
             base = alt.Chart(realized_df).encode(
@@ -2082,7 +2098,7 @@ def render_asset_page(config):
                 y=alt.Y('realized_return_pct', title='Return (%)'),
                 color=alt.Color('color', scale=alt.Scale(domain=['Profit', 'Loss'], range=['#2ca02c', '#d62728']), legend=None)
             )
-            st.altair_chart(bars, width='stretch') # FIX APPLIED
+            st.altair_chart(bars, width='stretch')
         else:
             st.info(f"No {trade_mode_selection.lower()} in {view_options[1].lower()} to display.")
 
