@@ -9,7 +9,8 @@ import uuid
 import numpy as np
 from mftool import Mftool
 import time
-from sqlalchemy import text # Retaining import for session and parametrized queries
+from sqlalchemy import text, create_engine # Retaining import for session and parametrized queries
+
 # --- Streamlit SQLConnection helpers (inserted) ---
 def get_db():
     """Return the Streamlit SQLConnection for supabase_db (type='sql')."""
@@ -36,6 +37,7 @@ def db_execute(sql: str, params: dict = None, commit: bool = True):
             pass
     return res
 
+
 def df_to_table(df, table_name):
     """
     Insert rows from a pandas DataFrame into a SQL table using session.execute.
@@ -53,7 +55,6 @@ def df_to_table(df, table_name):
             try:
                 session.execute(_sql_text(f"INSERT INTO {table_name} ({cols}) VALUES ({vals})"), rec)
             except Exception as e:
-                # log and continue
                 logging.warning(f"Failed inserting into {table_name}: {e}")
         try:
             session.commit()
@@ -143,32 +144,50 @@ def bollinger(close, period=20, std_dev=2):
 def get_db_connection():
     """
     Establishes and caches the database connection using Streamlit's SQL connection API.
-    Uses the connection named 'supabase_db' configured in secrets.toml for Supabase (PostgreSQL).
+    Also creates an SQLAlchemy engine (DB_ENGINE) from secrets for pandas compatibility.
     """
     try:
-        # --- CORRECTED: Using 'supabase_db' to match the latest secrets configuration ---
         conn = st.connection("supabase_db", type="sql")
         logging.info("Successfully connected to PostgreSQL (Supabase) via st.connection('supabase_db').")
-        return conn
     except Exception as e:
         logging.error(f"Database connection error (Supabase): {e}", exc_info=True)
         st.error(f"Failed to connect to the database. Please check Streamlit Secrets. Error: {e}")
         st.stop()
 
+    # Create SQLAlchemy engine for pandas usage if the sqlalchemy_url is present in secrets
+    engine = None
+    try:
+        sa_url = st.secrets.get("supabase_db", {}).get("sqlalchemy_url")
+        if sa_url:
+            engine = create_engine(sa_url)
+            logging.info("SQLAlchemy engine created from secrets.supabase_db.sqlalchemy_url")
+        else:
+            logging.warning("No sqlalchemy_url found in st.secrets['supabase_db']; pandas read_sql/to_sql will be unavailable until provided.")
+    except Exception as e:
+        logging.error(f"Failed to create SQLAlchemy engine: {e}", exc_info=True)
+
+    return conn, engine
+
+# Initialize connections
+DB_CONN, DB_ENGINE = get_db_connection()
+
+# Ensure DB_ENGINE is available (some features still work without it but pandas will require it)
+if DB_ENGINE is None:
+    logging.warning("DB_ENGINE not set. Create st.secrets['supabase_db']['sqlalchemy_url'] with a valid SQLAlchemy URL to enable pandas read_sql/to_sql operations.")
+
+
 def initialize_database(conn):
     """
     Initializes database tables if they don't exist.
+    Uses the Streamlit SQLConnection session (conn) for DDL.
     """
-    # Helper to execute DDL safely (now explicitly using text() for compatibility)
     def execute_ddl(session, sql_command):
         try:
-            # Explicitly wrap the SQL command with text()
             session.execute(text(sql_command))
         except Exception as e:
              logging.warning(f"Failed to execute DDL: {sql_command[:50]}... Error: {e}")
 
     with conn.session as session:
-        # Basic DDL definitions (PostgreSQL compatible)
         execute_ddl(session, """CREATE TABLE IF NOT EXISTS portfolio (ticker TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, sector TEXT, market_cap TEXT)""")
         execute_ddl(session, """CREATE TABLE IF NOT EXISTS trades (symbol TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, target_price REAL NOT NULL, stop_loss_price REAL NOT NULL)""")
         execute_ddl(session, """CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close_price REAL, PRIMARY KEY (ticker, date))""")
@@ -180,14 +199,9 @@ def initialize_database(conn):
         execute_ddl(session, """CREATE TABLE IF NOT EXISTS recurring_expenses (recurring_id SERIAL PRIMARY KEY, description TEXT NOT NULL UNIQUE, amount REAL NOT NULL, category TEXT NOT NULL, payment_method TEXT, day_of_month INTEGER NOT NULL)""")
         execute_ddl(session, """CREATE TABLE IF NOT EXISTS mf_transactions (transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL, scheme_name TEXT NOT NULL, yfinance_symbol TEXT NOT NULL, type TEXT NOT NULL, units REAL NOT NULL, nav REAL NOT NULL)""")
         execute_ddl(session, """CREATE TABLE IF NOT EXISTS mf_sips (sip_id SERIAL PRIMARY KEY, scheme_name TEXT NOT NULL UNIQUE, yfinance_symbol TEXT NOT NULL, amount REAL NOT NULL, day_of_month INTEGER NOT NULL)""")
-
         session.commit()
 
-    # We skip SQLite-specific schema migration logic (_add_missing_columns, _migrate_fund_transactions_schema)
-    # as the DDL is handled above, and structural changes should be managed manually in Supabase for safety.
-
-
-DB_CONN = get_db_connection()
+# Initialize DB schema
 initialize_database(DB_CONN)
 
 
@@ -198,7 +212,6 @@ def update_funds_on_transaction(transaction_type, amount, description, date):
         description = description.split(' - ', 1)[-1].strip()
 
     with DB_CONN.session as session:
-        # Wrap SQL in text()
         session.execute(
             text("INSERT INTO fund_transactions (transaction_id, date, type, amount, description) VALUES (:id, :date, :type, :amount, :desc)"),
             params={'id': str(uuid.uuid4()), 'date': date, 'type': transaction_type, 'amount': amount, 'desc': description}
@@ -252,13 +265,12 @@ def fetch_stock_info(symbol):
                 sector = info.get('fundFamily') or info.get('category')
 
 
-            if price is None:
-                # Use named parameter for read_sql (SAFE TO USE TEXT HERE)
+            if price is None and DB_ENGINE is not None:
                 latest_db_price = pd.read_sql(
-    text("SELECT close_price FROM price_history WHERE ticker = :symbol ORDER BY date DESC LIMIT 1"),
-    DB_CONN,
-    params={'symbol': symbol}
-)
+                    "SELECT close_price FROM price_history WHERE ticker = %(symbol)s ORDER BY date DESC LIMIT 1",
+                    DB_ENGINE,
+                    params={'symbol': symbol}
+                )
 
                 if not latest_db_price.empty:
                     price = latest_db_price['close_price'].iloc[0]
@@ -314,12 +326,12 @@ def get_mf_historical_data(scheme_code):
         logging.error(f"Failed to fetch historical data for scheme {scheme_code}: {e}")
         return pd.DataFrame()
 
+
 def update_stock_data(symbol):
 
     try:
         ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol and not symbol.endswith('.NS') else symbol
         today = datetime.date.today()
-        # Fetch only what's necessary (Close)
         data = yf.download(ticker_str, start="2020-01-01", end=today + datetime.timedelta(days=1), progress=False, auto_adjust=True)
 
         if data.empty or 'Close' not in data.columns:
@@ -330,14 +342,18 @@ def update_stock_data(symbol):
         data["ticker"] = symbol
         data["date"] = data["Date"].dt.strftime("%Y-%m-%d")
 
-        # Use to_sql with the connection object
-        data[["ticker", "date", "Close"]].rename(columns={"Close": "close_price"}).to_sql(
-            'price_history',
-            DB_CONN,
-            if_exists='append',
-            index=False
-        )
-        return True
+        # Write using SQLAlchemy engine when available
+        if DB_ENGINE is not None:
+            data[["ticker", "date", "Close"]].rename(columns={"Close": "close_price"}).to_sql(
+                'price_history',
+                DB_ENGINE,
+                if_exists='append',
+                index=False
+            )
+            return True
+        else:
+            logging.error("DB_ENGINE is not available; cannot write price_history via pandas.to_sql. Provide st.secrets['supabase_db']['sqlalchemy_url'].")
+            return False
     except Exception as e:
         logging.error(f"YFinance update_stock_data failed for {symbol}: {e}")
         return False
@@ -345,13 +361,11 @@ def update_stock_data(symbol):
 
 def get_holdings_df(table_name):
     """Fetches and calculates current portfolio/trade holdings from the database."""
-    # Use f-string for query construction, then wrap in text()
     if table_name == "trades":
         query = f"SELECT p.symbol, p.buy_price, p.buy_date, p.quantity, p.target_price, p.stop_loss_price, h.close_price AS current_price FROM trades p LEFT JOIN price_history h ON p.symbol = h.ticker WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.symbol)"
     else:
         query = f"SELECT p.ticker AS symbol, p.buy_price, p.buy_date, p.quantity, p.sector, p.market_cap, h.close_price AS current_price FROM portfolio p LEFT JOIN price_history h ON p.ticker = h.ticker WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.ticker)"
     try:
-        # FIX: Using raw string query
         df = db_query(query)
         if df.empty:
             return pd.DataFrame()
@@ -367,10 +381,10 @@ def get_holdings_df(table_name):
         logging.error(f"Error querying {table_name}: {e}")
         return pd.DataFrame()
 
+
 def get_realized_df(table_name):
 
     try:
-        # FIX: Using raw string query
         df = db_query(f"SELECT * FROM {table_name}")
         if df.empty:
             return pd.DataFrame()
@@ -385,6 +399,8 @@ def get_realized_df(table_name):
     except Exception as e:
         logging.error(f"Error querying {table_name}: {e}")
         return pd.DataFrame()
+
+
 
 def _update_existing_portfolio_info():
     """Placeholder for PostgreSQL DML update logic."""
@@ -1671,7 +1687,7 @@ def mutual_fund_page():
             if selected_result and selected_result != st.session_state.get(f"{key_prefix}_selected_result"):
                 st.session_state[f"{key_prefix}_selected_result"] = selected_result
                 st.rerun()
-        if st.session_state.get(f"{key_prefix}_selected_symbol"):
+        if st.session_state.get(f"{key_prefix}_selected_result"):
             selected_result = st.session_state[f"{key_prefix}_selected_result"]
             selected_name = selected_result.split(" (")[0]
             selected_code = selected_result.split(" (")[-1].replace(")", "")
@@ -2209,10 +2225,10 @@ def render_asset_page(config):
                 asset_info = df_to_display.loc[df_to_display["symbol"] == symbol].iloc[0]
                 # NOTE: Keeping text() here for parametrized query to handle potential SQLAlchemy warning.
                 history_df = pd.read_sql(
-    text("SELECT date, close_price FROM price_history WHERE ticker=:symbol AND date>=:date ORDER BY date ASC"),
-    DB_CONN,
-    params={'symbol': symbol, 'date': asset_info["buy_date"]}
-)
+                    text("SELECT date, close_price FROM price_history WHERE ticker=:symbol AND date>=:date ORDER BY date ASC"),
+                    DB_ENGINE, # <--- **FIX APPLIED HERE: Used DB_ENGINE instead of DB_CONN**
+                    params={'symbol': symbol, 'date': asset_info["buy_date"]}
+                )
 
                 if not history_df.empty:
                     history_df["return_%"] = ((history_df["close_price"] - asset_info["buy_price"]) / asset_info["buy_price"] * 100).round(2)
