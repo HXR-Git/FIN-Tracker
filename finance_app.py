@@ -12,6 +12,7 @@ import time
 
 # ❌ REMOVE SQLAlchemy engine imports
 # from sqlalchemy import text, create_engine
+from sqlalchemy import create_engine, text
 
 # ✅ Keep only the safe part:
 from sqlalchemy import text as _sql_text
