@@ -344,6 +344,9 @@ def get_holdings_df(table_name):
         df = db_query(query)
         if df.empty:
             return pd.DataFrame()
+        # Ensure date columns are proper datetime objects for later comparisons/formatting
+        df['buy_date'] = pd.to_datetime(df['buy_date'], format='%Y-%m-%d', errors='coerce')
+
         df['current_price'] = pd.to_numeric(df['current_price'], errors='coerce').fillna(0).round(2)
         df["return_%"] = ((df["current_price"] - df["buy_price"]) / df["buy_price"] * 100).round(2)
         df["return_amount"] = ((df["current_price"] - df["buy_price"]) * df["quantity"]).round(2)
@@ -520,14 +523,11 @@ def get_benchmark_data(ticker, start_date):
             return pd.DataFrame()
         return data['Close'].rename('Close').to_frame()
     except Exception as e:
-        # The previous error was here, but the fix is in the calling function (render_asset_page)
-        # to ensure the date parameter is a string before being passed to YF/SQL.
         logging.error(f"Failed to fetch benchmark data for {ticker}: {e}")
         return pd.DataFrame()
 
 def calculate_portfolio_metrics(holdings_df, portfolio_data, benchmark_choice):
     # This function relies on the benchmark comparison logic but is stubbed/simplified
-    # to prevent excessive YF calls unless necessary.
 
     metrics = {
         "alpha": 0.00,
@@ -560,7 +560,7 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
         return pd.DataFrame()
 
     # 1. Determine the earliest buy date (start of calculation)
-    holdings_df['buy_date'] = pd.to_datetime(holdings_df['buy_date'], format='%Y-%m-%d', errors='coerce')
+    # The date column is already loaded as datetime in get_holdings_df
     start_date = holdings_df['buy_date'].min()
 
     if pd.isna(start_date):
@@ -579,9 +579,12 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     all_tickers = holdings_df['symbol'].unique().tolist()
 
     # Portfolio prices from DB (only the held assets)
+    # The start_date must be passed as a string to match the 'TEXT' type in the DB.
+    start_date_str = start_date.strftime('%Y-%m-%d')
+
     portfolio_prices_df = db_query(
         "SELECT ticker, date, close_price FROM price_history WHERE ticker IN :tickers AND date >= :start_date",
-        params={'tickers': tuple(all_tickers), 'start_date': start_date.strftime('%Y-%m-%d')}
+        params={'tickers': tuple(all_tickers), 'start_date': start_date_str}
     ).pivot(index='date', columns='ticker', values='close_price')
 
     if portfolio_prices_df.empty:
@@ -589,7 +592,7 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
 
     portfolio_prices_df.index = pd.to_datetime(portfolio_prices_df.index)
 
-    # Benchmark prices from YF
+    # Benchmark prices from YF (start_date is handled correctly by YF if passed as datetime)
     benchmark_data = get_benchmark_data(benchmark_ticker, start_date)
     if benchmark_data.empty:
         return pd.DataFrame()
@@ -2031,6 +2034,7 @@ def render_asset_page(config):
 
                 # FIX APPLIED: Ensure asset_info["buy_date"] is converted to a string format
                 # that PostgreSQL (with TEXT date) can compare against.
+                # This fixes the "operator does not exist: text >= timestamp" error.
                 buy_date_str = asset_info["buy_date"].strftime("%Y-%m-%d")
 
                 history_df = pd.read_sql(
