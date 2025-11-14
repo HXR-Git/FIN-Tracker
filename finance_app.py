@@ -1200,11 +1200,12 @@ def expense_tracker_page():
             spending_by_category['percentage'] = (spending_by_category['amount'] / total_spent_for_chart * 100).round(2)
 
             base = alt.Chart(spending_by_category).encode(
-                theta=alt.Theta("amount", stack=True)
+                # FIX APPLIED: Explicitly define data types for robustness
+                theta=alt.Theta(field="amount", type="quantitative", stack=True),
             )
 
             pie = base.mark_arc(outerRadius=120).encode(
-                color=alt.Color("category"),
+                color=alt.Color(field="category", type="nominal"),
 
                 tooltip=["category",
                          alt.Tooltip('amount', format='.2f', title='Amount (₹)'),
