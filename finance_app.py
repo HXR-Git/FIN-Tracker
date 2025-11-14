@@ -17,6 +17,20 @@ from sqlalchemy.orm import sessionmaker
 # ------------------ CONFIG & LOGGING ------------------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
 
+def login_page():
+    st.title("🔐 Login")
+
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if username == USERNAME and password == PASSWORD:
+            st.session_state.logged_in = True
+            st.success("Login successful!")
+            st.rerun()
+        else:
+            st.error("Invalid username or password")
+
 st.set_page_config(
     page_title="Finance Dashboard",
     page_icon="pages/logo.png",
