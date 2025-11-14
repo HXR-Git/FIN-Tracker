@@ -9,7 +9,12 @@ import uuid
 import numpy as np
 from mftool import Mftool
 import time
-from sqlalchemy import text, create_engine # Retaining import for session and parametrized queries
+
+# ❌ REMOVE SQLAlchemy engine imports
+# from sqlalchemy import text, create_engine
+
+# ✅ Keep only the safe part:
+from sqlalchemy import text as _sql_text
 
 # --- Streamlit SQLConnection helpers (inserted) ---
 def get_db():
