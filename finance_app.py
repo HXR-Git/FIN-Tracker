@@ -344,7 +344,8 @@ def get_holdings_df(table_name):
         df = db_query(query)
         if df.empty:
             return pd.DataFrame()
-        # Ensure date columns are proper datetime objects for later comparisons/formatting
+
+        # FIX: Ensure buy_date is a datetime object immediately after loading from DB
         df['buy_date'] = pd.to_datetime(df['buy_date'], format='%Y-%m-%d', errors='coerce')
 
         df['current_price'] = pd.to_numeric(df['current_price'], errors='coerce').fillna(0).round(2)
@@ -2034,7 +2035,6 @@ def render_asset_page(config):
 
                 # FIX APPLIED: Ensure asset_info["buy_date"] is converted to a string format
                 # that PostgreSQL (with TEXT date) can compare against.
-                # This fixes the "operator does not exist: text >= timestamp" error.
                 buy_date_str = asset_info["buy_date"].strftime("%Y-%m-%d")
 
                 history_df = pd.read_sql(
