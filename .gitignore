@@ -2,3 +2,4 @@ migration_env/
 .streamlit/secrets.toml
 __pycache__/
 *.pyc
+finance.db
