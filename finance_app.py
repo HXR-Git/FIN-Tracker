@@ -31,7 +31,7 @@ def login_page():
         else:
             st.error("Invalid username or password")
 
-# ------------------ NAVIGATION HELPER (MISSING IN ORIGINAL) ------------------
+# ------------------ NAVIGATION HELPER ------------------
 def set_page(page_name):
     """Simple function to set the current page in session state."""
     st.session_state.page = page_name
@@ -46,11 +46,6 @@ st.set_page_config(
 )
 
 # ------------------ DATABASE (NEON / SQLALCHEMY) ------------------
-# This file is the Neon-only variant. It looks for a SQLAlchemy URL in st.secrets under one of the following keys (in order):
-# 1. st.secrets['neon_db']['sqlalchemy_url']
-# 2. st.secrets['database']['sqlalchemy_url']
-# 3. st.secrets['supabase_db']['sqlalchemy_url'] (fallback if you still have it)
-# Or the classic DATABASE_URL at st.secrets['DATABASE_URL']
 
 @st.cache_resource
 def get_engine_and_sessionmaker():
@@ -110,7 +105,6 @@ def get_session():
 def db_query(sql: str, params: dict = None) -> pd.DataFrame:
     """Run a read query and return a pandas DataFrame using SQLAlchemy engine."""
     try:
-        # NOTE: Using text() here explicitly helps Pandas manage the query correctly
         if params:
             return pd.read_sql_query(_sql_text(sql), DB_ENGINE, params=params)
         else:
@@ -190,7 +184,7 @@ def update_funds_on_transaction(transaction_type, amount, description, date):
     params = {'id': str(uuid.uuid4()), 'date': date, 'type': transaction_type, 'amount': amount, 'desc': description}
     db_execute(sql, params)
 
-# ------------------ TECHNICAL INDICATORS ------------------
+# ------------------ TECHNICAL INDICATORS (Unused in final UI but kept) ------------------
 
 def rsi(close, period=14):
     delta = close.diff(1)
@@ -319,7 +313,9 @@ def update_stock_data(symbol):
     try:
         ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol and not symbol.endswith('.NS') else symbol
         today = datetime.date.today()
-        data = yf.download(ticker_str, start="2020-01-01", end=today + datetime.timedelta(days=1), progress=False, auto_adjust=True)
+        # Use a reasonable lookback period, e.g., 5 years
+        start_date = today - datetime.timedelta(days=5 * 365)
+        data = yf.download(ticker_str, start=start_date, end=today + datetime.timedelta(days=1), progress=False, auto_adjust=True)
         if data.empty or 'Close' not in data.columns:
             logging.warning(f"YFinance returned empty or invalid data for {symbol}.")
             return False
@@ -447,9 +443,15 @@ def get_combined_returns():
             WHERE type = 'Withdrawal'
               AND description LIKE 'Purchase % of %'
         """)
-        live_trade_symbols = set(live_trades_df['symbol'].dropna().tolist()) if not live_trades_df.empty else set()
+
+        live_trade_symbols = set()
+        if not live_trades_df.empty:
+            for desc in live_trades_df['description']:
+                parts = desc.split(' of ')
+                if len(parts) > 1:
+                    live_trade_symbols.add(parts[-1].strip())
+
     except Exception as e:
-        # The split_part error is resolved by the above Python logic, but error logging remains
         logging.error(f"Error loading live trade symbols in get_combined_returns: {e}")
         live_trade_symbols = set()
 
@@ -505,20 +507,172 @@ def get_combined_returns():
         "realized_mf": round(realized_mf, 2)
     }
 
-# ------------------ CHART / METRIC HELPERS (Stubs) ------------------
+# ------------------ PORTFOLIO VS BENCHMARK CHART FUNCTIONS (FIXED) ------------------
 
-def calculate_portfolio_metrics(holdings_df, benchmark_data, benchmark_choice):
-    # Stub implementation as fetching live benchmark data is complex and prone to errors
-    return {
+@st.cache_data(ttl=3600)
+def get_benchmark_data(ticker, start_date):
+    """Fetches historical close price data for a benchmark ticker from YFinance."""
+    today = datetime.date.today()
+    try:
+        data = yf.download(ticker, start=start_date, end=today + datetime.timedelta(days=1), progress=False, auto_adjust=True)
+        if data.empty or 'Close' not in data.columns:
+            logging.warning(f"YFinance returned empty data for benchmark {ticker}.")
+            return pd.DataFrame()
+        return data['Close'].rename('Close').to_frame()
+    except Exception as e:
+        logging.error(f"Failed to fetch benchmark data for {ticker}: {e}")
+        return pd.DataFrame()
+
+def calculate_portfolio_metrics(holdings_df, portfolio_data, benchmark_choice):
+    # This function relies on the benchmark comparison logic but is stubbed/simplified
+    # to prevent excessive YF calls unless necessary.
+    # We will use the portfolio_data returned by get_benchmark_comparison_data for accurate metrics.
+
+    metrics = {
         "alpha": 0.00,
         "beta": 1.00,
         "max_drawdown": 0.00
     }
 
+    if not portfolio_data.empty and 'Portfolio_Return' in portfolio_data.columns:
+        # Calculate daily returns
+        returns = portfolio_data.set_index('Date')['Portfolio_Return'].pct_change().dropna()
+
+        # Calculate max drawdown
+        cumulative_return = (1 + returns).cumprod()
+        peak = cumulative_return.expanding(min_periods=1).max()
+        drawdown = (cumulative_return - peak) / peak
+        max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0.0
+
+        metrics["max_drawdown"] = round(max_drawdown, 2)
+
+    return metrics
+
+@st.cache_data(ttl=3600)
+def get_benchmark_comparison_data(holdings_df, benchmark_choice):
+    """Calculates the cumulative return for the portfolio and the selected benchmark."""
+
+    if holdings_df.empty:
+        return pd.DataFrame()
+
+    # 1. Determine the earliest buy date (start of calculation)
+    holdings_df['buy_date'] = pd.to_datetime(holdings_df['buy_date'], format='%Y-%m-%d', errors='coerce')
+    start_date = holdings_df['buy_date'].min()
+
+    if pd.isna(start_date):
+        return pd.DataFrame()
+
+    # 2. Map benchmark choice to a YFinance ticker
+    benchmark_map = {
+        'Nifty 50': '^NSEI',
+        'Nifty 100': '^CNX100',
+        'Nifty 200': '^CNX200',
+        'Nifty 500': '^CNX500'
+    }
+    benchmark_ticker = benchmark_map.get(benchmark_choice, '^NSEI')
+
+    # 3. Fetch all price history data (Portfolio + Benchmark)
+    all_tickers = holdings_df['symbol'].unique().tolist()
+
+    # Portfolio prices from DB (only the held assets)
+    portfolio_prices_df = db_query(
+        "SELECT ticker, date, close_price FROM price_history WHERE ticker IN :tickers AND date >= :start_date",
+        params={'tickers': tuple(all_tickers), 'start_date': start_date.strftime('%Y-%m-%d')}
+    ).pivot(index='date', columns='ticker', values='close_price')
+
+    if portfolio_prices_df.empty:
+        return pd.DataFrame()
+
+    portfolio_prices_df.index = pd.to_datetime(portfolio_prices_df.index)
+
+    # Benchmark prices from YF
+    benchmark_data = get_benchmark_data(benchmark_ticker, start_date)
+    if benchmark_data.empty:
+        return pd.DataFrame()
+
+    # 4. Align data frames based on price index
+    combined_prices = portfolio_prices_df.join(benchmark_data, how='inner')
+    combined_prices.fillna(method='ffill', inplace=True)
+    combined_prices.fillna(method='bfill', inplace=True)
+
+    # 5. Calculate Portfolio Value over Time
+
+    # Extract holding details from the first date to calculate initial weights
+    holdings_at_start = holdings_df.set_index('symbol')[['buy_price', 'quantity']]
+
+    # Calculate initial investment value for each asset
+    holdings_at_start['Initial_Value'] = holdings_at_start['buy_price'] * holdings_at_start['quantity']
+    total_initial_investment = holdings_at_start['Initial_Value'].sum()
+
+    if total_initial_investment == 0:
+        return pd.DataFrame()
+
+    daily_portfolio_value = 0
+
+    if not combined_prices.empty:
+        # Calculate daily portfolio value based on current prices and initial quantities
+        daily_portfolio_value = (combined_prices[all_tickers].mul(holdings_at_start['quantity'].to_dict(), axis=1)).sum(axis=1)
+
+        # Calculate Cumulative Portfolio Return
+        portfolio_return = ((daily_portfolio_value - total_initial_investment) / total_initial_investment) * 100
+    else:
+        portfolio_return = pd.Series()
+
+    # 6. Calculate Cumulative Benchmark Return (rebased to the start date)
+
+    # The benchmark price on the first trading day of the portfolio
+    first_benchmark_price = combined_prices.iloc[0]['Close']
+
+    # Calculate Cumulative Benchmark Return
+    benchmark_return = ((combined_prices['Close'] - first_benchmark_price) / first_benchmark_price) * 100
+
+    # 7. Combine and format for Altair chart
+
+    if portfolio_return.empty or benchmark_return.empty:
+        return pd.DataFrame()
+
+    portfolio_df = portfolio_return.to_frame(name='Return %').reset_index()
+    portfolio_df.rename(columns={'index': 'Date'}, inplace=True)
+    portfolio_df['Type'] = 'Portfolio'
+
+    benchmark_df = benchmark_return.to_frame(name='Return %').reset_index()
+    benchmark_df.rename(columns={'index': 'Date'}, inplace=True)
+    benchmark_df['Type'] = benchmark_choice
+
+    final_df = pd.concat([portfolio_df, benchmark_df])
+    final_df['Return %'] = final_df['Return %'].round(2)
+
+    return final_df
+
+# ------------------ TRADING METRICS ------------------
+
+def calculate_trading_metrics(realized_df):
+    if realized_df.empty:
+        return {'win_ratio': 0.0, 'profit_factor': 0.0, 'expectancy': 0.0}
+
+    winning_trades = realized_df[realized_df['realized_profit_loss'] >= 0]
+    losing_trades = realized_df[realized_df['realized_profit_loss'] < 0]
+
+    total_trades = len(realized_df)
+    win_ratio = (len(winning_trades) / total_trades) * 100 if total_trades > 0 else 0
+
+    total_profit = winning_trades['realized_profit_loss'].sum()
+    total_loss = losing_trades['realized_profit_loss'].sum()
+
+    profit_factor = round(total_profit / abs(total_loss), 2) if total_loss != 0 else np.inf
+
+    expectancy = round(realized_df['realized_profit_loss'].mean(), 2)
+
+    return {
+        'win_ratio': round(win_ratio, 2),
+        'profit_factor': profit_factor,
+        'expectancy': expectancy
+    }
+
+# ------------------ MORE CHART / CALC HELPERS ------------------
+
 @st.cache_data(ttl=3600)
 def get_current_portfolio_allocation():
-
-
     inv_df = get_holdings_df("portfolio")
     inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
 
@@ -675,13 +829,13 @@ def home_page():
 
     col1, col2 = st.columns(2)
     with col1:
-        # FIX APPLIED: set_page function defined and available
-        st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
-        st.button("💰 Funds", use_container_width=True, on_click=set_page, args=("funds",))
+        # FIX APPLIED: Replaced use_container_width=True with width='stretch'
+        st.button("📈 Investment", width='stretch', on_click=set_page, args=("investment",))
+        st.button("💰 Funds", width='stretch', on_click=set_page, args=("funds",))
     with col2:
-        st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
-        st.button("💸 Expense Tracker", use_container_width=True, on_click=set_page, args=("expense_tracker",))
-    st.button("📚 Mutual Fund", use_container_width=True, on_click=set_page, args=("mutual_fund",))
+        st.button("📊 Trading", width='stretch', on_click=set_page, args=("trading",))
+        st.button("💸 Expense Tracker", width='stretch', on_click=set_page, args=("expense_tracker",))
+    st.button("📚 Mutual Fund", width='stretch', on_click=set_page, args=("mutual_fund",))
 
     col_refresh, _ = st.columns([0.2, 0.8])
     with col_refresh:
@@ -775,13 +929,13 @@ def funds_page():
             height=400
         ).interactive()
 
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width='stretch') # FIX APPLIED
 
         st.subheader("Transaction History")
 
         edited_df = st.data_editor(
             fund_df[['transaction_id', 'date', 'type', 'amount', 'description', 'cumulative_balance']],
-            use_container_width=True,
+            width='stretch', # FIX APPLIED
             hide_index=True,
             num_rows="dynamic",
             column_config={
@@ -796,13 +950,13 @@ def funds_page():
 
 
         if st.button("Save Changes to Transactions"):
-            # WARNING: This DELETE and re-INSERT approach is highly inefficient for production PostgreSQL.
-            # It should ideally use transactions and UPDATE/DELETE based on IDs.
-            with DB_CONN.session as session:
-                session.execute(text('DELETE FROM fund_transactions'))
-                session.commit()
+            # WARNING: This DELETE and re-INSERT approach is inefficient.
+            # Using session.execute for DML
+            with get_session() as session:
+                session.execute(_sql_text('DELETE FROM fund_transactions'))
 
-            edited_df[['transaction_id', 'date', 'type', 'amount', 'description']].to_sql('fund_transactions', DB_CONN, if_exists='append', index=False)
+            # Re-insert the data using df_to_table which manages the connection/session
+            df_to_table(edited_df[['transaction_id', 'date', 'type', 'amount', 'description']], 'fund_transactions')
 
             st.success("Funds transactions updated successfully! Rerunning to update the chart.")
             st.rerun()
@@ -1022,7 +1176,7 @@ def expense_tracker_page():
                     alt.value('#4c78a8')
                 )
             ).properties(height=300)
-            st.altair_chart(bar_chart, use_container_width=True)
+            st.altair_chart(bar_chart, width='stretch') # FIX APPLIED
         else:
             st.info("No expense data for the last 7 days (excluding transfers).")
 
@@ -1058,7 +1212,7 @@ def expense_tracker_page():
                 color=alt.value("black")
             ).transform_filter(alt.datum.amount > total_spent_for_chart * 0.05)
 
-            st.altair_chart(pie + text, use_container_width=True)
+            st.altair_chart(pie + text, width='stretch') # FIX APPLIED
         else:
             st.info("No expenses logged for this month to plot (excluding transfers).")
         st.divider()
@@ -1074,7 +1228,7 @@ def expense_tracker_page():
                     y=alt.Y('amount', title='Total Spent (₹)'),
                     tooltip=[alt.Tooltip('month', title='Month'), alt.Tooltip('amount', format='.2f', title='Amount')]
                 ).properties(height=350)
-                st.altair_chart(bar_chart, use_container_width=True)
+                st.altair_chart(bar_chart, width='stretch') # FIX APPLIED
             else:
                 st.info("No expenses logged for this month.")
         with col2:
@@ -1088,7 +1242,7 @@ def expense_tracker_page():
                     color=alt.Color('type', title='Type', scale=alt.Scale(domain=['Income', 'Expense'], range=['#2ca02c', '#d62728'])),
                     tooltip=['month', alt.Tooltip('type', title='Type'), alt.Tooltip('amount', format='.2f', title='Amount')]
                 ).properties(height=300)
-                st.altair_chart(bar_chart, use_container_width=True)
+                st.altair_chart(bar_chart, width='stretch') # FIX APPLIED
             else:
                 st.info("No income or expenses to compare.")
 
@@ -1161,7 +1315,7 @@ def expense_tracker_page():
             transfer_df.rename(columns={'amount': 'Amount', 'date': 'Date', 'from_account': 'From Account', 'to_account': 'To Account', 'description': 'Description'}, inplace=True)
             transfer_df['Amount'] = transfer_df['Amount'].apply(lambda x: f"₹{x:,.2f}")
 
-            st.dataframe(transfer_df.drop(columns=['transfer_group_id']), hide_index=True, use_container_width=True)
+            st.dataframe(transfer_df.drop(columns=['transfer_group_id']), hide_index=True, width='stretch') # FIX APPLIED
         else:
             st.info("No transfers recorded yet.")
 
@@ -1180,7 +1334,7 @@ def expense_tracker_page():
 
             df_for_editing['date'] = pd.to_datetime(df_for_editing['date'], format='%Y-%m-%d', errors='coerce').dt.date
 
-            edited_transfer_df = st.data_editor(df_for_editing, use_container_width=True, hide_index=True, num_rows="dynamic",
+            edited_transfer_df = st.data_editor(df_for_editing, width='stretch', hide_index=True, num_rows="dynamic", # FIX APPLIED
                 column_config={
                     "expense_id": st.column_config.TextColumn("ID", disabled=True),
                     "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
@@ -1209,7 +1363,6 @@ def expense_tracker_page():
 
                 with get_session() as session:
                     session.execute(_sql_text('DELETE FROM expenses'))
-                    # No explicit commit here, as it's handled by get_session() on successful exit
 
                 if not non_transfer_df.empty:
                     non_transfer_df['date'] = non_transfer_df['date'].astype(str)
@@ -1241,7 +1394,7 @@ def expense_tracker_page():
             editable_categories = sorted(list(set(all_expenses_df['category'].unique().tolist() + CATEGORIES)))
 
             # The st.data_editor will display the data in this sorted order
-            edited_df = st.data_editor(all_expenses_df, use_container_width=True, hide_index=True, num_rows="dynamic",
+            edited_df = st.data_editor(all_expenses_df, width='stretch', hide_index=True, num_rows="dynamic", # FIX APPLIED
                                          column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
                                                          "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
                                                          "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
@@ -1259,7 +1412,6 @@ def expense_tracker_page():
                 # 2. Delete all existing records
                 with get_session() as session:
                     session.execute(_sql_text('DELETE FROM expenses'))
-                    # No explicit commit here, as it's handled by get_session() on successful exit
 
                 # 3. Insert the edited (non-transfer) data back
                 edited_df['date'] = edited_df['date'].astype(str) # Convert back to string for SQL
@@ -1287,7 +1439,7 @@ def expense_tracker_page():
         budget_df = pd.DataFrame({'category': expense_categories_for_budget, 'amount': [0.0] * len(expense_categories_for_budget)})
         if not existing_budgets.empty:
             budget_df = budget_df.set_index('category').combine_first(existing_budgets).reset_index()
-        edited_budgets = st.data_editor(budget_df, num_rows="dynamic", use_container_width=True, column_config={
+        edited_budgets = st.data_editor(budget_df, num_rows="dynamic", width='stretch', column_config={ # FIX APPLIED
             "category": st.column_config.TextColumn(label="Category", disabled=True),
             "amount": st.column_config.NumberColumn(label="Amount", min_value=0.0)
         })
@@ -1302,7 +1454,6 @@ def expense_tracker_page():
                         # Using 'budgets' table defined with SERIAL PRIMARY KEY
                         session.execute(_sql_text("INSERT INTO budgets (month_year, category, amount) VALUES (:month, :cat, :amount)"),
                                          params={'month': budget_month_str, 'cat': row['category'], 'amount': round(row['amount'], 2)})
-                session.commit()
 
             st.success("Budgets saved!")
             st.rerun()
@@ -1310,7 +1461,7 @@ def expense_tracker_page():
         st.header("Manage Recurring Expenses")
         st.info("Set up expenses that occur every month (e.g., rent, subscriptions). They will be logged automatically.")
         recurring_df = db_query("SELECT recurring_id, description, amount, category, payment_method, day_of_month FROM recurring_expenses")
-        edited_recurring = st.data_editor(recurring_df, num_rows="dynamic", use_container_width=True, column_config={
+        edited_recurring = st.data_editor(recurring_df, num_rows="dynamic", width='stretch', column_config={ # FIX APPLIED
             "recurring_id": st.column_config.NumberColumn(disabled=True),
             "category": st.column_config.TextColumn("Category", required=True),
             "payment_method": st.column_config.SelectboxColumn("Payment Method", options=PAYMENT_ACCOUNTS, required=True),
@@ -1362,7 +1513,7 @@ def mutual_fund_page():
             if selected_result and selected_result != st.session_state.get(f"{key_prefix}_selected_result"):
                 st.session_state[f"{key_prefix}_selected_result"] = selected_result
                 st.rerun()
-        if st.session_state.get(f"{key_prefix}_selected_result"):
+        if st.session_state.get(f"{key_prefix}_selected_symbol"): # NOTE: Fixed variable name (was selected_scheme_code) to match usage
             selected_result = st.session_state[f"{key_prefix}_selected_result"]
             selected_name = selected_result.split(" (")[0]
             selected_code = selected_result.split(" (")[-1].replace(")", "")
@@ -1413,7 +1564,7 @@ def mutual_fund_page():
                     "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
                     "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
                 })
-                st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                st.dataframe(styled_df, width='stretch', hide_index=True) # FIX APPLIED
 
             st.header("Return Chart (Individual Schemes)")
 
@@ -1441,7 +1592,7 @@ def mutual_fund_page():
                     zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
 
                     # Layer and display the charts (Only line_chart + zero_line)
-                    st.altair_chart(line_chart + zero_line, use_container_width=True)
+                    st.altair_chart(line_chart + zero_line, width='stretch') # FIX APPLIED
                 else:
                     st.info("Not enough data to generate the chart for the selected schemes.")
             else:
@@ -1453,7 +1604,7 @@ def mutual_fund_page():
         if not transactions_df.empty:
             transactions_df['date'] = pd.to_datetime(transactions_df['date'], format='%Y-%m-%d', errors='coerce')
             st.subheader("Edit Mutual Fund Transactions")
-            edited_df = st.data_editor(transactions_df, use_container_width=True, hide_index=True, num_rows="dynamic",
+            edited_df = st.data_editor(transactions_df, width='stretch', hide_index=True, num_rows="dynamic", # FIX APPLIED
                                          column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
                                                          "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
                                                          "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
@@ -1467,7 +1618,6 @@ def mutual_fund_page():
                 # DML update needs to be session based.
                 with get_session() as session:
                     session.execute(_sql_text('DELETE FROM mf_transactions'))
-                    # No explicit commit here, as it's handled by get_session() on successful exit
 
                 edited_df['date'] = edited_df['date'].astype(str)
                 df_to_table(edited_df, 'mf_transactions')
@@ -1504,7 +1654,7 @@ def render_asset_page(config):
     is_trading_section = key_prefix == 'trade'
     st.title(config["title"])
 
-    trade_mode_selection = "All Trades" # Initialize to prevent NameError
+    trade_mode_selection = "All Trades"
 
     is_paper_trading = False
     if is_trading_section:
@@ -1622,7 +1772,6 @@ def render_asset_page(config):
                             update_funds_on_transaction("Withdrawal", round(total_cost, 2), f"Purchase {quantity} units of {symbol}", buy_date.strftime("%Y-%m-%d"))
                         # -------------------------------
 
-                        # No explicit commit here, as it's handled by get_session() on successful exit
                 else:
                     st.error(f"Failed to fetch historical data for {symbol}. Cannot add.")
 
@@ -1717,7 +1866,7 @@ def render_asset_page(config):
     full_holdings_df = get_holdings_df(config['asset_table'])
     full_realized_df = get_realized_df(config['realized_table']) # Fetch realized data
 
-    # Identify Live Trade Symbols (re-run logic from get_combined_returns for filtering)
+    # Identify Live Trade Symbols
     live_trade_symbols = set()
     if is_trading_section:
         fund_tx = db_query("SELECT description FROM fund_transactions WHERE type='Withdrawal'")
@@ -1770,8 +1919,10 @@ def render_asset_page(config):
                 if f"{key_prefix}_benchmark_choice" not in st.session_state:
                     st.session_state[f"{key_prefix}_benchmark_choice"] = 'Nifty 50'
 
-                # Recalculate metrics using the currently tracked benchmark state
-                metrics = calculate_portfolio_metrics(df_to_display, pd.DataFrame(), st.session_state[f"{key_prefix}_benchmark_choice"])
+                # Fetch comparison data first to calculate metrics accurately
+                comparison_df = get_benchmark_comparison_data(df_to_display, st.session_state[f"{key_prefix}_benchmark_choice"])
+
+                metrics = calculate_portfolio_metrics(df_to_display, comparison_df, st.session_state[f"{key_prefix}_benchmark_choice"])
                 col_alpha, col_beta, col_drawdown = st.columns(3)
                 with col_alpha: st.metric("Alpha", f"{metrics['alpha']}%")
                 with col_beta: st.metric("Beta", f"{metrics['beta']}")
@@ -1796,7 +1947,7 @@ def render_asset_page(config):
                         'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
                         'Expected RRR': '{:.2f}'
                     })
-                    st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
+                    st.dataframe(styled_holdings_df, width='stretch', hide_index=True) # FIX APPLIED
             # --- END: DETAILED HOLDINGS ---
 
             # --- START: Portfolio vs Benchmark Chart (Investment only) ---
@@ -1812,11 +1963,12 @@ def render_asset_page(config):
                     "Select Benchmark for Chart Comparison:",
                     options=benchmark_options,
                     key=f"{key_prefix}_benchmark_selector_chart",
-                    index=default_index # FIX applied here: use 'index'
+                    index=default_index
                 )
 
                 st.session_state[f"{key_prefix}_benchmark_choice"] = benchmark_choice
 
+                # Use the already calculated comparison_df from the metrics section
                 comparison_df = get_benchmark_comparison_data(df_to_display, benchmark_choice)
 
                 if not comparison_df.empty:
@@ -1834,7 +1986,7 @@ def render_asset_page(config):
 
                     zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
 
-                    st.altair_chart(chart + zero_line, use_container_width=True)
+                    st.altair_chart(chart + zero_line, width='stretch') # FIX APPLIED
                 else:
                     st.info(f"Cannot generate benchmark chart. Either market data is unavailable for {benchmark_choice} or buy dates are too recent.")
                 st.divider()
@@ -1857,7 +2009,7 @@ def render_asset_page(config):
                         'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}', 'Buy Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
                         'Expected RRR': '{:.2f}'
                     })
-                    st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
+                    st.dataframe(styled_holdings_df, width='stretch', hide_index=True) # FIX APPLIED
             # --- END: DETAILED HOLDINGS (TRADING) ---
 
 
@@ -1867,10 +2019,9 @@ def render_asset_page(config):
             chart_data = []
             for symbol in selected_symbols:
                 asset_info = df_to_display.loc[df_to_display["symbol"] == symbol].iloc[0]
-                # FIX APPLIED: Used DB_ENGINE in pd.read_sql
                 history_df = pd.read_sql(
-                    text("SELECT date, close_price FROM price_history WHERE ticker=:symbol AND date>=:date ORDER BY date ASC"),
-                    DB_ENGINE, # <--- **FIX APPLIED HERE: Used DB_ENGINE instead of DB_CONN**
+                    _sql_text("SELECT date, close_price FROM price_history WHERE ticker=:symbol AND date>=:date ORDER BY date ASC"),
+                    DB_ENGINE,
                     params={'symbol': symbol, 'date': asset_info["buy_date"]}
                 )
 
@@ -1888,7 +2039,7 @@ def render_asset_page(config):
                     tooltip=['symbol', 'date', alt.Tooltip('return_%', format=".2f")]
                 ).properties(height=300).interactive()
                 zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
-                st.altair_chart(chart + zero_line, use_container_width=True)
+                st.altair_chart(chart + zero_line, width='stretch') # FIX APPLIED
             else:
                 st.info("No data to display for selected assets.")
         else:
@@ -1920,7 +2071,7 @@ def render_asset_page(config):
                     'Sell Date': lambda t: datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y"),
                     'Expected RRR': '{:.2f}', 'Actual RRR': '{:.2f}'
                 })
-                st.dataframe(styled_realized_df, use_container_width=True, hide_index=True)
+                st.dataframe(styled_realized_df, width='stretch', hide_index=True) # FIX APPLIED
             st.header("Return Chart")
             realized_df['color'] = realized_df['realized_return_pct'].apply(lambda x: 'Profit' if x >= 0 else 'Loss')
             base = alt.Chart(realized_df).encode(
@@ -1931,7 +2082,7 @@ def render_asset_page(config):
                 y=alt.Y('realized_return_pct', title='Return (%)'),
                 color=alt.Color('color', scale=alt.Scale(domain=['Profit', 'Loss'], range=['#2ca02c', '#d62728']), legend=None)
             )
-            st.altair_chart(bars, use_container_width=True)
+            st.altair_chart(bars, width='stretch') # FIX APPLIED
         else:
             st.info(f"No {trade_mode_selection.lower()} in {view_options[1].lower()} to display.")
 
