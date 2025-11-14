@@ -1,767 +1,83 @@
 import streamlit as st
-import yfinance as yf
-import pandas as pd
-import datetime
-import logging
-import requests
-import altair as alt
-import uuid
-import numpy as np
-from mftool import Mftool
-import time
+"yfinance_symbol": code
+})
+return pd.DataFrame(holdings)
 
-# ❌ REMOVE SQLAlchemy engine imports
-# from sqlalchemy import text, create_engine
-from sqlalchemy import create_engine, text
-
-# ✅ Keep only the safe part:
-from sqlalchemy import text as _sql_text
-
-# --- Streamlit SQLConnection helpers (inserted) ---
-def get_db():
-    """Return the Streamlit SQLConnection for supabase_db (type='sql')."""
-    return st.connection("supabase_db", type="sql")
-
-def db_query(sql: str):
-    """Run a read query and return a pandas DataFrame using Streamlit SQLConnection."""
-    db = get_db()
-    return db.query(sql)
-
-from sqlalchemy import text as _sql_text  # used by db_execute
-
-def db_execute(sql: str, params: dict = None, commit: bool = True):
-    """Execute a DML/DDL statement using the SQLConnection session."""
-    db = get_db()
-    if params is not None:
-        res = db.session.execute(_sql_text(sql), params)
-    else:
-        res = db.session.execute(_sql_text(sql))
-    if commit:
-        try:
-            db.session.commit()
-        except Exception:
-            pass
-    return res
-
-
-def df_to_table(df, table_name):
-    """
-    Insert rows from a pandas DataFrame into a SQL table using session.execute.
-    This is a simple row-by-row fallback for DataFrame.to_sql which isn't
-    compatible with Streamlit SQLConnection wrapper.
-    """
-    if df is None or df.empty:
-        return
-    db = get_db()
-    records = df.to_dict(orient='records')
-    with db.session as session:
-        for rec in records:
-            cols = ', '.join(rec.keys())
-            vals = ', '.join(':'+k for k in rec.keys())
-            try:
-                session.execute(_sql_text(f"INSERT INTO {table_name} ({cols}) VALUES ({vals})"), rec)
-            except Exception as e:
-                logging.warning(f"Failed inserting into {table_name}: {e}")
-        try:
-            session.commit()
-        except Exception:
-            pass
-# --- end helpers ---
-
-
-# --- LOGGING SETUP ---
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
-
-# --- PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="Finance Dashboard",
-    page_icon="pages/logo.png",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-# Authentication credentials are now read via st.secrets but kept here for clarity.
-USERNAME = st.secrets.get("auth", {}).get("username", "HXR")
-PASSWORD = st.secrets.get("auth", {}).get("password", "Rossph")
-
-
-def login_page():
-    """Renders the login page."""
-    st.title("Login to Finance Dashboard")
-    st.markdown("Please enter your credentials to access the dashboard.")
-
-
-    def reset_login_fields():
-        if "username" in st.session_state:
-            st.session_state.username = ""
-        if "password" in st.session_state:
-            st.session_state.password = ""
-
-    with st.form("login_form"):
-        st.subheader("Login")
-        username = st.text_input("Username", key="username")
-        password = st.text_input("Password", type="password", key="password")
-
-        submit_button = st.form_submit_button("Login")
-
-
-    if st.button("Reset", on_click=reset_login_fields):
-        pass
-
-    if submit_button:
-        if username == USERNAME and password == PASSWORD:
-            st.session_state.logged_in = True
-            st.success("Logged in successfully!")
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-
-
-def rsi(close, period=14):
-    """Calculates the Relative Strength Index (RSI)."""
-    delta = close.diff(1)
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.ewm(span=period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(span=period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / avg_loss
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val
-
-def macd(close, fast=12, slow=26, signal=9):
-    """Calculates the Moving Average Convergence Divergence (MACD)."""
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-def bollinger(close, period=20, std_dev=2):
-    """Calculates Bollinger Bands."""
-    rolling_mean = close.rolling(window=period).mean()
-    rolling_std = close.rolling(window=period).std()
-    upper_band = rolling_mean + (rolling_std * std_dev)
-    lower_band = rolling_mean - (rolling_std * std_dev)
-    return upper_band, rolling_mean, lower_band
-
-
-@st.cache_resource
-def get_db_connection():
-    """
-    Establishes and caches the database connection using Streamlit's SQL connection API.
-    Also creates an SQLAlchemy engine (DB_ENGINE) from secrets for pandas compatibility.
-    """
-    try:
-        conn = st.connection("supabase_db", type="sql")
-        logging.info("Successfully connected to PostgreSQL (Supabase) via st.connection('supabase_db').")
-    except Exception as e:
-        logging.error(f"Database connection error (Supabase): {e}", exc_info=True)
-        st.error(f"Failed to connect to the database. Please check Streamlit Secrets. Error: {e}")
-        st.stop()
-
-    # Create SQLAlchemy engine for pandas usage if the sqlalchemy_url is present in secrets
-    engine = None
-    try:
-        sa_url = st.secrets.get("supabase_db", {}).get("sqlalchemy_url")
-        if sa_url:
-            engine = create_engine(sa_url)
-            logging.info("SQLAlchemy engine created from secrets.supabase_db.sqlalchemy_url")
-        else:
-            logging.warning("No sqlalchemy_url found in st.secrets['supabase_db']; pandas read_sql/to_sql will be unavailable until provided.")
-    except Exception as e:
-        logging.error(f"Failed to create SQLAlchemy engine: {e}", exc_info=True)
-
-    return conn, engine
-
-# Initialize connections
-DB_CONN, DB_ENGINE = get_db_connection()
-
-# Ensure DB_ENGINE is available (some features still work without it but pandas will require it)
-if DB_ENGINE is None:
-    logging.warning("DB_ENGINE not set. Create st.secrets['supabase_db']['sqlalchemy_url'] with a valid SQLAlchemy URL to enable pandas read_sql/to_sql operations.")
-
-
-def initialize_database(conn):
-    """
-    Initializes database tables if they don't exist.
-    Uses the Streamlit SQLConnection session (conn) for DDL.
-    """
-    def execute_ddl(session, sql_command):
-        try:
-            session.execute(text(sql_command))
-        except Exception as e:
-             logging.warning(f"Failed to execute DDL: {sql_command[:50]}... Error: {e}")
-
-    with conn.session as session:
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS portfolio (ticker TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, sector TEXT, market_cap TEXT)""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS trades (symbol TEXT PRIMARY KEY, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, target_price REAL NOT NULL, stop_loss_price REAL NOT NULL)""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close_price REAL, PRIMARY KEY (ticker, date))""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS realized_stocks (transaction_id TEXT PRIMARY KEY, ticker TEXT NOT NULL, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL, sell_price REAL NOT NULL, sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL)""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS exits (transaction_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, buy_price REAL NOT NULL, buy_date TEXT NOT NULL, quantity INTEGER NOT NULL, sell_price REAL NOT NULL, sell_date TEXT NOT NULL, realized_return_pct REAL NOT NULL, target_price REAL NOT NULL, stop_loss_price REAL NOT NULL)""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS fund_transactions (transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL, type TEXT NOT NULL, amount REAL NOT NULL, description TEXT)""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS expenses (expense_id TEXT PRIMARY KEY, date TEXT NOT NULL, amount REAL NOT NULL, category TEXT NOT NULL, payment_method TEXT, description TEXT, type TEXT, transfer_group_id TEXT)""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS budgets (budget_id SERIAL PRIMARY KEY, month_year TEXT NOT NULL, category TEXT NOT NULL, amount REAL NOT NULL, UNIQUE(month_year, category))""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS recurring_expenses (recurring_id SERIAL PRIMARY KEY, description TEXT NOT NULL UNIQUE, amount REAL NOT NULL, category TEXT NOT NULL, payment_method TEXT, day_of_month INTEGER NOT NULL)""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS mf_transactions (transaction_id TEXT PRIMARY KEY, date TEXT NOT NULL, scheme_name TEXT NOT NULL, yfinance_symbol TEXT NOT NULL, type TEXT NOT NULL, units REAL NOT NULL, nav REAL NOT NULL)""")
-        execute_ddl(session, """CREATE TABLE IF NOT EXISTS mf_sips (sip_id SERIAL PRIMARY KEY, scheme_name TEXT NOT NULL UNIQUE, yfinance_symbol TEXT NOT NULL, amount REAL NOT NULL, day_of_month INTEGER NOT NULL)""")
-        session.commit()
-
-# Initialize DB schema
-initialize_database(DB_CONN)
-
-
-def update_funds_on_transaction(transaction_type, amount, description, date):
-    """Inserts a new transaction into the fund_transactions table using st.connection."""
-
-    if description and description.startswith("ALLOCATION:"):
-        description = description.split(' - ', 1)[-1].strip()
-
-    with DB_CONN.session as session:
-        session.execute(
-            text("INSERT INTO fund_transactions (transaction_id, date, type, amount, description) VALUES (:id, :date, :type, :amount, :desc)"),
-            params={'id': str(uuid.uuid4()), 'date': date, 'type': transaction_type, 'amount': amount, 'desc': description}
-        )
-        session.commit()
-
-
-@st.cache_data(ttl=3600)
-def search_for_ticker(company_name):
-    """Searches for a stock ticker using a company name via Finnhub API."""
-    try:
-
-        api_key = st.secrets.get("api_keys", {}).get("finnhub")
-        if not api_key:
-            logging.warning("Finnhub API key not found in st.secrets.")
-            return []
-
-        url = f"https://finnhub.io/api/v1/search?q={company_name}&token={api_key}"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return [f"{item.get('symbol')} - {item.get('description', 'N/A')}" for item in data.get("result", [])]
-    except Exception as e:
-        logging.error(f"Finnhub search failed: {e}")
-        return []
-
-@st.cache_data(ttl=600)
-def fetch_stock_info(symbol):
-
-    max_retries = 3
-    retry_delay = 5
-    for attempt in range(max_retries):
-        try:
-            ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol and not symbol.endswith('.NS') else symbol
-            ticker_obj = yf.Ticker(ticker_str)
-            info = ticker_obj.info
-            price = info.get('currentPrice') or info.get('regularMarketPrice')
-
-            if price is None:
-
-                data = ticker_obj.history(period='1d', auto_adjust=True)
-                if not data.empty:
-                    price = data['Close'].iloc[-1]
-
-            if price:
-                price = round(price, 2)
-
-            sector = info.get('sector', 'N/A')
-            market_cap = info.get('marketCap', 'N/A')
-            if sector == 'N/A' and ('fundFamily' in info or 'category' in info):
-                sector = info.get('fundFamily') or info.get('category')
-
-
-            if price is None and DB_ENGINE is not None:
-                latest_db_price = pd.read_sql(
-                    "SELECT close_price FROM price_history WHERE ticker = %(symbol)s ORDER BY date DESC LIMIT 1",
-                    DB_ENGINE,
-                    params={'symbol': symbol}
-                )
-
-                if not latest_db_price.empty:
-                    price = latest_db_price['close_price'].iloc[0]
-
-            return {'price': price, 'sector': sector, 'market_cap': market_cap}
-        except Exception as e:
-            logging.warning(f"Attempt {attempt + 1}/{max_retries} to fetch info for {symbol} failed: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-            else:
-                logging.error(f"All {max_retries} attempts failed for {symbol}.")
-                return {'price': None, 'sector': 'N/A', 'market_cap': 'N/A'}
-
-@st.cache_data(ttl=3600)
-def fetch_mf_schemes():
-
-    try:
-        mf = Mftool()
-        schemes = mf.get_scheme_codes()
-        return {v: k for k, v in schemes.items()}
-    except Exception as e:
-        logging.error(f"Failed to fetch mutual fund schemes: {e}")
-        return {}
-
-@st.cache_data(ttl=600)
-def fetch_latest_mf_nav(scheme_code):
-
-    try:
-        mf = Mftool()
-        data = mf.get_scheme_quote(scheme_code)
-        if data and 'nav' in data and data['nav']:
-            return float(data['nav'])
-        return None
-    except Exception as e:
-        logging.error(f"Failed to fetch NAV for scheme {scheme_code}: {e}")
-        return None
-
-@st.cache_data(ttl=86400)
-def get_mf_historical_data(scheme_code):
-
-    try:
-        mf = Mftool()
-        data = mf.get_scheme_historical_nav(scheme_code)
-        if not data or 'data' not in data:
-            return pd.DataFrame()
-        df = pd.DataFrame(data['data'])
-        df.rename(columns={'nav': 'NAV', 'date': 'Date'}, inplace=True)
-        df['Date'] = pd.to_datetime(df['Date'], format='%d-%m-%Y')
-        df['NAV'] = pd.to_numeric(df['NAV'])
-        df.set_index('Date', inplace=True)
-        return df
-    except Exception as e:
-        logging.error(f"Failed to fetch historical data for scheme {scheme_code}: {e}")
-        return pd.DataFrame()
-
-
-def update_stock_data(symbol):
-
-    try:
-        ticker_str = symbol.replace('XNSE:', '') + '.NS' if 'XNSE:' in symbol and not symbol.endswith('.NS') else symbol
-        today = datetime.date.today()
-        data = yf.download(ticker_str, start="2020-01-01", end=today + datetime.timedelta(days=1), progress=False, auto_adjust=True)
-
-        if data.empty or 'Close' not in data.columns:
-            logging.warning(f"YFinance returned empty or invalid data for {symbol}.")
-            return False
-
-        data.reset_index(inplace=True)
-        data["ticker"] = symbol
-        data["date"] = data["Date"].dt.strftime("%Y-%m-%d")
-
-        # Write using SQLAlchemy engine when available
-        if DB_ENGINE is not None:
-            data[["ticker", "date", "Close"]].rename(columns={"Close": "close_price"}).to_sql(
-                'price_history',
-                DB_ENGINE,
-                if_exists='append',
-                index=False
-            )
-            return True
-        else:
-            logging.error("DB_ENGINE is not available; cannot write price_history via pandas.to_sql. Provide st.secrets['supabase_db']['sqlalchemy_url'].")
-            return False
-    except Exception as e:
-        logging.error(f"YFinance update_stock_data failed for {symbol}: {e}")
-        return False
-
-
-def get_holdings_df(table_name):
-    """Fetches and calculates current portfolio/trade holdings from the database."""
-    if table_name == "trades":
-        query = f"SELECT p.symbol, p.buy_price, p.buy_date, p.quantity, p.target_price, p.stop_loss_price, h.close_price AS current_price FROM trades p LEFT JOIN price_history h ON p.symbol = h.ticker WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.symbol)"
-    else:
-        query = f"SELECT p.ticker AS symbol, p.buy_price, p.buy_date, p.quantity, p.sector, p.market_cap, h.close_price AS current_price FROM portfolio p LEFT JOIN price_history h ON p.ticker = h.ticker WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.ticker)"
-    try:
-        df = db_query(query)
-        if df.empty:
-            return pd.DataFrame()
-        df['current_price'] = pd.to_numeric(df['current_price'], errors='coerce').fillna(0).round(2)
-        df["return_%"] = ((df["current_price"] - df["buy_price"]) / df["buy_price"] * 100).round(2)
-        df["return_amount"] = ((df["current_price"] - df["buy_price"]) * df["quantity"]).round(2)
-        df["invested_value"] = (df["buy_price"] * df["quantity"]).round(2)
-        df["current_value"] = (df["current_price"] * df["quantity"]).round(2)
-        if table_name == "trades":
-            df["Expected RRR"] = np.where((df["buy_price"] - df["stop_loss_price"]) > 0, (df["target_price"] - df["buy_price"]) / (df["buy_price"] - df["stop_loss_price"]), np.inf).round(2)
-        return df
-    except Exception as e:
-        logging.error(f"Error querying {table_name}: {e}")
-        return pd.DataFrame()
-
-
-def get_realized_df(table_name):
-
-    try:
-        df = db_query(f"SELECT * FROM {table_name}")
-        if df.empty:
-            return pd.DataFrame()
-        df["invested_value"] = (df["buy_price"] * df["quantity"]).round(2)
-        df["realized_value"] = (df["sell_price"] * df["quantity"]).round(2)
-        df["realized_profit_loss"] = (df["realized_value"] - df["invested_value"]).round(2)
-        df["realized_return_pct"] = df["realized_return_pct"].round(2)
-        if table_name == "exits":
-            df["Expected RRR"] = np.where((df["buy_price"] - df["stop_loss_price"]) > 0, (df["target_price"] - df["buy_price"]) / (df["buy_price"] - df["stop_loss_price"]), np.inf).round(2)
-            df["Actual RRR"] = np.where((df["buy_price"] - df["stop_loss_price"]) > 0, (df["sell_price"] - df["buy_price"]) / (df["buy_price"] - df["stop_loss_price"]), np.inf).round(2)
-        return df
-    except Exception as e:
-        logging.error(f"Error querying {table_name}: {e}")
-        return pd.DataFrame()
-
-
-
-def _update_existing_portfolio_info():
-    """Placeholder for PostgreSQL DML update logic."""
-    logging.warning("Function _update_existing_portfolio_info requires explicit session/commit for DML. Skipping execution.")
-    pass
-
-def _categorize_market_cap(market_cap_value):
-
-    if isinstance(market_cap_value, (int, float)):
-        if market_cap_value >= 10000000000:
-            return "Large Cap"
-        elif market_cap_value >= 2000000000:
-            return "Mid Cap"
-        else:
-            return "Small Cap"
-    return "N/A"
-
-
-def _process_recurring_expenses():
-    """Placeholder for recurring expense processing with st.connection."""
-    logging.warning("Function _process_recurring_expenses requires explicit session/commit for DML. Skipping execution.")
-    pass
-
-def _process_mf_sips():
-    """Placeholder for MF SIP processing with st.connection."""
-    logging.warning("Function _process_mf_sips requires explicit session/commit for DML. Skipping execution.")
-    pass
-
-@st.cache_data(ttl=3600)
-def get_benchmark_comparison_data(holdings_df, benchmark_choice):
-    """
-    Calculates portfolio vs benchmark comparison data for Investment page.
-    """
-    if holdings_df.empty:
-        return pd.DataFrame()
-
-    start_date = holdings_df['buy_date'].min() if not holdings_df.empty else datetime.date.today().strftime('%Y-%m-%d')
-    end_date = datetime.date.today().strftime('%Y-%m-%d')
-    date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date))
-
-    benchmark_map = {'Nifty 50': '^NSEI', 'Nifty 100': '^CNX100', 'Nifty 200': '^CNX200', 'Nifty 500': '^CRSLDX'}
-    selected_ticker = benchmark_map.get(benchmark_choice)
-
-    if not selected_ticker:
-        return pd.DataFrame()
-
-
-    all_tickers = holdings_df['symbol'].unique().tolist()
-
-    # Using explicit quote marks for ticker/date since params binding is complex for IN clauses
-    price_data_query_text = f"""SELECT date, ticker, close_price FROM price_history WHERE ticker IN ({','.join([f"'{t}'" for t in all_tickers])}) AND date >= '{start_date}'"""
-
-    # FIX: Using raw string query
-    all_prices = db_query(price_data_query_text)
-    all_prices['date'] = pd.to_datetime(all_prices['date'])
-    price_pivot = all_prices.pivot(index='date', columns='ticker', values='close_price').ffill()
-    price_pivot = price_pivot.reindex(date_range).ffill()
-
-    daily_units = pd.DataFrame(0.0, index=date_range, columns=all_tickers)
-    daily_invested = pd.DataFrame(0.0, index=date_range, columns=all_tickers)
-
-    for _, row in holdings_df.iterrows():
-        buy_date = pd.to_datetime(row['buy_date'])
-        buy_date_index = daily_units.index.searchsorted(buy_date, side='left')
-        daily_units.iloc[buy_date_index:, daily_units.columns.get_loc(row['symbol'])] = row['quantity']
-        daily_invested.iloc[buy_date_index:, daily_invested.columns.get_loc(row['symbol'])] = row['quantity'] * row['buy_price']
-
-    daily_market_value = (price_pivot * daily_units).sum(axis=1)
-    total_daily_invested = daily_invested.sum(axis=1)
-    total_daily_invested_clean = total_daily_invested.replace(0, np.nan).ffill()
-
-
-    portfolio_return = ((daily_market_value - total_daily_invested) / total_daily_invested_clean * 100).rename('Portfolio').round(2)
-    portfolio_return = portfolio_return.dropna() # Ensure we only use dates where we have invested capital
-
-
-    try:
-        benchmark_df = yf.download(selected_ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
-        if benchmark_df.empty or 'Close' not in benchmark_df.columns:
-            logging.error(f"yfinance returned empty or invalid data for benchmark {selected_ticker}")
-            return pd.DataFrame()
-        benchmarks = benchmark_df['Close'].copy()
-        benchmarks.ffill(inplace=True)
-        benchmark_returns = ((benchmarks / benchmarks.iloc[0] - 1) * 100).round(2)
-        benchmark_returns.name = benchmark_choice
-
-        final_df = pd.concat([portfolio_return, benchmark_returns], axis=1).reset_index().rename(columns={'index': 'Date'})
-
-    except Exception as e:
-        logging.error(f"Failed to download benchmark data for {selected_ticker}: {e}", exc_info=True)
-        return pd.DataFrame()
-
-    final_df = final_df.melt(id_vars='Date', var_name='Type', value_name='Return %').dropna()
-    return final_df
-
-
-def calculate_mf_portfolio_return_data(mf_holdings_df):
-    """
-    Calculates the daily cumulative portfolio return for the mutual fund holdings.
-    """
-    if mf_holdings_df.empty:
-        return pd.DataFrame()
-
-    # 1. Fetch all MF transactions
-    # FIX: Using raw string query
-    transactions_df = db_query("SELECT date, scheme_name, yfinance_symbol, type, units, nav FROM mf_transactions")
-    if transactions_df.empty:
-        return pd.DataFrame()
-
-    transactions_df['date'] = pd.to_datetime(transactions_df['date'], format='%Y-%m-%d', errors='coerce')
-    transactions_df = transactions_df.sort_values('date').reset_index(drop=True)
-
-    start_date = transactions_df['date'].min()
-    end_date = datetime.date.today()
-    date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date, freq='D'))
-
-    daily_values = pd.DataFrame(index=date_range)
-    daily_invested = pd.DataFrame(index=date_range)
-
-    unique_schemes = mf_holdings_df['yfinance_symbol'].unique()
-
-    # Pre-fetch all historical NAVs
-    historical_navs = {}
-    for code in unique_schemes:
-        df_nav = get_mf_historical_data(code)
-        if not df_nav.empty:
-            historical_navs[code] = df_nav['NAV'].reindex(date_range).ffill()
-
-    if not historical_navs:
-        return pd.DataFrame()
-
-    # 2. Daily calculation loop (Slow, but necessary for XIRR-style calculation)
-    for date in date_range:
-        current_invested_value = 0
-        current_market_value = 0
-
-        # Calculate daily holdings
-        for scheme_code in unique_schemes:
-            if scheme_code not in historical_navs:
-                continue
-
-            # Filter transactions up to and including this date
-            scheme_tx = transactions_df[
-                (transactions_df['yfinance_symbol'] == scheme_code) &
-                (transactions_df['date'] <= date)
-            ].copy()
-
-            if scheme_tx.empty:
-                continue
-
-            purchases = scheme_tx[scheme_tx['type'] == 'Purchase']
-            redemptions = scheme_tx[scheme_tx['type'] == 'Redemption']
-
-            total_units = purchases['units'].sum() - redemptions['units'].sum()
-
-            if total_units > 0.001:
-                # Calculate effective cost: Sum(Units * NAV) - Sum(Redemption Units * NAV)
-                cost_purchases = (purchases['units'] * purchases['nav']).sum()
-                cost_redemptions = (redemptions['units'] * redemptions['nav']).sum()
-
-                # We track cumulative net cash flow into the fund.
-                net_investment = cost_purchases - cost_redemptions
-
-                current_invested_value += net_investment
-
-                # Current market value
-                if date in historical_navs[scheme_code].index:
-                    current_nav = historical_navs[scheme_code].loc[date]
-                else:
-                    # Fallback to the last available NAV
-                    current_nav = historical_navs[scheme_code].iloc[-1] if not historical_navs[scheme_code].empty else 0
-
-                current_market_value += (total_units * current_nav)
-
-        # Record daily totals
-        daily_values.loc[date, 'Total_Invested'] = current_invested_value
-        daily_values.loc[date, 'Total_Value'] = current_market_value
-
-    # 3. Calculate Cumulative Return %
-    daily_values = daily_values.replace(0, np.nan).ffill().dropna()
-
-    if daily_values.empty:
-        return pd.DataFrame()
-
-    # The true portfolio return is calculated based on cumulative cash flow (Total_Value - Total_Invested) / Total_Invested
-    daily_values['Return %'] = ((daily_values['Total_Value'] - daily_values['Total_Invested']) / daily_values['Total_Invested'] * 100).round(2)
-    daily_values['Type'] = 'MF Portfolio'
-
-    return daily_values.reset_index().rename(columns={'index': 'Date'})
-
-def calculate_portfolio_metrics(holdings_df, realized_df, benchmark_choice):
-    metrics = {
-        'alpha': 'N/A', 'beta': 'N/A', 'max_drawdown': 'N/A'
-    }
-    if holdings_df.empty:
-        return metrics
-    start_date = holdings_df['buy_date'].min() if not holdings_df.empty else datetime.date.today().strftime('%Y-%m-%d')
-    end_date = datetime.date.today().strftime('%Y-%m-%d')
-    all_tickers = holdings_df['symbol'].unique().tolist()
-
-    # Using explicit quote marks for safety in SQL query
-    price_data_query_text = f"""SELECT date, ticker, close_price FROM price_history WHERE ticker IN ({','.join([f"'{t}'" for t in all_tickers])}) AND date >= '{start_date}'"""
-
-    # FIX: Using raw string query
-    all_prices = db_query(price_data_query_text)
-    all_prices['date'] = pd.to_datetime(all_prices['date'])
-    price_pivot = all_prices.pivot(index='date', columns='ticker', values='close_price').ffill()
-    daily_units = pd.DataFrame(0.0, index=price_pivot.index, columns=all_tickers)
-    for _, row in holdings_df.iterrows():
-        buy_date = pd.to_datetime(row['buy_date'])
-        buy_date_index = price_pivot.index.searchsorted(buy_date, side='left')
-        daily_units.iloc[buy_date_index:, daily_units.columns.get_loc(row['symbol'])] = row['quantity']
-    portfolio_value = (price_pivot * daily_units).sum(axis=1).ffill().dropna()
-    if portfolio_value.empty or len(portfolio_value) < 2:
-        return metrics
-    portfolio_returns = portfolio_value.pct_change().dropna()
-    cumulative_returns = (1 + portfolio_returns).cumprod()
-    peak = cumulative_returns.expanding(min_periods=1).max()
-    drawdown = (cumulative_returns / peak) - 1
-    max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0
-    metrics['max_drawdown'] = round(max_drawdown, 2)
-    benchmark_map = {'Nifty 50': '^NSEI', 'Nifty 100': '^CNX100', 'Nifty 200': '^CNX200', 'Nifty 500': '^CRSLDX'}
-    selected_ticker = benchmark_map.get(benchmark_choice)
-    if selected_ticker:
-        try:
-            benchmark_df = yf.download(selected_ticker, start=portfolio_value.index.min(), end=portfolio_value.index.max(), progress=False, auto_adjust=True)
-            if not benchmark_df.empty:
-                benchmark_returns = benchmark_df['Close'].pct_change().dropna().squeeze()
-                combined_returns = pd.DataFrame({
-                    'portfolio': portfolio_returns,
-                    'benchmark': benchmark_returns
-                }).dropna()
-                if len(combined_returns) > 1:
-                    cov_matrix = np.cov(combined_returns['portfolio'], combined_returns['benchmark'])
-                    beta = cov_matrix[0, 1] / cov_matrix[1, 1]
-                    metrics['beta'] = round(beta, 2)
-                    excess_portfolio_return = combined_returns['portfolio'].mean()
-                    excess_benchmark_return = combined_returns['benchmark'].mean()
-                    risk_free_rate = 0
-                    alpha = excess_portfolio_return - (risk_free_rate + beta * (excess_benchmark_return - risk_free_rate))
-                    metrics['alpha'] = round(alpha * 252 * 100, 2)
-        except Exception as e:
-            logging.error(f"Failed to calculate Alpha/Beta for {selected_ticker}: {e}", exc_info=True)
-    return metrics
-
-def calculate_trading_metrics(realized_df):
-
-    metrics = {
-        'win_ratio': 'N/A', 'profit_factor': 'N/A', 'expectancy': 'N/A'
-    }
-    if realized_df.empty:
-        return metrics
-    winning_trades = realized_df[realized_df['realized_profit_loss'] > 0]
-    losing_trades = realized_df[realized_df['realized_profit_loss'] <= 0]
-    total_trades = len(realized_df)
-    if total_trades > 0:
-        win_ratio = (len(winning_trades) / total_trades) * 100
-        metrics['win_ratio'] = round(win_ratio, 2)
-    gross_profit = winning_trades['realized_profit_loss'].sum()
-    gross_loss = abs(losing_trades['realized_profit_loss'].sum())
-    if gross_loss > 0:
-        profit_factor = gross_profit / gross_loss
-        metrics['profit_factor'] = round(profit_factor, 2)
-    if total_trades > 0:
-        avg_win = winning_trades['realized_profit_loss'].mean() if not winning_trades.empty else 0
-        avg_loss = losing_trades['realized_profit_loss'].mean() if not losing_trades.empty else 0
-        expectancy = (win_ratio / 100 * avg_win) + ((1 - win_ratio / 100) * avg_loss)
-        metrics['expectancy'] = round(expectancy, 2)
-    return metrics
-
-def color_return_value(val):
-    """Applies color to a cell based on its numerical value."""
-    if val is None or not isinstance(val, (int, float)):
-        return ''
-    return 'color: green' if val >= 0 else 'color: red'
-
-def set_page(page):
-    """Sets the current page in session state."""
-    st.session_state.page = page
 
 
 
 def get_combined_returns():
-    """
-    Compute combined returns for investments, trades, and mutual funds.
-    Fully compatible with Supabase SQLConnection.
-    """
-    try:
-        live_trades_df = db_query("""
-            SELECT DISTINCT
-                split_part(description, ' of ', 2) AS symbol
-            FROM fund_transactions
-            WHERE type = 'Withdrawal'
-              AND description LIKE 'Purchase % of %'
-        """)
-        live_trade_symbols = set(live_trades_df['symbol'].dropna().tolist()) if not live_trades_df.empty else set()
-    except Exception as e:
-        logging.error(f"Error loading live trade symbols: {e}")
-        live_trade_symbols = set()
+try:
+live_trades_df = db_query("""
+SELECT DISTINCT
+split_part(description, ' of ', 2) AS symbol
+FROM fund_transactions
+WHERE type = 'Withdrawal'
+AND description LIKE 'Purchase % of %'
+""")
+live_trade_symbols = set(live_trades_df['symbol'].dropna().tolist()) if not live_trades_df.empty else set()
+except Exception as e:
+logging.error(f"Error loading live trade symbols: {e}")
+live_trade_symbols = set()
 
-    # INVESTMENT HOLDINGS
-    inv_df = get_holdings_df("portfolio")
-    inv_invested = float(inv_df['invested_value'].sum()) if not inv_df.empty else 0
-    inv_current = float(inv_df['current_value'].sum()) if not inv_df.empty else 0
 
-    # TRADING HOLDINGS
-    trade_df = get_holdings_df("trades")
-    live_trade_df = trade_df[trade_df['symbol'].isin(live_trade_symbols)] if not trade_df.empty else pd.DataFrame()
-    trade_invested = float(live_trade_df['invested_value'].sum()) if not live_trade_df.empty else 0
-    trade_current  = float(live_trade_df['current_value'].sum()) if not live_trade_df.empty else 0
+inv_df = get_holdings_df("portfolio")
+inv_invested = float(inv_df['invested_value'].sum()) if not inv_df.empty else 0
+inv_current = float(inv_df['current_value'].sum()) if not inv_df.empty else 0
 
-    # MUTUAL FUNDS
-    mf_df = get_mf_holdings_df()
-    mf_invested = float(mf_df['Investment'].sum()) if not mf_df.empty else 0
-    mf_current  = float(mf_df['Current Value'].sum()) if not mf_df.empty else 0
 
-    # RETURNS CALCULATION
-    inv_return_amount = round(inv_current - inv_invested, 2)
-    inv_return_pct    = round((inv_return_amount / inv_invested) * 100, 2) if inv_invested > 0 else 0
+trade_df = get_holdings_df("trades")
+live_trade_df = trade_df[trade_df['symbol'].isin(live_trade_symbols)] if not trade_df.empty else pd.DataFrame()
+trade_invested = float(live_trade_df['invested_value'].sum()) if not live_trade_df.empty else 0
+trade_current = float(live_trade_df['current_value'].sum()) if not live_trade_df.empty else 0
 
-    trade_return_amount = round(trade_current - trade_invested, 2)
-    trade_return_pct    = round((trade_return_amount / trade_invested) * 100, 2) if trade_invested > 0 else 0
 
-    mf_return_amount = round(mf_current - mf_invested, 2)
-    mf_return_pct    = round((mf_return_amount / mf_invested) * 100, 2) if mf_invested > 0 else 0
+mf_df = get_mf_holdings_df()
+mf_invested = float(mf_df['Investment'].sum()) if not mf_df.empty else 0
+mf_current = float(mf_df['Current Value'].sum()) if not mf_df.empty else 0
 
-    # TOTALS
-    total_invested = inv_invested + trade_invested + mf_invested
-    total_current  = inv_current + trade_current + mf_current
-    total_return_amount = round(total_current - total_invested, 2)
-    total_return_pct    = round((total_return_amount / total_invested) * 100, 2) if total_invested > 0 else 0
 
-    # REALIZED PROFITS
-    realized_stocks_df = get_realized_df("realized_stocks")
-    realized_exits_df  = get_realized_df("exits")
-    live_exits_df = realized_exits_df[realized_exits_df['symbol'].isin(live_trade_symbols)] if not realized_exits_df.empty else pd.DataFrame()
-    realized_inv   = float(realized_stocks_df['realized_profit_loss'].sum()) if not realized_stocks_df.empty else 0
-    realized_trade = float(live_exits_df['realized_profit_loss'].sum())       if not live_exits_df.empty     else 0
-    realized_mf    = 0
+inv_return_amount = round(inv_current - inv_invested, 2)
+inv_return_pct = round((inv_return_amount / inv_invested) * 100, 2) if inv_invested > 0 else 0
 
-    return {
-        "inv_return_amount": inv_return_amount,
-        "inv_return_pct": inv_return_pct,
-        "trade_return_amount": trade_return_amount,
-        "trade_return_pct": trade_return_pct,
-        "mf_return_amount": mf_return_amount,
-        "mf_return_pct": mf_return_pct,
-        "total_invested_value": total_invested,
-        "total_current_value": total_current,
-        "total_return_amount": total_return_amount,
-        "total_return_pct": total_return_pct,
-        "realized_inv": round(realized_inv, 2),
-        "realized_trade": round(realized_trade, 2),
-        "realized_mf": round(realized_mf, 2)
-    }
+
+trade_return_amount = round(trade_current - trade_invested, 2)
+trade_return_pct = round((trade_return_amount / trade_invested) * 100, 2) if trade_invested > 0 else 0
+
+
+mf_return_amount = round(mf_current - mf_invested, 2)
+mf_return_pct = round((mf_return_amount / mf_invested) * 100, 2) if mf_invested > 0 else 0
+
+
+total_invested = inv_invested + trade_invested + mf_invested
+total_current = inv_current + trade_current + mf_current
+total_return_amount = round(total_current - total_invested, 2)
+total_return_pct = round((total_return_amount / total_invested) * 100, 2) if total_invested > 0 else 0
+
+
+realized_stocks_df = get_realized_df("realized_stocks")
+realized_exits_df = get_realized_df("exits")
+live_exits_df = realized_exits_df[realized_exits_df['symbol'].isin(live_trade_symbols)] if not realized_exits_df.empty else pd.DataFrame()
+realized_inv = float(realized_stocks_df['realized_profit_loss'].sum()) if not realized_stocks_df.empty else 0
+realized_trade = float(live_exits_df['realized_profit_loss'].sum()) if not live_exits_df.empty else 0
+realized_mf = 0
+
+
+return {
+"inv_return_amount": inv_return_amount,
+"inv_return_pct": inv_return_pct,
+"trade_return_amount": trade_return_amount,
+"trade_return_pct": trade_return_pct,
+"mf_return_amount": mf_return_amount,
+"mf_return_pct": mf_return_pct,
+"total_invested_value": total_invested,
+"total_current_value": total_current,
+"total_return_amount": total_return_amount,
+"total_return_pct": total_return_pct,
+"realized_inv": round(realized_inv, 2),
+"realized_trade": round(realized_trade, 2),
+"realized_mf": round(realized_mf, 2)
+}
 
 def get_mf_holdings_df():
     """Calculates current mutual fund holdings from transaction data."""
