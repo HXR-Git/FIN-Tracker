@@ -447,14 +447,7 @@ def get_combined_returns():
             WHERE type = 'Withdrawal'
               AND description LIKE 'Purchase % of %'
         """)
-
-        live_trade_symbols = set()
-        if not live_trades_df.empty:
-            for desc in live_trades_df['description']:
-                parts = desc.split(' of ')
-                if len(parts) > 1:
-                    live_trade_symbols.add(parts[-1].strip())
-
+        live_trade_symbols = set(live_trades_df['symbol'].dropna().tolist()) if not live_trades_df.empty else set()
     except Exception as e:
         # The split_part error is resolved by the above Python logic, but error logging remains
         logging.error(f"Error loading live trade symbols in get_combined_returns: {e}")
@@ -523,37 +516,9 @@ def calculate_portfolio_metrics(holdings_df, benchmark_data, benchmark_choice):
     }
 
 @st.cache_data(ttl=3600)
-def get_benchmark_comparison_data(holdings_df, benchmark_choice):
-    # Stub implementation as fetching live benchmark data is complex
-    return pd.DataFrame()
-
-def calculate_trading_metrics(realized_df):
-    if realized_df.empty:
-        return {'win_ratio': 0.0, 'profit_factor': 0.0, 'expectancy': 0.0}
-
-    winning_trades = realized_df[realized_df['realized_profit_loss'] >= 0]
-    losing_trades = realized_df[realized_df['realized_profit_loss'] < 0]
-
-    total_trades = len(realized_df)
-    win_ratio = (len(winning_trades) / total_trades) * 100 if total_trades > 0 else 0
-
-    total_profit = winning_trades['realized_profit_loss'].sum()
-    total_loss = losing_trades['realized_profit_loss'].sum()
-
-    profit_factor = round(total_profit / abs(total_loss), 2) if total_loss != 0 else np.inf
-
-    expectancy = round(realized_df['realized_profit_loss'].mean(), 2)
-
-    return {
-        'win_ratio': round(win_ratio, 2),
-        'profit_factor': profit_factor,
-        'expectancy': expectancy
-    }
-
-# ------------------ MORE CHART / CALC HELPERS ------------------
-
-@st.cache_data(ttl=3600)
 def get_current_portfolio_allocation():
+
+
     inv_df = get_holdings_df("portfolio")
     inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
 
@@ -831,13 +796,13 @@ def funds_page():
 
 
         if st.button("Save Changes to Transactions"):
-            # WARNING: This DELETE and re-INSERT approach is inefficient.
-            # Using session.execute for DML
-            with get_session() as session:
-                session.execute(_sql_text('DELETE FROM fund_transactions'))
+            # WARNING: This DELETE and re-INSERT approach is highly inefficient for production PostgreSQL.
+            # It should ideally use transactions and UPDATE/DELETE based on IDs.
+            with DB_CONN.session as session:
+                session.execute(text('DELETE FROM fund_transactions'))
+                session.commit()
 
-            # Re-insert the data using df_to_table which manages the connection/session
-            df_to_table(edited_df[['transaction_id', 'date', 'type', 'amount', 'description']], 'fund_transactions')
+            edited_df[['transaction_id', 'date', 'type', 'amount', 'description']].to_sql('fund_transactions', DB_CONN, if_exists='append', index=False)
 
             st.success("Funds transactions updated successfully! Rerunning to update the chart.")
             st.rerun()
@@ -1337,6 +1302,7 @@ def expense_tracker_page():
                         # Using 'budgets' table defined with SERIAL PRIMARY KEY
                         session.execute(_sql_text("INSERT INTO budgets (month_year, category, amount) VALUES (:month, :cat, :amount)"),
                                          params={'month': budget_month_str, 'cat': row['category'], 'amount': round(row['amount'], 2)})
+                session.commit()
 
             st.success("Budgets saved!")
             st.rerun()
@@ -1751,7 +1717,7 @@ def render_asset_page(config):
     full_holdings_df = get_holdings_df(config['asset_table'])
     full_realized_df = get_realized_df(config['realized_table']) # Fetch realized data
 
-    # Identify Live Trade Symbols
+    # Identify Live Trade Symbols (re-run logic from get_combined_returns for filtering)
     live_trade_symbols = set()
     if is_trading_section:
         fund_tx = db_query("SELECT description FROM fund_transactions WHERE type='Withdrawal'")
@@ -1846,7 +1812,7 @@ def render_asset_page(config):
                     "Select Benchmark for Chart Comparison:",
                     options=benchmark_options,
                     key=f"{key_prefix}_benchmark_selector_chart",
-                    index=default_index
+                    index=default_index # FIX applied here: use 'index'
                 )
 
                 st.session_state[f"{key_prefix}_benchmark_choice"] = benchmark_choice
@@ -1903,8 +1869,8 @@ def render_asset_page(config):
                 asset_info = df_to_display.loc[df_to_display["symbol"] == symbol].iloc[0]
                 # FIX APPLIED: Used DB_ENGINE in pd.read_sql
                 history_df = pd.read_sql(
-                    _sql_text("SELECT date, close_price FROM price_history WHERE ticker=:symbol AND date>=:date ORDER BY date ASC"),
-                    DB_ENGINE,
+                    text("SELECT date, close_price FROM price_history WHERE ticker=:symbol AND date>=:date ORDER BY date ASC"),
+                    DB_ENGINE, # <--- **FIX APPLIED HERE: Used DB_ENGINE instead of DB_CONN**
                     params={'symbol': symbol, 'date': asset_info["buy_date"]}
                 )
 
