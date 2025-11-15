@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import datetime
 import logging
@@ -9,6 +8,7 @@ import uuid
 import numpy as np
 from mftool import Mftool
 import time
+import yfinance as yf
 
 from sqlalchemy import create_engine, text as _sql_text
 from sqlalchemy.exc import SQLAlchemyError
@@ -17,24 +17,6 @@ from sqlalchemy.orm import sessionmaker
 # ------------------ CONFIG & LOGGING ------------------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
 
-def login_page():
-    st.title("🔐 Login")
-
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-
-    if st.button("Login"):
-        if username == USERNAME and password == PASSWORD:
-            st.session_state.logged_in = True
-            st.success("Login successful!")
-            st.rerun()
-        else:
-            st.error("Invalid username or password")
-
-# ------------------ NAVIGATION HELPER ------------------
-def set_page(page_name):
-    """Simple function to set the current page in session state."""
-    st.session_state.page = page_name
 # ------------------ END NAVIGATION HELPER ------------------------------------
 
 
@@ -151,6 +133,80 @@ def df_to_table(df: pd.DataFrame, table_name: str, if_exists: str = 'append'):
 # ------------------ APP CONFIG ------------------
 USERNAME = st.secrets.get("auth", {}).get("username", "HXR")
 PASSWORD = st.secrets.get("auth", {}).get("password", "Rossph")
+
+# Removed Viewer Credentials
+
+def login_page():
+    # Inject custom CSS for a modern, centered login page
+    st.markdown("""
+        <style>
+        .stApp {
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        }
+        .stApp > header {
+            display: none; /* Hide Streamlit header */
+        }
+        /* Style for the centered login card */
+        .login-card {
+            background-color: #1f2937; /* Darker slate gray */
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+            max-width: 400px;
+            margin: 10vh auto 0; /* Center vertically, push down slightly */
+            border: 1px solid #374151;
+        }
+        .stTextInput > label, .stToggle > label {
+            color: #e5e7eb; /* Light text color for labels */
+        }
+        .stTextInput div > div > input {
+            background-color: #374151; /* Input background */
+            color: #f3f4f6; /* Input text color */
+            border: 1px solid #4b5563;
+        }
+        .stButton button {
+            width: 100%;
+            background-color: #10b981; /* Emerald green accent color */
+            color: white;
+            font-weight: bold;
+            border-radius: 8px;
+            transition: background-color 0.3s;
+        }
+        .stButton button:hover {
+            background-color: #059669;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # Use columns to contain the content in the center
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col2:
+        with st.container(border=False):
+            st.markdown('<div class="login-card">', unsafe_allow_html=True)
+            st.markdown('<h2 style="color: #10b981; text-align: center; margin-bottom: 20px;">💰 Finance Dashboard Login</h2>', unsafe_allow_html=True)
+
+            # Input fields
+            username = st.text_input("Username", placeholder="Owner Username")
+            password = st.text_input("Password", type="password", placeholder="Password")
+
+            if st.button("Login"):
+                if username == USERNAME and password == PASSWORD:
+                    st.session_state.logged_in = True
+                    st.success(f"Login successful!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+
+            st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ------------------ NAVIGATION HELPER ------------------
+def set_page(page_name):
+    """Simple function to set the current page in session state."""
+    st.session_state.page = page_name
+# ------------------ END NAVIGATION HELPER ------------------------------------
+
 
 # ------------------ DB SCHEMA INIT ------------------
 def initialize_database():
@@ -485,14 +541,14 @@ def get_combined_returns():
     total_invested = inv_invested + trade_invested + mf_invested
     total_current  = inv_current + trade_current + mf_current
     total_return_amount = round(total_current - total_invested, 2)
-    total_return_pct     = round((total_return_amount / total_invested) * 100, 2) if total_invested > 0 else 0
+    total_return_pct      = round((total_return_amount / total_invested) * 100, 2) if total_invested > 0 else 0
 
     realized_stocks_df = get_realized_df("realized_stocks")
     realized_exits_df  = get_realized_df("exits")
     # Filter realized exits based on live trade symbols
     live_exits_df = realized_exits_df[realized_exits_df['symbol'].isin(live_trade_symbols)] if not realized_exits_df.empty else pd.DataFrame()
-    realized_inv     = float(realized_stocks_df['realized_profit_loss'].sum()) if not realized_stocks_df.empty else 0
-    realized_trade = float(live_exits_df['realized_profit_loss'].sum())         if not live_exits_df.empty      else 0
+    realized_inv       = float(realized_stocks_df['realized_profit_loss'].sum()) if not realized_stocks_df.empty else 0
+    realized_trade = float(live_exits_df['realized_profit_loss'].sum())           if not live_exits_df.empty       else 0
     realized_mf    = 0
 
     return {
@@ -514,18 +570,40 @@ def get_combined_returns():
 # ------------------ PORTFOLIO VS BENCHMARK CHART FUNCTIONS (FIXED) ------------------
 
 @st.cache_data(ttl=3600)
-def get_benchmark_data(ticker, start_date):
-    """Fetches historical close price data for a benchmark ticker from YFinance."""
-    today = datetime.date.today()
+def get_benchmark_data(benchmark_choice, start_date):
+    """Fetch benchmark data using yfinance for robustness."""
+
+    # Map the user's choice to the correct yfinance ticker
+    ticker_map = {
+        "Nifty 50": "^NSEI",
+        "Nifty 100": "^CNX100",
+        "Nifty 200": "^CNX200",
+        "Nifty 500": "^CNX500",
+    }
+
+    ticker = ticker_map.get(benchmark_choice, "^NSEI")
+
+    # Use yfinance.download for reliable data fetching
     try:
-        data = yf.download(ticker, start=start_date, end=today + datetime.timedelta(days=1), progress=False, auto_adjust=True)
+        data = yf.download(
+            ticker,
+            start=start_date,
+            end=datetime.date.today() + datetime.timedelta(days=1),
+            progress=False,
+            auto_adjust=True
+        )
+
         if data.empty or 'Close' not in data.columns:
-            logging.warning(f"YFinance returned empty data for benchmark {ticker}.")
+            logging.error(f"yfinance returned empty or invalid data for benchmark {ticker}.")
             return pd.DataFrame()
+
+        # Keep only the 'Close' column and ensure it is named 'Close'
         return data['Close'].rename('Close').to_frame()
+
     except Exception as e:
-        logging.error(f"Failed to fetch benchmark data for {ticker}: {e}")
+        logging.error(f"Failed to fetch benchmark data for {ticker} using yfinance: {e}")
         return pd.DataFrame()
+
 
 def calculate_portfolio_metrics(holdings_df, portfolio_data, benchmark_choice):
     # This function relies on the benchmark comparison logic but is stubbed/simplified
@@ -594,7 +672,7 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     portfolio_prices_df.index = pd.to_datetime(portfolio_prices_df.index)
 
     # Benchmark prices from YF (start_date is handled correctly by YF if passed as datetime)
-    benchmark_data = get_benchmark_data(benchmark_ticker, start_date)
+    benchmark_data = get_benchmark_data(benchmark_choice, start_date)
     if benchmark_data.empty:
         return pd.DataFrame()
 
@@ -837,12 +915,12 @@ def home_page():
 
     col1, col2 = st.columns(2)
     with col1:
-        st.button("📈 Investment", width='stretch', on_click=set_page, args=("investment",))
-        st.button("💰 Funds", width='stretch', on_click=set_page, args=("funds",))
+        st.button("📈 Investment", use_container_width=True, on_click=set_page, args=("investment",))
+        st.button("💰 Funds", use_container_width=True, on_click=set_page, args=("funds",))
     with col2:
-        st.button("📊 Trading", width='stretch', on_click=set_page, args=("trading",))
-        st.button("💸 Expense Tracker", width='stretch', on_click=set_page, args=("expense_tracker",))
-    st.button("📚 Mutual Fund", width='stretch', on_click=set_page, args=("mutual_fund",))
+        st.button("📊 Trading", use_container_width=True, on_click=set_page, args=("trading",))
+        st.button("💸 Expense Tracker", use_container_width=True, on_click=set_page, args=("expense_tracker",))
+    st.button("📚 Mutual Fund", use_container_width=True, on_click=set_page, args=("mutual_fund",))
 
     col_refresh, _ = st.columns([0.2, 0.8])
     with col_refresh:
@@ -936,13 +1014,13 @@ def funds_page():
             height=400
         ).interactive()
 
-        st.altair_chart(chart, width='stretch')
+        st.altair_chart(chart, use_container_width=True)
 
         st.subheader("Transaction History")
 
         edited_df = st.data_editor(
             fund_df[['transaction_id', 'date', 'type', 'amount', 'description', 'cumulative_balance']],
-            width='stretch',
+            use_container_width=True,
             hide_index=True,
             num_rows="dynamic",
             column_config={
@@ -1042,15 +1120,15 @@ def expense_tracker_page():
 
                     # Use session for execution via db_execute helper
                     db_execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description) VALUES (:id, :date, :type, :amount, :cat, :pm, :desc)",
-                               params={
-                                   'id': str(uuid.uuid4()),
-                                   'date': trans_date.strftime("%Y-%m-%d"),
-                                   'type': trans_type,
-                                   'amount': round(trans_amount, 2),
-                                   'cat': final_cat,
-                                   'pm': trans_pm,
-                                   'desc': trans_desc
-                               }
+                                 params={
+                                    'id': str(uuid.uuid4()),
+                                    'date': trans_date.strftime("%Y-%m-%d"),
+                                    'type': trans_type,
+                                    'amount': round(trans_amount, 2),
+                                    'cat': final_cat,
+                                    'pm': trans_pm,
+                                    'desc': trans_desc
+                                }
                     )
                     st.success(f"{trans_type} added! Category: **{final_cat}**")
 
@@ -1107,7 +1185,7 @@ def expense_tracker_page():
 
         remaining_help_text = "\n".join([f"{row['payment_method']}: ₹{row['Remaining']:,.2f}" for _, row in remaining_breakdown_df.iterrows()])
         if not remaining_help_text:
-             remaining_help_text = "All flows balanced, or no categorized transactions."
+              remaining_help_text = "All flows balanced, or no categorized transactions."
 
 
         col1, col2, col3, col4 = st.columns(4)
@@ -1115,12 +1193,12 @@ def expense_tracker_page():
 
 
         col2.metric("Total Spent this Month (Excl. Transfers)", f"₹{total_spent:,.2f}",
-                     help=f"**Spent Breakdown (This Month, Excl. Transfers):**\n{spent_help_text}")
+                      help=f"**Spent Breakdown (This Month, Excl. Transfers):**\n{spent_help_text}")
 
 
         col3.metric("Net Flow (Excl. Transfers)", f"₹{net_flow:,.2f}",
-                     delta_color="inverse" if net_flow >= 0 else "normal",
-                     help=f"**Net Remaining Breakdown (Includes all time funds movements):**\n{remaining_help_text}")
+                      delta_color="inverse" if net_flow >= 0 else "normal",
+                      help=f"**Net Remaining Breakdown (Includes all time funds movements):**\n{remaining_help_text}")
 
 
         # --- NEW METRIC: Available Amount (Budget - Spent) ---
@@ -1141,10 +1219,10 @@ def expense_tracker_page():
         ])
 
         if not available_help_text:
-             available_help_text = "No budgets set for this month."
+              available_help_text = "No budgets set for this month."
 
         col4.metric("Available Amount (Budget)", f"₹{total_available:,.2f}",
-                     help=f"**Available Amount Breakdown (Budget - Spent this month):**\n{available_help_text}")
+                      help=f"**Available Amount Breakdown (Budget - Spent this month):**\n{available_help_text}")
 
         # --- END NEW METRIC ---
 
@@ -1182,7 +1260,7 @@ def expense_tracker_page():
                     alt.value('#4c78a8')
                 )
             ).properties(height=300)
-            st.altair_chart(bar_chart, width='stretch')
+            st.altair_chart(bar_chart, use_container_width=True)
 
         else:
             st.info("No expense data for the last 7 days (excluding transfers).")
@@ -1220,7 +1298,7 @@ def expense_tracker_page():
                 color=alt.value("black")
             ).transform_filter(alt.datum.amount > total_spent_for_chart * 0.05)
 
-            st.altair_chart(pie + text, width='stretch')
+            st.altair_chart(pie + text, use_container_width=True)
         else:
             st.info("No expenses logged for this month to plot (excluding transfers).")
         st.divider()
@@ -1236,7 +1314,7 @@ def expense_tracker_page():
                     y=alt.Y('amount', title='Total Spent (₹)'),
                     tooltip=[alt.Tooltip('month', title='Month'), alt.Tooltip('amount', format='.2f', title='Amount')]
                 ).properties(height=350)
-                st.altair_chart(bar_chart, width='stretch')
+                st.altair_chart(bar_chart, use_container_width=True)
             else:
                 st.info("No expenses logged for this month.")
         with col2:
@@ -1250,7 +1328,7 @@ def expense_tracker_page():
                     color=alt.Color('type', title='Type', scale=alt.Scale(domain=['Income', 'Expense'], range=['#2ca02c', '#d62728'])),
                     tooltip=['month', alt.Tooltip('type', title='Type'), alt.Tooltip('amount', format='.2f', title='Amount')]
                 ).properties(height=300)
-                st.altair_chart(bar_chart, width='stretch')
+                st.altair_chart(bar_chart, use_container_width=True)
             else:
                 st.info("No income or expenses to compare.")
 
@@ -1283,10 +1361,10 @@ def expense_tracker_page():
 
                     # Use db_execute for both DML operations
                     db_execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (:id1, :date, 'Expense', :amount, 'Transfer Out', :source, :desc1, :group_id)",
-                               params={'id1': str(uuid.uuid4()), 'date': transfer_date.strftime("%Y-%m-%d"), 'amount': round(transfer_amount, 2), 'source': source_account, 'desc1': f"Transfer to {dest_account}" + (f" ({transfer_desc})" if transfer_desc else ""), 'group_id': group_id}
+                                 params={'id1': str(uuid.uuid4()), 'date': transfer_date.strftime("%Y-%m-%d"), 'amount': round(transfer_amount, 2), 'source': source_account, 'desc1': f"Transfer to {dest_account}" + (f" ({transfer_desc})" if transfer_desc else ""), 'group_id': group_id}
                     )
                     db_execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (:id2, :date, 'Income', :amount, 'Transfer In', :dest, :desc2, :group_id)",
-                               params={'id2': str(uuid.uuid4()), 'date': transfer_date.strftime("%Y-%m-%d"), 'amount': round(transfer_amount, 2), 'dest': dest_account, 'desc2': f"Transfer from {source_account}" + (f" ({transfer_desc})" if transfer_desc else ""), 'group_id': group_id}
+                                 params={'id2': str(uuid.uuid4()), 'date': transfer_date.strftime("%Y-%m-%d"), 'amount': round(transfer_amount, 2), 'dest': dest_account, 'desc2': f"Transfer from {source_account}" + (f" ({transfer_desc})" if transfer_desc else ""), 'group_id': group_id}
                     )
 
                     st.success(f"Transfer of ₹{transfer_amount:,.2f} recorded from **{source_account}** to **{dest_account}**.")
@@ -1323,7 +1401,7 @@ def expense_tracker_page():
             transfer_df.rename(columns={'amount': 'Amount', 'date': 'Date', 'from_account': 'From Account', 'to_account': 'To Account', 'description': 'Description'}, inplace=True)
             transfer_df['Amount'] = transfer_df['Amount'].apply(lambda x: f"₹{x:,.2f}")
 
-            st.dataframe(transfer_df.drop(columns=['transfer_group_id']), hide_index=True, width='stretch')
+            st.dataframe(transfer_df.drop(columns=['transfer_group_id']), hide_index=True, use_container_width=True)
         else:
             st.info("No transfers recorded yet.")
 
@@ -1342,7 +1420,7 @@ def expense_tracker_page():
 
             df_for_editing['date'] = pd.to_datetime(df_for_editing['date'], format='%Y-%m-%d', errors='coerce').dt.date
 
-            edited_transfer_df = st.data_editor(df_for_editing, width='stretch', hide_index=True, num_rows="dynamic",
+            edited_transfer_df = st.data_editor(df_for_editing, use_container_width=True, hide_index=True, num_rows="dynamic",
                 column_config={
                     "expense_id": st.column_config.TextColumn("ID", disabled=True),
                     "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
@@ -1402,13 +1480,13 @@ def expense_tracker_page():
             editable_categories = sorted(list(set(all_expenses_df['category'].unique().tolist() + CATEGORIES)))
 
             # The st.data_editor will display the data in this sorted order
-            edited_df = st.data_editor(all_expenses_df, width='stretch', hide_index=True, num_rows="dynamic",
+            edited_df = st.data_editor(all_expenses_df, use_container_width=True, hide_index=True, num_rows="dynamic",
                                          column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
-                                                         "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                         "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
-                                                         # Use a selectbox for categories allowing user input of new ones
-                                                         "category": st.column_config.SelectboxColumn("Category", options=editable_categories, required=True),
-                                                         "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS], required=True)})
+                                                        "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                        "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
+                                                        # Use a selectbox for categories allowing user input of new ones
+                                                        "category": st.column_config.SelectboxColumn("Category", options=editable_categories, required=True),
+                                                        "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS], required=True)})
 
             # Manually convert 'date' column back to string for SQL insertion
             edited_df['date'] = edited_df['date'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, datetime.date) else x)
@@ -1447,7 +1525,7 @@ def expense_tracker_page():
         budget_df = pd.DataFrame({'category': expense_categories_for_budget, 'amount': [0.0] * len(expense_categories_for_budget)})
         if not existing_budgets.empty:
             budget_df = budget_df.set_index('category').combine_first(existing_budgets).reset_index()
-        edited_budgets = st.data_editor(budget_df, num_rows="dynamic", width='stretch', column_config={
+        edited_budgets = st.data_editor(budget_df, num_rows="dynamic", use_container_width=True, column_config={
             "category": st.column_config.TextColumn(label="Category", disabled=True),
             "amount": st.column_config.NumberColumn(label="Amount", min_value=0.0)
         })
@@ -1469,7 +1547,7 @@ def expense_tracker_page():
         st.header("Manage Recurring Expenses")
         st.info("Set up expenses that occur every month (e.g., rent, subscriptions). They will be logged automatically.")
         recurring_df = db_query("SELECT recurring_id, description, amount, category, payment_method, day_of_month FROM recurring_expenses")
-        edited_recurring = st.data_editor(recurring_df, num_rows="dynamic", width='stretch', column_config={
+        edited_recurring = st.data_editor(recurring_df, num_rows="dynamic", use_container_width=True, column_config={
             "recurring_id": st.column_config.NumberColumn(disabled=True),
             "category": st.column_config.TextColumn("Category", required=True),
             "payment_method": st.column_config.SelectboxColumn("Payment Method", options=PAYMENT_ACCOUNTS, required=True),
@@ -1502,32 +1580,54 @@ def mutual_fund_page():
 
     if table_view == "Holdings":
         st.sidebar.header("Add Transaction")
+
+        # --- MF Search/Selection Block (Fixed) ---
         if f"{key_prefix}_all_schemes" not in st.session_state:
             st.session_state[f"{key_prefix}_all_schemes"] = fetch_mf_schemes()
             st.session_state[f"{key_prefix}_search_results"] = []
+            st.session_state[f"{key_prefix}_search_term_input"] = ""
+
         with st.sidebar.form(f"{key_prefix}_search_form"):
-            company_name = st.text_input("Search Fund Name", value=st.session_state.get(f"{key_prefix}_search_term_input", ""), key=f"{key_prefix}_search_term_input")
+            company_name = st.text_input("Search Fund Name", value=st.session_state.get(f"{key_prefix}_search_term_input", ""), key=f"{key_prefix}_search_term_input_live")
             search_button = st.form_submit_button("Search")
-        if search_button:
-            if company_name:
-                filtered_schemes = {name: code for name, code in st.session_state[f"{key_prefix}_all_schemes"].items() if company_name.lower() in name.lower()}
-                st.session_state[f"{key_prefix}_search_results"] = [f"{name} ({code})" for name, code in filtered_schemes.items()]
-            else:
-                st.session_state[f"{key_prefix}_search_results"] = []
-            st.session_state[f"{key_prefix}_selected_scheme_code"] = None
+
+        if search_button and company_name:
+            filtered_schemes = {name: code for name, code in st.session_state[f"{key_prefix}_all_schemes"].items() if company_name.lower() in name.lower()}
+            st.session_state[f"{key_prefix}_search_results"] = [f"{name} ({code})" for name, code in filtered_schemes.items()]
+            st.session_state[f"{key_prefix}_selected_result"] = None
+            st.session_state[f"{key_prefix}_search_term_input"] = company_name # Keep search term visible
             st.rerun()
-        if st.session_state.get(f"{key_prefix}_selected_result"):
+
+        # Display selection box only if results exist
+        selected_result = None
+        if st.session_state.get(f"{key_prefix}_search_results"):
+            results = st.session_state[f"{key_prefix}_search_results"]
+            selected_result = st.sidebar.selectbox(
+                "Select Scheme",
+                options=[None] + results,
+                index=0,
+                key=f"{key_prefix}_select_result",
+                format_func=lambda x: "Select a scheme..." if x is None else x
+            )
+
+            # Store selected result in session state for later use
+            st.session_state[f"{key_prefix}_selected_result"] = selected_result
+
+
+        # Display details form if a result is selected
+        if st.session_state.get(f"{key_prefix}_selected_result") and st.session_state[f"{key_prefix}_selected_result"] is not None:
             selected_result = st.session_state[f"{key_prefix}_selected_result"]
             selected_name = selected_result.split(" (")[0]
             selected_code = selected_result.split(" (")[-1].replace(")", "")
-            st.session_state[f"{key_prefix}_selected_scheme_code"] = selected_code
+
             with st.sidebar.form(f"{key_prefix}_add_details_form"):
-                st.write(f"Selected: **{selected_name}**")
+                st.subheader(f"Transaction for: {selected_name}")
                 mf_date = st.date_input("Date", max_value=datetime.date.today())
                 mf_type = st.selectbox("Type", ["Purchase", "Redemption"])
                 mf_units = st.number_input("Units", min_value=0.001, format="%.4f")
                 mf_nav = st.number_input("NAV (Net Asset Value)", min_value=0.01, format="%.4f")
                 mf_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", value=0.0)
+
                 if st.form_submit_button("Add Transaction"):
                     if not (mf_units and mf_units > 0 and mf_nav and mf_nav > 0):
                         st.warning("Please fill all fields.")
@@ -1541,14 +1641,17 @@ def mutual_fund_page():
 
                         # Use db_execute for the transaction insertion
                         db_execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (:id, :date, :scheme, :symbol, :type, :units, :nav)",
-                                   params={'id': str(uuid.uuid4()), 'date': mf_date.strftime('%Y-%m-%d'), 'scheme': selected_name, 'symbol': selected_code, 'type': mf_type, 'units': round(mf_units, 4), 'nav': round(mf_nav, 4)}
+                                     params={'id': str(uuid.uuid4()), 'date': mf_date.strftime('%Y-%m-%d'), 'scheme': selected_name, 'symbol': selected_code, 'type': mf_type, 'units': round(mf_units, 4), 'nav': round(mf_nav, 4)}
                         )
 
                         st.success(f"{mf_type} of {selected_name} logged!")
+                        # Clear search state upon successful submission
                         st.session_state[f"{key_prefix}_selected_result"] = None
                         st.session_state[f"{key_prefix}_search_results"] = []
                         st.session_state[f"{key_prefix}_search_term_input"] = ""
                         st.rerun()
+        # --- END MF Search/Selection Block ---
+
         st.divider()
 
         holdings_df = get_mf_holdings_df()
@@ -1567,7 +1670,7 @@ def mutual_fund_page():
                     "Avg NAV": "₹{:.4f}", "Latest NAV": "₹{:.4f}", "Investment": "₹{:.2f}",
                     "Current Value": "₹{:.2f}", "P&L": "₹{:.2f}", "P&L %": "{:.2f}%"
                 })
-                st.dataframe(styled_df, width='stretch', hide_index=True)
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
             st.header("Return Chart (Individual Schemes)")
 
@@ -1595,7 +1698,7 @@ def mutual_fund_page():
                     zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
 
                     # Layer and display the charts (Only line_chart + zero_line)
-                    st.altair_chart(line_chart + zero_line, width='stretch')
+                    st.altair_chart(line_chart + zero_line, use_container_width=True)
                 else:
                     st.info("Not enough data to generate the chart for the selected schemes.")
             else:
@@ -1607,15 +1710,15 @@ def mutual_fund_page():
         if not transactions_df.empty:
             transactions_df['date'] = pd.to_datetime(transactions_df['date'], format='%Y-%m-%d', errors='coerce')
             st.subheader("Edit Mutual Fund Transactions")
-            edited_df = st.data_editor(transactions_df, width='stretch', hide_index=True, num_rows="dynamic",
+            edited_df = st.data_editor(transactions_df, use_container_width=True, hide_index=True, num_rows="dynamic",
                                          column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
-                                                         "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                         "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
-                                                         "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
-                                                         "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
-                                                         "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
-                                                         "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
-                                                            })
+                                                        "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+                                                        "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
+                                                        "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
+                                                        "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
+                                                        "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
+                                                        "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
+                                                             })
 
             if st.button("Save Mutual Fund Changes"):
                 # DML update needs to be session based.
@@ -1686,13 +1789,16 @@ def render_asset_page(config):
         )
         st.divider()
 
+    # Disable sidebar actions as there is no viewer anymore
+    sidebar_disabled = False
+
     # --- Sidebar forms for Add/Sell remain the same ---
 
     st.sidebar.header(f"Add {config['asset_name']}")
     with st.sidebar.form(f"{key_prefix}_add_form"):
-        company_name = st.text_input(f"{config['asset_name']} Name", value=st.session_state.get(f"{key_prefix}_add_company_name_input", ""), key=f"{key_prefix}_add_company_name_input")
-        search_button = st.form_submit_button("Search")
-    if search_button and company_name:
+        company_name = st.text_input(f"{config['asset_name']} Name", value=st.session_state.get(f"{key_prefix}_add_company_name_input", ""), key=f"{key_prefix}_add_company_name_input", disabled=sidebar_disabled)
+        search_button = st.form_submit_button("Search", disabled=sidebar_disabled)
+    if search_button and company_name and not sidebar_disabled:
         st.session_state[f"{key_prefix}_search_results"] = search_for_ticker(company_name)
         st.session_state[f"{key_prefix}_selected_symbol"] = None
         st.rerun()
@@ -1704,12 +1810,13 @@ def render_asset_page(config):
             options=[None] + symbols_only,
             index=0,
             key=f"{key_prefix}_select_symbol",
-            format_func=lambda x: "Select a stock..." if x is None else x
+            format_func=lambda x: "Select a stock..." if x is None else x,
+            disabled=sidebar_disabled
         )
         if selected_symbol_from_search and selected_symbol_from_search != st.session_state.get(f"{key_prefix}_selected_symbol"):
             st.session_state[f"{key_prefix}_selected_symbol"] = selected_symbol_from_search
             st.rerun()
-    if st.session_state.get(f"{key_prefix}_selected_symbol"):
+    if st.session_state.get(f"{key_prefix}_selected_symbol") and not sidebar_disabled:
         with st.sidebar.form(f"{key_prefix}_add_details_form"):
             symbol = st.session_state[f"{key_prefix}_selected_symbol"]
             st.write(f"Selected: **{symbol}**")
@@ -1754,19 +1861,19 @@ def render_asset_page(config):
 
                             if is_trading_section:
                                 session.execute(_sql_text(f"UPDATE {config['asset_table']} SET buy_price=:price, quantity=:qty, target_price=:target, stop_loss_price=:stop WHERE {config['asset_col']}=:symbol"),
-                                                 params={'price': round(new_avg_price, 2), 'qty': new_quantity, 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2), 'symbol': symbol})
+                                                params={'price': round(new_avg_price, 2), 'qty': new_quantity, 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2), 'symbol': symbol})
                             else:
                                 session.execute(_sql_text(f"UPDATE {config['asset_table']} SET buy_price=:price, quantity=:qty, sector=:sector, market_cap=:mc WHERE {config['asset_col']}=:symbol"),
-                                                 params={'price': round(new_avg_price, 2), 'qty': new_quantity, 'sector': sector, 'mc': _categorize_market_cap(market_cap), 'symbol': symbol})
+                                                params={'price': round(new_avg_price, 2), 'qty': new_quantity, 'sector': sector, 'mc': _categorize_market_cap(market_cap), 'symbol': symbol})
 
                             st.success(f"Updated {symbol}. New quantity: {new_quantity}, New avg. price: {currency}{new_avg_price:,.2f}")
                         else:
                             if is_trading_section:
                                 session.execute(_sql_text(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, target_price, stop_loss_price) VALUES (:symbol, :price, :date, :qty, :target, :stop)"),
-                                                 params={'symbol': symbol, 'price': round(buy_price, 2), 'date': buy_date.strftime("%Y-%m-%d"), 'qty': quantity, 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2)})
+                                                params={'symbol': symbol, 'price': round(buy_price, 2), 'date': buy_date.strftime("%Y-%m-%d"), 'qty': quantity, 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2)})
                             else:
                                 session.execute(_sql_text(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, sector, market_cap) VALUES (:symbol, :price, :date, :qty, :sector, :mc)"),
-                                                 params={'symbol': symbol, 'price': round(buy_price, 2), 'date': buy_date.strftime("%Y-%m-%d"), 'qty': quantity, 'sector': sector, 'mc': _categorize_market_cap(market_cap)})
+                                                params={'symbol': symbol, 'price': round(buy_price, 2), 'date': buy_date.strftime("%Y-%m-%d"), 'qty': quantity, 'sector': sector, 'mc': _categorize_market_cap(market_cap)})
 
                             st.success(f"{symbol} added successfully!")
 
@@ -1789,7 +1896,8 @@ def render_asset_page(config):
             options=[None] + all_symbols,
             index=0,
             key=f"{key_prefix}_sell_symbol_selector",
-            format_func=lambda x: "Select a stock..." if x is None else x
+            format_func=lambda x: "Select a stock..." if x is None else x,
+            disabled=sidebar_disabled
         )
         available_qty = 1
         if selected_option:
@@ -1803,13 +1911,13 @@ def render_asset_page(config):
         else:
             symbol_to_sell = None
         with st.sidebar.form(f"{key_prefix}_sell_form"):
-            is_disabled = not symbol_to_sell
+            is_disabled = not symbol_to_sell or sidebar_disabled
             sell_qty = st.number_input("Quantity to Sell", min_value=1, max_value=available_qty, step=1, key=f"{key_prefix}_sell_qty", disabled=is_disabled)
             sell_price = st.number_input("Sell Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_sell_price", disabled=is_disabled)
             sell_date = st.date_input("Sell Date", max_value=datetime.date.today(), key=f"{key_prefix}_sell_date", disabled=is_disabled)
             sell_transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_sell_transaction_fee", disabled=is_disabled, value=0.0)
-            sell_button = st.form_submit_button(f"Sell {config['asset_name']}")
-            if sell_button:
+            sell_button = st.form_submit_button(f"Sell {config['asset_name']}", disabled=is_disabled)
+            if sell_button and not sidebar_disabled:
                 is_paper_trading_on_submit = st.session_state.get(f"trade_paper_trading_state", False) if is_trading_section else False
 
                 if not symbol_to_sell:
@@ -1842,10 +1950,10 @@ def render_asset_page(config):
                     with get_session() as session:
                         if is_trading_section:
                             session.execute(_sql_text(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct, target_price, stop_loss_price) VALUES (:id, :symbol, :bprice, :bdate, :qty, :sprice, :sdate, :ret, :target, :stop)"),
-                                             params={'id': transaction_id, 'symbol': symbol_to_sell, 'bprice': round(buy_price, 2), 'bdate': buy_date, 'qty': sell_qty, 'sprice': round(sell_price, 2), 'sdate': sell_date.strftime("%Y-%m-%d"), 'ret': round(realized_return, 2), 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2)})
+                                            params={'id': transaction_id, 'symbol': symbol_to_sell, 'bprice': round(buy_price, 2), 'bdate': buy_date, 'qty': sell_qty, 'sprice': round(sell_price, 2), 'sdate': sell_date.strftime("%Y-%m-%d"), 'ret': round(realized_return, 2), 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2)})
                         else:
                             session.execute(_sql_text(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct) VALUES (:id, :symbol, :bprice, :bdate, :qty, :sprice, :sdate, :ret)"),
-                                             params={'id': transaction_id, 'symbol': symbol_to_sell, 'bprice': round(buy_price, 2), 'bdate': buy_date, 'qty': sell_qty, 'sprice': round(sell_price, 2), 'sdate': sell_date.strftime("%Y-%m-%d"), 'ret': round(realized_return, 2)})
+                                            params={'id': transaction_id, 'symbol': symbol_to_sell, 'bprice': round(buy_price, 2), 'bdate': buy_date, 'qty': sell_qty, 'sprice': round(sell_price, 2), 'sdate': sell_date.strftime("%Y-%m-%d"), 'ret': round(realized_return, 2)})
 
                         # --- FUND UPDATE LOGIC (SELL) ---
                         if not is_trading_section or (is_trading_section and not is_paper_trading_on_submit):
@@ -1918,115 +2026,51 @@ def render_asset_page(config):
                 # --- Alpha/Beta metrics display (Investment section only) ---
                 benchmark_options = ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500']
 
-                # Default to 'Nifty 50' if not set
-                if f"{key_prefix}_benchmark_choice" not in st.session_state:
-                    st.session_state[f"{key_prefix}_benchmark_choice"] = 'Nifty 50'
+                # Use a default choice for the initial data fetch
+                initial_benchmark = st.session_state.get(f"{key_prefix}_benchmark_choice", 'Nifty 50')
 
-                # Fetch comparison data first to calculate metrics accurately
-                comparison_df = get_benchmark_comparison_data(df_to_display, st.session_state[f"{key_prefix}_benchmark_choice"])
+                # Fetch initial comparison data once.
+                initial_comparison_df = get_benchmark_comparison_data(df_to_display, initial_benchmark)
 
-                # The portfolio_data needs to be passed to calculate_portfolio_metrics
-                metrics = calculate_portfolio_metrics(df_to_display, comparison_df, st.session_state[f"{key_prefix}_benchmark_choice"])
-                col_alpha, col_beta, col_drawdown = st.columns(3)
-                with col_alpha: st.metric("Alpha", f"{metrics['alpha']}%")
-                with col_beta: st.metric("Beta", f"{metrics['beta']}")
-                with col_drawdown: st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
+                # 1. Display Metrics (Conditional)
+                if not initial_comparison_df.empty:
+                    metrics = calculate_portfolio_metrics(df_to_display, initial_comparison_df, initial_benchmark)
+                    col_alpha, col_beta, col_drawdown = st.columns(3)
+                    with col_alpha: st.metric("Alpha", f"{metrics['alpha']}%")
+                    with col_beta: st.metric("Beta", f"{metrics['beta']}")
+                    with col_drawdown: st.metric("Max Drawdown", f"{metrics['max_drawdown']}%")
 
             st.divider()
 
-            # --- START: DETAILED HOLDINGS (MOVED UP FOR INVESTMENT SECTION) ---
-            if not is_trading_section:
-                with st.expander(f"View Detailed {view_options[0]}"):
-                    column_rename = {
-                        'symbol': 'Stock Name', 'ticker': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date', 'quantity': 'Quantity',
-                        'sector': 'Sector', 'market_cap': 'Market Cap', 'current_price': 'Current Price', 'return_%': 'Return (%)',
-                        'return_amount': 'Return (Amount)', 'invested_value': 'Investment Value', 'current_value': 'Current Value',
-                        'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
-                    }
-                    df_to_style = df_to_display.rename(columns=column_rename)
+            # --- START: DETAILED HOLDINGS EXPANDER (COMMON BLOCK) ---
+            with st.expander(f"View Detailed {view_options[0]}"):
+                column_rename = {
+                    'symbol': 'Stock Name', 'ticker': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date', 'quantity': 'Quantity',
+                    'sector': 'Sector', 'market_cap': 'Market Cap', 'current_price': 'Current Price', 'return_%': 'Return (%)',
+                    'return_amount': 'Return (Amount)', 'invested_value': 'Investment Value', 'current_value': 'Current Value',
+                    'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
+                }
+                df_to_style = df_to_display.rename(columns=column_rename)
+
+                # Drop columns specific to the *other* view, if applicable
+                if not is_trading_section:
                     df_to_style = df_to_style.drop(columns=['Target Price', 'Stop Loss', 'Expected RRR'], errors='ignore')
 
-                    # FIX APPLIED: Handles Timestamp objects correctly
-                    date_formatter = lambda t: t.strftime("%d/%m/%Y") if isinstance(t, (pd.Timestamp, datetime.date)) else datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y")
+                date_formatter = lambda t: t.strftime("%d/%m/%Y") if isinstance(t, (pd.Timestamp, datetime.date)) else datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y")
 
-                    styled_holdings_df = df_to_style.style.map(color_return_value, subset=['Return (%)']).format({
-                        'Buy Price': '₹{:.2f}', 'Current Price': '₹{:.2f}', 'Return (Amount)': '₹{:.2f}',
-                        'Investment Value': '₹{:.2f}', 'Current Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
-                        'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}',
-                        'Buy Date': date_formatter,
-                        'Expected RRR': '{:.2f}'
-                    })
-                    st.dataframe(styled_holdings_df, width='stretch', hide_index=True)
-            # --- END: DETAILED HOLDINGS ---
+                styled_holdings_df = df_to_style.style.map(color_return_value, subset=['Return (%)']).format({
+                    'Buy Price': '₹{:.2f}', 'Current Price': '₹{:.2f}', 'Return (Amount)': '₹{:.2f}',
+                    'Investment Value': '₹{:.2f}', 'Current Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
+                    'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}',
+                    'Buy Date': date_formatter,
+                    'Expected RRR': '{:.2f}'
+                })
+                st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
+            # --- END: DETAILED HOLDINGS EXPANDER (COMMON BLOCK) ---
 
-            # --- START: Portfolio vs Benchmark Chart (Investment only) ---
-            if not is_trading_section and not df_to_display.empty:
-                st.header("Portfolio vs. Benchmark Comparison")
+            st.divider()
 
-                benchmark_options = ['Nifty 50', 'Nifty 100', 'Nifty 200', 'Nifty 500']
-
-                default_benchmark = st.session_state.get(f"{key_prefix}_benchmark_choice", 'Nifty 50')
-                default_index = benchmark_options.index(default_benchmark) if default_benchmark in benchmark_options else 0
-
-                benchmark_choice = st.selectbox(
-                    "Select Benchmark for Chart Comparison:",
-                    options=benchmark_options,
-                    key=f"{key_prefix}_benchmark_selector_chart",
-                    index=default_index
-                )
-
-                st.session_state[f"{key_prefix}_benchmark_choice"] = benchmark_choice
-
-                # Recalculate comparison data after selectbox update
-                comparison_df = get_benchmark_comparison_data(df_to_display, benchmark_choice)
-
-                if not comparison_df.empty:
-                    comparison_df['Date'] = pd.to_datetime(comparison_df['Date'])
-
-                    chart = alt.Chart(comparison_df).mark_line().encode(
-                        x=alt.X('Date:T', title='Date'),
-                        y=alt.Y('Return %:Q', title='Cumulative Return (%)'),
-                        color=alt.Color('Type:N', scale=alt.Scale(range=['#1f77b4', '#ff7f0e'])), # Blue for Portfolio, Orange for Benchmark
-                        tooltip=['Date', 'Type', alt.Tooltip('Return %', format=".2f")]
-                    ).properties(
-                        height=400,
-                        title=f"Portfolio vs. {benchmark_choice} Cumulative Return"
-                    ).interactive()
-
-                    zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
-
-                    st.altair_chart(chart + zero_line, width='stretch')
-                else:
-                    st.info(f"Cannot generate benchmark chart. Either market data is unavailable for {benchmark_choice} or buy dates are too recent.")
-                st.divider()
-            # --- END: Portfolio vs Benchmark Chart (Investment only) ---
-
-            # --- DETAILED HOLDINGS (TRADING SECTION ONLY, was already correct) ---
-            if is_trading_section:
-                with st.expander(f"View Detailed {view_options[0]}"):
-                    column_rename = {
-                        'symbol': 'Stock Name', 'ticker': 'Stock Name', 'buy_price': 'Buy Price', 'buy_date': 'Buy Date', 'quantity': 'Quantity',
-                        'sector': 'Sector', 'market_cap': 'Market Cap', 'current_price': 'Current Price', 'return_%': 'Return (%)',
-                        'return_amount': 'Return (Amount)', 'invested_value': 'Investment Value', 'current_value': 'Current Value',
-                        'target_price': 'Target Price', 'stop_loss_price': 'Stop Loss'
-                    }
-                    df_to_style = df_to_display.rename(columns=column_rename)
-
-                    # FIX APPLIED: Handles Timestamp objects correctly
-                    date_formatter = lambda t: t.strftime("%d/%m/%Y") if isinstance(t, (pd.Timestamp, datetime.date)) else datetime.datetime.strptime(t, "%Y-%m-%d").strftime("%d/%m/%Y")
-
-
-                    styled_holdings_df = df_to_style.style.map(color_return_value, subset=['Return (%)']).format({
-                        'Buy Price': '₹{:.2f}', 'Current Price': '₹{:.2f}', 'Return (Amount)': '₹{:.2f}',
-                        'Investment Value': '₹{:.2f}', 'Current Value': '₹{:.2f}', 'Return (%)': '{:.2f}%',
-                        'Target Price': '₹{:.2f}', 'Stop Loss': '₹{:.2f}',
-                        'Buy Date': date_formatter,
-                        'Expected RRR': '{:.2f}'
-                    })
-                    st.dataframe(styled_holdings_df, width='stretch', hide_index=True)
-            # --- END: DETAILED HOLDINGS (TRADING) ---
-
-
+            # --- MOVED: Return Chart (Individual Assets) ---
             st.header("Return Chart (Individual Assets)")
             all_symbols_list = df_to_display["symbol"].tolist()
             selected_symbols = st.multiselect("Select assets for return chart", all_symbols_list, default=all_symbols_list, key=f"{key_prefix}_perf_symbols")
@@ -2058,9 +2102,60 @@ def render_asset_page(config):
                     tooltip=['symbol', 'date', alt.Tooltip('return_%', format=".2f")]
                 ).properties(height=300).interactive()
                 zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
-                st.altair_chart(chart + zero_line, width='stretch')
+                st.altair_chart(chart + zero_line, use_container_width=True)
             else:
                 st.info("No data to display for selected assets.")
+            # --- END MOVED: Return Chart (Individual Assets) ---
+
+            st.divider()
+
+
+            # --- START: CONDITIONAL BENCHMARK COMPARISON BLOCK (INVESTMENT ONLY) ---
+            if not is_trading_section:
+
+                if initial_comparison_df.empty:
+                    # RENDER FAILURE CASE: Hide the entire block and display warning
+                    st.warning("Could not generate portfolio metrics or comparison chart. Either benchmark data is unavailable or your portfolio buy dates are too recent.")
+                else:
+                    # RENDER SUCCESS CASE: Chart controls and chart visible
+
+                    st.header("Portfolio vs. Benchmark Comparison")
+
+                    default_index = benchmark_options.index(initial_benchmark)
+
+                    # Store the benchmark selection in session state
+                    benchmark_choice = st.selectbox(
+                        "Select Benchmark for Chart Comparison:",
+                        options=benchmark_options,
+                        key=f"{key_prefix}_benchmark_selector_chart",
+                        index=default_index
+                    )
+
+                    # Update session state with the selected choice
+                    st.session_state[f"{key_prefix}_benchmark_choice"] = benchmark_choice
+
+                    # Fetch the final data based on the selection (will hit cache if same as initial)
+                    comparison_df = get_benchmark_comparison_data(df_to_display, benchmark_choice)
+
+                    comparison_df['Date'] = pd.to_datetime(comparison_df['Date'])
+
+                    chart = alt.Chart(comparison_df).mark_line().encode(
+                        x=alt.X('Date:T', title='Date'),
+                        y=alt.Y('Return %:Q', title='Cumulative Return (%)'),
+                        color=alt.Color('Type:N', scale=alt.Scale(range=['#1f77b4', '#ff7f0e'])),
+                        tooltip=['Date', 'Type', alt.Tooltip('Return %', format=".2f")]
+                    ).properties(
+                        height=400,
+                        title=f"Portfolio vs. {benchmark_choice} Cumulative Return"
+                    ).interactive()
+
+                    zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color="gray", strokeDash=[3,3]).encode(y='y')
+
+                    st.altair_chart(chart + zero_line, use_container_width=True)
+
+                st.divider()
+            # --- END: CONDITIONAL BENCHMARK COMPARISON BLOCK (INVESTMENT ONLY) ---
+
         else:
             st.info(f"No {trade_mode_selection.lower()} in {view_options[0].lower()} to display.")
 
@@ -2095,7 +2190,7 @@ def render_asset_page(config):
                     'Sell Date': date_formatter,
                     'Expected RRR': '{:.2f}', 'Actual RRR': '{:.2f}'
                 })
-                st.dataframe(styled_realized_df, width='stretch', hide_index=True)
+                st.dataframe(styled_realized_df, use_container_width=True, hide_index=True)
             st.header("Return Chart")
             realized_df['color'] = realized_df['realized_return_pct'].apply(lambda x: 'Profit' if x >= 0 else 'Loss')
             base = alt.Chart(realized_df).encode(
@@ -2106,7 +2201,7 @@ def render_asset_page(config):
                 y=alt.Y('realized_return_pct', title='Return (%)'),
                 color=alt.Color('color', scale=alt.Scale(domain=['Profit', 'Loss'], range=['#2ca02c', '#d62728']), legend=None)
             )
-            st.altair_chart(bars, width='stretch')
+            st.altair_chart(bars, use_container_width=True)
         else:
             st.info(f"No {trade_mode_selection.lower()} in {view_options[1].lower()} to display.")
 
@@ -2117,6 +2212,12 @@ def main_app():
     """Renders the main dashboard pages."""
     if "page" not in st.session_state:
         st.session_state.page = "home"
+
+    # Sidebar Check (No viewer role needed anymore)
+    if st.session_state.get("logged_in"):
+        st.sidebar.markdown(f"**Logged in as: Owner**")
+        st.sidebar.markdown("---")
+
 
     # All pages must be defined before this dictionary is created
     pages = {
