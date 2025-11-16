@@ -101,5 +101,3 @@ streamlit run finance_app.py
 
 ---
 
-## 📌 License
-MIT License. Free to use, enhance, and extend.
