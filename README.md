@@ -1,18 +1,105 @@
-💰 FIN-Tracker: Secure Personal Finance DashboardFIN-Tracker is a secure, all-in-one financial dashboard built with Streamlit and powered by a robust PostgreSQL database (Neon DB). It provides comprehensive, real-time tracking for stocks, mutual funds, trading P&L, budget management, and overall fund flow.The application uses a strict Owner/Viewer access model and relies entirely on Streamlit Secrets for all credentials and API keys, ensuring zero exposure of sensitive data in this repository.✨ Features at a Glance1. Secure Access & Role ManagementOwner Access: Full read/write access to add, edit, or delete transactions, investments, and trades.Viewer Access: Read-only access for portfolio viewing and analysis.Data Security: All authentication keys, API keys, and database URLs are stored securely outside the codebase using st.secrets.2. Fund Management (Bank Account Monitoring)Track all deposits, withdrawals, and capital allocations (e.g., to brokerage accounts).Calculate Available Capital (Cash) and view the cumulative fund flow over time.This section acts as a ledger to monitor your primary bank account/finance accounts.3. Investment & Trading PortfolioLive Metrics: Calculate real-time profit/loss, return percentages, and portfolio value based on fetched stock prices (via yfinance).Investment Portfolio: Long-term stock holdings with sector and market cap allocation analysis.Trading Book: Short-term trade management including Target Price and Stop Loss, allowing calculation of Risk-Reward Ratio (RRR).Paper Trading Mode: Toggle to run trades without affecting your actual cash balance in the "Funds" section.4. Mutual Fund (MF) TrackingIndian MF Focus: Integrates mftool to fetch real-time NAVs and historical data for Indian mutual fund schemes.Performance: Calculates average NAV, current value, and cumulative return (XIRR approximation) over time.5. Expense Tracker & BudgetingCategorization: Log daily income and expenses by customizable categories.Account Transfers: Dedicated tool to log internal transfers between payment methods (e.g., UPI to Credit Card) without affecting net worth.Budgeting: Set monthly budgets and track spending against them.Recurring Expenses: Manage subscriptions and automated monthly bills.🚀 Setup and DeploymentThis application is designed for easy deployment on Streamlit Cloud.PrerequisitesPython 3.8+PostgreSQL Database: A running instance (e.g., Neon DB).Finnhub API Key: For enhanced stock search (optional, but recommended).Local InstallationClone the repository and install dependencies:git clone git@github.com:your_username/FIN-Tracker.git
+# 💰 FIN-Tracker: Secure Personal Finance Dashboard
+
+FIN-Tracker is a secure, all-in-one financial dashboard built with **Streamlit** and powered by a robust **PostgreSQL (Neon DB)** backend. It provides comprehensive real-time tracking for stocks, mutual funds, trading P&L, budgeting, and overall fund flow.
+
+The application uses a strict **Owner/Viewer access model** and relies entirely on **Streamlit Secrets** for credentials—ensuring zero exposure of sensitive data in the repository.
+
+---
+
+## ✨ Features at a Glance
+
+### 1. 🔐 Secure Access & Role Management
+- **Owner Access:** Full read/write access to add, edit, or delete data.
+- **Viewer Access:** Read-only view of all dashboards and analytics.
+- **Security:** All credentials and API keys stored securely using `st.secrets`.
+
+---
+
+### 2. 💸 Fund Management (Bank Account Monitoring)
+- Track all deposits, withdrawals, and fund allocations.
+- Calculate **Available Capital**.
+- View cumulative fund flow over time.
+
+---
+
+### 3. 📈 Investment & Trading Portfolio
+- Real-time P&L, returns, and valuation using *yfinance*.
+- Long-term investment tracking with sector & market cap analysis.
+- Trading book with Target, Stop Loss, and Risk-Reward Ratio (RRR).
+- **Paper Trading Mode** available.
+
+---
+
+### 4. 📊 Mutual Fund Tracking (India)
+- Fetch real-time NAVs using `mftool`.
+- Track MF performance, average NAV, and XIRR-like returns.
+
+---
+
+### 5. 🧾 Expense Tracker & Budgeting
+- Categorized income & expenses.
+- Internal transfers (e.g., UPI → Credit Card) without affecting net worth.
+- Monthly budget tracking.
+- Manage recurring expenses/subscriptions.
+
+---
+
+## 🚀 Setup and Deployment
+
+FIN-Tracker is optimized for deployment on **Streamlit Cloud**.
+
+---
+
+## ✅ Prerequisites
+- Python 3.8+
+- PostgreSQL / Neon DB
+- (Optional) Finnhub API key for enhanced stock search
+
+---
+
+## 🛠️ Local Installation
+
+```bash
+git clone git@github.com:your_username/FIN-Tracker.git
 cd FIN-Tracker
 pip install -r requirements.txt
-Security Configuration (The Essential Step)All sensitive information is accessed via st.secrets. Before running the app locally or deploying it to Streamlit Cloud, you must create or configure your secrets.Create/Edit secrets.toml: Create a file named .streamlit/secrets.toml in your local environment.Paste Credentials: Fill in your credentials accurately. Your Python code will automatically read these values.[api_keys]
+```
+
+---
+
+## 🔐 Security Configuration (Required)
+
+Create the file:
+
+```
+.streamlit/secrets.toml
+```
+
+Add the following:
+
+```toml
+[api_keys]
 finnhub = "YOUR_FINNHUB_API_KEY"
 
-# --- OWNER/VIEWER LOGIN CREDENTIALS ---
 [auth]
 username = "YOUR_OWNER_USERNAME"
 password = "YOUR_OWNER_PASSWORD"
 viewer_username = "YOUR_VIEWER_ACCESS_CODE"
-viewer_password = "VIEWER_PASSWORD" # Used for simplicity, access code is primary validation
+viewer_password = "VIEWER_PASSWORD"
 
-# --- NEON / POSTGRESQL CONNECTION ---
 [neon_db]
-# Replace with your actual Neon/Postgres connection string
 sqlalchemy_url = "postgresql+psycopg2://user:password@host/database?sslmode=require"
-Run Locally:streamlit run finance_app.py
+```
+
+---
+
+## ▶️ Run Locally
+
+```bash
+streamlit run finance_app.py
+```
+
+---
+
+## 📌 License
+MIT License. Free to use, enhance, and extend.
