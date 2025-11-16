@@ -3,3 +3,4 @@ migration_env/
 __pycache__/
 *.pyc
 finance.db
+.DS_Store
