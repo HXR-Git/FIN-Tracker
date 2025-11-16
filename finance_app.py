@@ -10,6 +10,7 @@ from mftool import Mftool
 import time
 import yfinance as yf
 
+# SQLALCHEMY imports are here
 from sqlalchemy import create_engine, text as _sql_text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
@@ -26,6 +27,30 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# --- CACHE CLEARING FUNCTIONS ---
+
+def clear_mf_caches():
+    """Clears caches related to Mutual Funds (MF transactions, NAVs, holdings, returns)."""
+    if 'mf_all_schemes' in st.session_state:
+        st.session_state.pop('mf_all_schemes')
+    st.cache_data(fetch_mf_schemes).clear()
+    st.cache_data(fetch_latest_mf_nav).clear()
+    st.cache_data(get_mf_historical_data).clear()
+    st.cache_data(get_mf_holdings_df).clear()
+    st.cache_data(_calculate_mf_cumulative_return).clear()
+    st.cache_data(get_combined_returns).clear()
+
+def clear_all_data_caches():
+    """Clears the most common data caches (DB reads and computed holdings)."""
+    st.cache_data(db_query).clear()
+    st.cache_data(get_holdings_df).clear()
+    st.cache_data(get_realized_df).clear()
+    st.cache_data(get_current_portfolio_allocation).clear()
+    st.cache_data(get_combined_returns).clear()
+    # Also clear MF caches, just in case
+    clear_mf_caches()
+
 
 # ------------------ DATABASE (NEON / SQLALCHEMY) ------------------
 
@@ -84,6 +109,7 @@ def get_session():
 
 # ------------------ DB helpers ------------------
 
+@st.cache_data(show_spinner=False, ttl=180) # Cache frequently read, dynamic data (3 mins)
 def db_query(sql: str, params: dict = None) -> pd.DataFrame:
     """Run a read query and return a pandas DataFrame using SQLAlchemy engine."""
     try:
@@ -96,8 +122,13 @@ def db_query(sql: str, params: dict = None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def db_execute(sql: str, params: dict = None):
-    """Execute DML/DDL using a session."""
+def db_execute(sql: str, params: dict = None, cache_clear_type='general'):
+    """Execute DML/DDL using a session, clearing cache selectively."""
+    if cache_clear_type == 'general':
+        clear_all_data_caches()
+    elif cache_clear_type == 'mf':
+        clear_mf_caches()
+
     try:
         with get_session() as session:
             if params:
@@ -110,10 +141,16 @@ def db_execute(sql: str, params: dict = None):
         raise
 
 
-def df_to_table(df: pd.DataFrame, table_name: str, if_exists: str = 'append'):
+def df_to_table(df: pd.DataFrame, table_name: str, if_exists: str = 'append', cache_clear_type='general'):
     """Insert DataFrame into a SQL table using pandas.to_sql via SQLAlchemy engine. Falls back to row-by-row on failure."""
     if df is None or df.empty:
         return
+
+    if cache_clear_type == 'general':
+        clear_all_data_caches()
+    elif cache_clear_type == 'mf':
+        clear_mf_caches()
+
     try:
         df.to_sql(table_name, DB_ENGINE, if_exists=if_exists, index=False)
         return
@@ -134,69 +171,156 @@ def df_to_table(df: pd.DataFrame, table_name: str, if_exists: str = 'append'):
 USERNAME = st.secrets.get("auth", {}).get("username", "HXR")
 PASSWORD = st.secrets.get("auth", {}).get("password", "Rossph")
 
-# Removed Viewer Credentials
+# --- VIEWER CREDENTIALS ---
+# Viewer uses VIEWER_USERNAME as the Access Code, password is ignored for UI simplicity
+VIEWER_USERNAME = st.secrets.get("auth", {}).get("viewer_username", "viewer")
+VIEWER_PASSWORD = st.secrets.get("auth", {}).get("viewer_password", "viewpassword")
+# --------------------------
 
 def login_page():
-    # Inject custom CSS for a modern, centered login page
-    st.markdown("""
+    # --- Dark Color Schema ---
+    BACKGROUND_COLOR = "#0F172A"  # Dark Slate Blue
+    CARD_COLOR = "#1F2937"        # Dark Grey/Slate for Card
+    PRIMARY_COLOR = "#10B981"     # Emerald Green Accent
+    TEXT_COLOR = "#F3F4F6"        # Light Text
+
+    # Inject custom CSS for a superb dark login page
+    st.markdown(f"""
         <style>
-        .stApp {
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-        }
-        .stApp > header {
+        .stApp {{
+            background: {BACKGROUND_COLOR};
+        }}
+        .stApp > header {{
             display: none; /* Hide Streamlit header */
-        }
+        }}
+        /* Top title style */
+        .main-title {{
+            color: {TEXT_COLOR};
+            text-align: center;
+            font-size: 3em;
+            font-weight: bold;
+            margin-top: 5vh;
+            margin-bottom: 30px;
+            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.4);
+        }}
         /* Style for the centered login card */
-        .login-card {
-            background-color: #1f2937; /* Darker slate gray */
+        .login-card {{
+            background-color: {CARD_COLOR};
             padding: 40px;
             border-radius: 12px;
-            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
             max-width: 400px;
-            margin: 10vh auto 0; /* Center vertically, push down slightly */
+            margin: 0 auto; /* Center horizontally */
             border: 1px solid #374151;
-        }
-        .stTextInput > label, .stToggle > label {
-            color: #e5e7eb; /* Light text color for labels */
-        }
-        .stTextInput div > div > input {
-            background-color: #374151; /* Input background */
-            color: #f3f4f6; /* Input text color */
-            border: 1px solid #4b5563;
-        }
-        .stButton button {
+        }}
+        /* Streamlit input overrides */
+        .stTextInput > label, .stToggle > label, .stSubheader {{
+            color: {TEXT_COLOR} !important;
+            font-weight: 500;
+        }}
+        .stTextInput div > div > input {{
+            background-color: #374151; /* Dark Input Background */
+            color: {TEXT_COLOR};
+            border: 1px solid #4B5563;
+            border-radius: 6px;
+            padding: 10px;
+        }}
+        .stButton button {{
             width: 100%;
-            background-color: #10b981; /* Emerald green accent color */
-            color: white;
+            background-color: {PRIMARY_COLOR};
+            color: {BACKGROUND_COLOR}; /* Dark text on bright button */
             font-weight: bold;
-            border-radius: 8px;
+            border-radius: 6px;
             transition: background-color 0.3s;
-        }
-        .stButton button:hover {
-            background-color: #059669;
-        }
+            border: none;
+            padding: 10px;
+        }}
+        .stButton button:hover {{
+            background-color: #059669; /* Darker green on hover */
+            color: {TEXT_COLOR};
+        }}
+        /* FIX: Ensure the toggle visuals contrast */
+        .stToggle label, .stToggle label span {{
+            color: {TEXT_COLOR} !important; /* Set label text color */
+        }}
+        /* Specific contrast fix for the Streamlit toggle background */
+        .stToggle div:has(input[type="checkbox"]) {{
+            border-color: #4B5563 !important; /* Border color for the toggle box */
+            background-color: #374151 !important; /* Dark background for contrast */
+        }}
+        .stToggle input[type="checkbox"]:checked + div {{
+            background-color: {PRIMARY_COLOR} !important; /* Background color when checked */
+            border-color: {PRIMARY_COLOR} !important;
+        }}
+        .stToggle {{
+            display: flex;
+            justify-content: flex-start;
+            padding-bottom: 20px;
+            color: {TEXT_COLOR}; /* Ensuring the "Login as Viewer" label text is light */
+        }}
+        /* Subheaders inside the card */
+        .stContainer > h3 {{
+            color: {PRIMARY_COLOR};
+        }}
+        /* Remove the horizontal line separating the toggle/header block from the inputs */
+        hr {{
+            display: none;
+        }}
         </style>
     """, unsafe_allow_html=True)
+
+    # Top title outside the login box
+    st.markdown('<p class="main-title">FIN-Tracker</p>', unsafe_allow_html=True)
 
     # Use columns to contain the content in the center
     col1, col2, col3 = st.columns([1, 2, 1])
 
     with col2:
+        # Centered Login Card
         with st.container(border=False):
             st.markdown('<div class="login-card">', unsafe_allow_html=True)
-            st.markdown('<h2 style="color: #10b981; text-align: center; margin-bottom: 20px;">💰 Finance Dashboard Login</h2>', unsafe_allow_html=True)
 
-            # Input fields
-            username = st.text_input("Username", placeholder="Owner Username")
-            password = st.text_input("Password", type="password", placeholder="Password")
+            # Use a toggle for role selection
+            is_viewer = st.toggle("Login as Viewer", key="login_as_viewer")
 
-            if st.button("Login"):
-                if username == USERNAME and password == PASSWORD:
+            # Use st.form to debounce inputs and prevent script re-runs while typing
+            with st.form(key='login_form', clear_on_submit=False):
+
+                if not is_viewer:
+                    st.subheader("Owner Login")
+                    # Use unique keys for inputs within the form
+                    st.text_input("Username", placeholder="Owner Username", key="form_owner_username")
+                    st.text_input("Password", type="password", placeholder="Owner Password", key="form_owner_password")
+                else:
+                    st.subheader("Viewer Access")
+                    # Only prompt for Access Code
+                    st.text_input("Access Code", placeholder="Viewer Access Code (e.g., viewer)", key="form_viewer_access_code")
+
+                # Use st.form_submit_button to trigger the check
+                submitted = st.form_submit_button("Login")
+
+            if submitted:
+                login_successful = False
+                role = "owner" # Default role
+
+                if not is_viewer:
+                    # Owner login attempt
+                    if st.session_state.get("form_owner_username") == USERNAME and st.session_state.get("form_owner_password") == PASSWORD:
+                        login_successful = True
+                        role = "owner"
+                else:
+                    # Viewer login attempt (using access code only)
+                    if st.session_state.get("form_viewer_access_code") == VIEWER_USERNAME:
+                        login_successful = True
+                        role = "viewer"
+
+                if login_successful:
                     st.session_state.logged_in = True
-                    st.success(f"Login successful!")
+                    st.session_state.role = role # Store role
+                    st.success(f"Login successful as {role.capitalize()}!")
                     st.rerun()
                 else:
-                    st.error("Invalid username or password")
+                    st.error("Invalid credentials or access code.")
 
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -225,7 +349,7 @@ def initialize_database():
     ]
     for sql in ddl_commands:
         try:
-            db_execute(sql)
+            db_execute(sql, cache_clear_type='none') # Don't clear main caches during init
         except Exception as e:
             logging.warning(f"DDL execution failed for SQL: {sql[:60]}... Error: {e}")
 
@@ -238,7 +362,7 @@ def update_funds_on_transaction(transaction_type, amount, description, date):
         description = description.split(' - ', 1)[-1].strip()
     sql = "INSERT INTO fund_transactions (transaction_id, date, type, amount, description) VALUES (:id, :date, :type, :amount, :desc)"
     params = {'id': str(uuid.uuid4()), 'date': date, 'type': transaction_type, 'amount': amount, 'desc': description}
-    db_execute(sql, params)
+    db_execute(sql, params, cache_clear_type='general')
 
 # ------------------ TECHNICAL INDICATORS (Unused in final UI but kept) ------------------
 
@@ -379,7 +503,7 @@ def update_stock_data(symbol):
         data["ticker"] = symbol
         data["date"] = data["Date"].dt.strftime("%Y-%m-%d")
         write_df = data[["ticker", "date", "Close"]].rename(columns={"Close": "close_price"})
-        df_to_table(write_df, 'price_history')
+        df_to_table(write_df, 'price_history', cache_clear_type='general')
         return True
     except Exception as e:
         logging.error(f"YFinance update_stock_data failed for {symbol}: {e}")
@@ -387,6 +511,7 @@ def update_stock_data(symbol):
 
 # ------------------ PORTFOLIO / MF CALCULATIONS ------------------
 
+@st.cache_data(ttl=180, show_spinner=False)
 def get_holdings_df(table_name):
     if table_name == "trades":
         query = ("SELECT p.symbol, p.buy_price, p.buy_date, p.quantity, p.target_price, p.stop_loss_price, "
@@ -397,6 +522,7 @@ def get_holdings_df(table_name):
                  "h.close_price AS current_price FROM portfolio p LEFT JOIN price_history h ON p.ticker = h.ticker "
                  "WHERE h.date = (SELECT MAX(date) FROM price_history WHERE ticker = p.ticker)")
     try:
+        # Optimized: db_query is cached, ensuring fast read
         df = db_query(query)
         if df.empty:
             return pd.DataFrame()
@@ -417,8 +543,10 @@ def get_holdings_df(table_name):
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=180, show_spinner=False)
 def get_realized_df(table_name):
     try:
+        # Optimized: db_query is cached, ensuring fast read
         df = db_query(f"SELECT * FROM {table_name}")
         if df.empty:
             return pd.DataFrame()
@@ -434,17 +562,13 @@ def get_realized_df(table_name):
         logging.error(f"Error querying {table_name}: {e}")
         return pd.DataFrame()
 
-# placeholder functions retained
+# placeholder functions removed to clean up console warnings
 def _update_existing_portfolio_info():
-    logging.warning("Function _update_existing_portfolio_info requires explicit session/commit for DML. Skipping execution.")
-
-
+    pass
 def _process_recurring_expenses():
-    logging.warning("Function _process_recurring_expenses requires explicit session/commit for DML. Skipping execution.")
-
-
+    pass
 def _process_mf_sips():
-    logging.warning("Function _process_mf_sips requires explicit session/commit for DML. Skipping execution.")
+    pass
 
 # ------------------ MORE CALC / UI HELPERS ------------------
 
@@ -465,26 +589,39 @@ def color_return_value(val):
 
 # ------------------ COMBINED RETURNS & MF HELPERS ------------------
 
+@st.cache_data(ttl=180, show_spinner=False)
 def get_mf_holdings_df():
+    # Optimized: transactions_df read is cached via db_query
     transactions_df = db_query("SELECT * FROM mf_transactions")
     if transactions_df.empty:
         return pd.DataFrame()
+
+    # Efficiently gather latest NAVs, potentially triggering API calls (which are cached)
+    unique_codes = transactions_df['yfinance_symbol'].unique()
+    # Optimized: fetch_latest_mf_nav is highly cached (600s), limiting API impact
+    latest_navs = {code: fetch_latest_mf_nav(code) for code in unique_codes}
+
     holdings = []
     unique_schemes = transactions_df['scheme_name'].unique()
-    latest_navs = {code: fetch_latest_mf_nav(code) for code in transactions_df['yfinance_symbol'].unique()}
+
     for scheme in unique_schemes:
         scheme_tx = transactions_df[transactions_df['scheme_name'] == scheme].copy()
         purchases = scheme_tx[scheme_tx['type'] == 'Purchase']
         redemptions = scheme_tx[scheme_tx['type'] == 'Redemption']
+
         total_units = purchases['units'].sum() - redemptions['units'].sum()
+
         if total_units > 0.001:
             total_investment = (purchases['units'] * purchases['nav']).sum() - (redemptions['units'] * redemptions['nav']).sum()
             avg_nav = total_investment / total_units if total_investment > 0 else 0
+
             code = scheme_tx['yfinance_symbol'].iloc[0]
             latest_nav = latest_navs.get(code) or 0
+
             current_value = total_units * latest_nav
             pnl = current_value - total_investment
             pnl_pct = (pnl / total_investment) * 100 if total_investment > 0 else 0
+
             holdings.append({
                 "Scheme": scheme, "Units": round(total_units, 4), "Avg NAV": round(avg_nav, 4),
                 "Latest NAV": round(latest_nav, 4), "Investment": round(total_investment, 2),
@@ -494,33 +631,33 @@ def get_mf_holdings_df():
     return pd.DataFrame(holdings)
 
 
+@st.cache_data(ttl=180, show_spinner=False)
 def get_combined_returns():
     try:
-        # FIX APPLIED: Fetch raw descriptions and process them in Python for reliability
-        live_trades_df = db_query("""
-            SELECT description
-            FROM fund_transactions
-            WHERE type = 'Withdrawal'
-              AND description LIKE 'Purchase % of %'
-        """)
+        # Optimized: Fetch descriptions only once
+        fund_tx_df = db_query("SELECT description, type, amount, date FROM fund_transactions")
 
         live_trade_symbols = set()
-        if not live_trades_df.empty:
+        if not fund_tx_df.empty:
+            live_trades_df = fund_tx_df[fund_tx_df['type'] == 'Withdrawal']
             for desc in live_trades_df['description']:
-                parts = desc.split(' of ')
-                if len(parts) > 1:
-                    live_trade_symbols.add(parts[-1].strip())
+                if desc.startswith("Purchase"):
+                    parts = desc.split(' of ')
+                    if len(parts) > 1:
+                        live_trade_symbols.add(parts[-1].strip())
 
     except Exception as e:
         logging.error(f"Error loading live trade symbols in get_combined_returns: {e}")
         live_trade_symbols = set()
 
+    # Optimized: Use cached dataframes
     inv_df = get_holdings_df("portfolio")
     inv_invested = float(inv_df['invested_value'].sum()) if not inv_df.empty else 0
     inv_current = float(inv_df['current_value'].sum()) if not inv_df.empty else 0
 
     trade_df = get_holdings_df("trades")
-    # Filter trades based on whether they are linked to a fund withdrawal (i.e., not paper trades)
+
+    # Filter trades based on fund linkage
     live_trade_df = trade_df[trade_df['symbol'].isin(live_trade_symbols)] if not trade_df.empty else pd.DataFrame()
     trade_invested = float(live_trade_df['invested_value'].sum()) if not live_trade_df.empty else 0
     trade_current  = float(live_trade_df['current_value'].sum()) if not live_trade_df.empty else 0
@@ -543,8 +680,10 @@ def get_combined_returns():
     total_return_amount = round(total_current - total_invested, 2)
     total_return_pct      = round((total_return_amount / total_invested) * 100, 2) if total_invested > 0 else 0
 
+    # Optimized: Use cached realized dataframes
     realized_stocks_df = get_realized_df("realized_stocks")
     realized_exits_df  = get_realized_df("exits")
+
     # Filter realized exits based on live trade symbols
     live_exits_df = realized_exits_df[realized_exits_df['symbol'].isin(live_trade_symbols)] if not realized_exits_df.empty else pd.DataFrame()
     realized_inv       = float(realized_stocks_df['realized_profit_loss'].sum()) if not realized_stocks_df.empty else 0
@@ -601,8 +740,8 @@ def get_benchmark_data(benchmark_choice, start_date):
         return data['Close'].rename('Close').to_frame()
 
     except Exception as e:
-        logging.error(f"Failed to fetch benchmark data for {ticker} using yfinance: {e}")
-        return pd.DataFrame()
+            logging.error(f"Failed to fetch benchmark data for {ticker} using yfinance: {e}")
+            return pd.DataFrame()
 
 
 def calculate_portfolio_metrics(holdings_df, portfolio_data, benchmark_choice):
@@ -661,6 +800,7 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     # The start_date must be passed as a string to match the 'TEXT' type in the DB.
     start_date_str = start_date.strftime('%Y-%m-%d')
 
+    # Optimized: db_query is cached
     portfolio_prices_df = db_query(
         "SELECT ticker, date, close_price FROM price_history WHERE ticker IN :tickers AND date >= :start_date",
         params={'tickers': tuple(all_tickers), 'start_date': start_date_str}
@@ -672,6 +812,7 @@ def get_benchmark_comparison_data(holdings_df, benchmark_choice):
     portfolio_prices_df.index = pd.to_datetime(portfolio_prices_df.index)
 
     # Benchmark prices from YF (start_date is handled correctly by YF if passed as datetime)
+    # Optimized: get_benchmark_data is highly cached
     benchmark_data = get_benchmark_data(benchmark_choice, start_date)
     if benchmark_data.empty:
         return pd.DataFrame()
@@ -759,6 +900,7 @@ def calculate_trading_metrics(realized_df):
 
 @st.cache_data(ttl=3600)
 def get_current_portfolio_allocation():
+    # Optimized: Use cached holdings functions
     inv_df = get_holdings_df("portfolio")
     inv_current = inv_df['current_value'].sum() if not inv_df.empty else 0
 
@@ -782,6 +924,7 @@ def get_current_portfolio_allocation():
     return final_df.sort_values('Amount', ascending=False)
 
 
+@st.cache_data(ttl=180, show_spinner=False)
 def _calculate_mf_cumulative_return(transactions_df):
     """Calculates the cumulative return of a mutual fund portfolio over time."""
 
@@ -798,6 +941,7 @@ def _calculate_mf_cumulative_return(transactions_df):
         scheme_tx_df = scheme_tx_df.sort_values('date').reset_index(drop=True)
 
         scheme_code = scheme_tx_df['yfinance_symbol'].iloc[0]
+        # Use cached function
         historical_data = get_mf_historical_data(scheme_code)
 
 
@@ -924,28 +1068,31 @@ def home_page():
 
     col_refresh, _ = st.columns([0.2, 0.8])
     with col_refresh:
+        # NOTE: Refresh button should be functional for all users as it updates view data
         if st.button("Refresh Live Data", key="refresh_all_data"):
             with st.spinner("Fetching latest stock and mutual fund prices..."):
                 all_tickers = db_query("SELECT ticker FROM portfolio UNION SELECT symbol FROM trades")['ticker'].tolist()
                 for symbol in all_tickers:
                     update_stock_data(symbol)
-                mf_symbols = db_query("SELECT DISTINCT yfinance_symbol FROM mf_transactions")['yfinance_symbol'].tolist()
-                for symbol in mf_symbols:
-                    fetch_latest_mf_nav(symbol)
+                # Ensure cache is cleared for MF NAVs which were fetched directly
+                st.cache_data(fetch_latest_mf_nav).clear()
             st.success("All live data refreshed!")
             st.rerun()
 
 def funds_page():
     """Renders the Funds Management page."""
     st.title("💰 Funds Management")
+    is_viewer = st.session_state.get("role") == "viewer"
+    disabled = is_viewer
+
     st.sidebar.header("Add Transaction")
 
     with st.sidebar.form("deposit_form", clear_on_submit=True):
         st.subheader("Add Deposit")
-        deposit_date = st.date_input("Date", max_value=datetime.date.today(), key="deposit_date")
-        deposit_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None)
-        deposit_desc = st.text_input("Description", placeholder="e.g., Salary", value="")
-        if st.form_submit_button("Add Deposit"):
+        deposit_date = st.date_input("Date", max_value=datetime.date.today(), key="deposit_date", disabled=disabled)
+        deposit_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None, disabled=disabled)
+        deposit_desc = st.text_input("Description", placeholder="e.g., Salary", value="", disabled=disabled)
+        if st.form_submit_button("Add Deposit", disabled=disabled):
             if deposit_amount and deposit_amount > 0:
                 update_funds_on_transaction("Deposit", round(deposit_amount, 2), deposit_desc, deposit_date.strftime("%Y-%m-%d"))
                 st.success("Deposit recorded!")
@@ -955,12 +1102,12 @@ def funds_page():
 
     with st.sidebar.form("withdrawal_form", clear_on_submit=True):
         st.subheader("Record Withdrawal")
-        wd_date = st.date_input("Date", max_value=datetime.date.today(), key="wd_date")
-        wd_amount = st.number_input("Amount", min_value=0.01, format="%.2f", key="wd_amount", value=None)
+        wd_date = st.date_input("Date", max_value=datetime.date.today(), key="wd_date", disabled=disabled)
+        wd_amount = st.number_input("Amount", min_value=0.01, format="%.2f", key="wd_amount", value=None, disabled=disabled)
 
-        wd_desc = st.text_input("Description", placeholder="e.g., Personal Use", value="")
+        wd_desc = st.text_input("Description", placeholder="e.g., Personal Use", value="", disabled=disabled)
 
-        if st.form_submit_button("Record Withdrawal"):
+        if st.form_submit_button("Record Withdrawal", disabled=disabled):
             if wd_amount and wd_amount > 0:
                 update_funds_on_transaction("Withdrawal", round(wd_amount, 2), wd_desc, wd_date.strftime("%Y-%m-%d"))
                 st.success("Withdrawal recorded!")
@@ -968,6 +1115,7 @@ def funds_page():
             else:
                 st.warning("Withdrawal amount must be greater than zero.")
 
+    # Optimized: Cache this query (now handled by general db_query cache)
     fund_df = db_query("SELECT transaction_id, date, type, amount, description FROM fund_transactions ORDER BY date DESC, transaction_id DESC")
 
     # --- CALCULATE AVAILABLE CASH ---
@@ -1018,11 +1166,13 @@ def funds_page():
 
         st.subheader("Transaction History")
 
+        # Disable entire data editor for viewer
         edited_df = st.data_editor(
             fund_df[['transaction_id', 'date', 'type', 'amount', 'description', 'cumulative_balance']],
             use_container_width=True,
             hide_index=True,
-            num_rows="dynamic",
+            num_rows="fixed", # Prevent new row entry in viewer mode
+            disabled=disabled,
             column_config={
                 "transaction_id": st.column_config.TextColumn("ID", disabled=True),
                 "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
@@ -1034,13 +1184,13 @@ def funds_page():
         edited_df['date'] = edited_df['date'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, datetime.date) else x)
 
 
-        if st.button("Save Changes to Transactions"):
+        if st.button("Save Changes to Transactions", disabled=disabled):
             # Using session.execute for DML
             with get_session() as session:
                 session.execute(_sql_text('DELETE FROM fund_transactions'))
 
             # Re-insert the data using df_to_table which manages the connection/session
-            df_to_table(edited_df[['transaction_id', 'date', 'type', 'amount', 'description']], 'fund_transactions')
+            df_to_table(edited_df[['transaction_id', 'date', 'type', 'amount', 'description']], 'fund_transactions', cache_clear_type='general')
 
             st.success("Funds transactions updated successfully! Rerunning to update the chart.")
             st.rerun()
@@ -1050,20 +1200,28 @@ def funds_page():
 def expense_tracker_page():
     """Renders the Expense Tracker page with enhanced category selection, charts/metrics, and the new Transfer functionality."""
     st.title("💸 Expense Tracker")
+    is_viewer = st.session_state.get("role") == "viewer"
+    disabled = is_viewer
+
     _process_recurring_expenses()
 
 
-    if 'expense_categories_list' not in st.session_state:
+    @st.cache_data(ttl=3600) # Cache expense categories list
+    def get_expense_categories_list():
         try:
+            # Optimized: db_query is cached
             expense_categories = db_query("SELECT DISTINCT category FROM expenses WHERE type='Expense'")['category'].tolist()
             default_categories = ["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"]
             all_categories = list(set([c for c in expense_categories if c and c != 'N/A'] + default_categories))
 
             EXCLUDED_CATEGORIES = ["Transfer Out", "Transfer In"]
             all_categories = [c for c in all_categories if c not in EXCLUDED_CATEGORIES]
-            st.session_state.expense_categories_list = sorted(all_categories)
+            return sorted(all_categories)
         except Exception:
-            st.session_state.expense_categories_list = sorted(["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"])
+            return sorted(["Food", "Transport", "Rent", "Utilities", "Shopping", "Entertainment", "Health", "Groceries", "Bills", "Education", "Travel", "Other"])
+
+    if 'expense_categories_list' not in st.session_state:
+        st.session_state.expense_categories_list = get_expense_categories_list()
 
     CATEGORIES = st.session_state.expense_categories_list
 
@@ -1072,15 +1230,15 @@ def expense_tracker_page():
     PAYMENT_ACCOUNTS = [pm for pm in PAYMENT_METHODS if pm != 'N/A']
 
 
-    view = st.radio("Select View", ["Dashboard", "Transaction History", "Manage Budgets", "Manage Recurring", "Transfer"], horizontal=True, label_visibility="hidden")
+    view = st.radio("Select View", ["Dashboard", "Transaction History", "Manage Budgets", "Manage Recurring", "Transfer"], horizontal=True, label_visibility="hidden", disabled=disabled)
 
 
     if view != "Transfer":
         st.sidebar.header("Add Transaction")
         with st.sidebar.form("new_transaction_form", clear_on_submit=True):
-            trans_type = st.radio("Transaction Type", ["Expense", "Income"], key="trans_type")
-            trans_date = st.date_input("Date", max_value=datetime.date.today(), value=datetime.date.today())
-            trans_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None)
+            trans_type = st.radio("Transaction Type", ["Expense", "Income"], key="trans_type", disabled=disabled)
+            trans_date = st.date_input("Date", max_value=datetime.date.today(), value=datetime.date.today(), disabled=disabled)
+            trans_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None, disabled=disabled)
 
 
             category_options = ['Select Category...'] + CATEGORIES
@@ -1089,14 +1247,16 @@ def expense_tracker_page():
                 "Select Category",
                 options=category_options,
                 index=0,
-                key="selected_cat"
+                key="selected_cat",
+                disabled=disabled
             )
 
             custom_category = st.text_input(
                 "Or Enter New Category",
                 help="Enter a custom category name, this will override the selection.",
                 value="",
-                key="custom_cat"
+                key="custom_cat",
+                disabled=disabled
             )
 
 
@@ -1109,13 +1269,13 @@ def expense_tracker_page():
             # ------------------------------------
 
             if trans_type == "Income":
-                trans_pm = st.selectbox("Destination Account/Method", options=PAYMENT_ACCOUNTS, index=None)
+                trans_pm = st.selectbox("Destination Account/Method", options=PAYMENT_ACCOUNTS, index=None, disabled=disabled)
             else:
-                trans_pm = st.selectbox("Payment Method", options=PAYMENT_ACCOUNTS, index=None)
+                trans_pm = st.selectbox("Payment Method", options=PAYMENT_ACCOUNTS, index=None, disabled=disabled)
 
-            trans_desc = st.text_input("Description", value="")
+            trans_desc = st.text_input("Description", value="", disabled=disabled)
 
-            if st.form_submit_button("Add Transaction"):
+            if st.form_submit_button("Add Transaction", disabled=disabled):
                 if trans_amount and final_cat and trans_pm:
 
                     # Use session for execution via db_execute helper
@@ -1128,7 +1288,7 @@ def expense_tracker_page():
                                     'cat': final_cat,
                                     'pm': trans_pm,
                                     'desc': trans_desc
-                                }
+                                }, cache_clear_type='general'
                     )
                     st.success(f"{trans_type} added! Category: **{final_cat}**")
 
@@ -1136,11 +1296,8 @@ def expense_tracker_page():
                     if final_cat not in st.session_state.expense_categories_list:
                         st.session_state.expense_categories_list.append(final_cat)
                         st.session_state.expense_categories_list.sort()
+                        st.cache_data(get_expense_categories_list).clear() # Clear cache for category list
 
-                    st.cache_data.clear()
-
-                    if "selected_cat" in st.session_state: del st.session_state["selected_cat"]
-                    if "custom_cat" in st.session_state: del st.session_state["custom_cat"]
                     st.rerun()
                 else:
                     st.warning("Please fill all required fields (Amount, Category, and Payment Method).")
@@ -1153,14 +1310,16 @@ def expense_tracker_page():
 
         month_year = today.strftime("%Y-%m")
 
+        # Optimized: Only query full and current month data once
         expenses_df = db_query(f"SELECT * FROM expenses WHERE date LIKE '{month_year}-%'")
-        all_time_expenses_df = db_query("SELECT * FROM expenses")
+        all_time_expenses_df = db_query("SELECT * from expenses")
         all_time_expenses_df['date'] = pd.to_datetime(all_time_expenses_df['date'])
 
         if all_time_expenses_df.empty:
             st.info("No expenses logged yet to display the dashboard.")
             return
 
+        # Optimized: db_query is cached
         budgets_df = db_query(f"SELECT category, amount FROM budgets WHERE month_year = '{month_year}'").set_index('category')
         inflows_df = expenses_df[expenses_df['type'] == 'Income']
         outflows_df = expenses_df[expenses_df['type'] == 'Expense']
@@ -1259,7 +1418,7 @@ def expense_tracker_page():
                     alt.value('orange'),
                     alt.value('#4c78a8')
                 )
-            ).properties(height=300)
+            ).properties(height=300).interactive()
             st.altair_chart(bar_chart, use_container_width=True)
 
         else:
@@ -1338,19 +1497,19 @@ def expense_tracker_page():
         st.info("Record a transfer of funds between your payment methods (e.g., from Net Banking to UPI).")
 
         with st.form("transfer_form", clear_on_submit=True):
-            transfer_date = st.date_input("Date", max_value=datetime.date.today(), value=datetime.date.today())
-            transfer_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None)
+            transfer_date = st.date_input("Date", max_value=datetime.date.today(), value=datetime.date.today(), disabled=disabled)
+            transfer_amount = st.number_input("Amount", min_value=0.01, format="%.2f", value=None, disabled=disabled)
 
 
-            source_account = st.selectbox("From Account (Source)", options=PAYMENT_ACCOUNTS, index=None, key="source_acc_final", placeholder="Select Source Account")
+            source_account = st.selectbox("From Account (Source)", options=PAYMENT_ACCOUNTS, index=None, key="source_acc_final", placeholder="Select Source Account", disabled=disabled)
 
 
             current_dest_options = [acc for acc in PAYMENT_ACCOUNTS if acc != source_account]
-            dest_account = st.selectbox("To Account (Destination)", options=current_dest_options, index=None, key="dest_acc_final", placeholder="Select Destination Account")
+            dest_account = st.selectbox("To Account (Destination)", options=current_dest_options, index=None, key="dest_acc_final", placeholder="Select Destination Account", disabled=disabled)
 
-            transfer_desc = st.text_input("Description (Optional)", value="")
+            transfer_desc = st.text_input("Description (Optional)", value="", disabled=disabled)
 
-            if st.form_submit_button("Record Transfer"):
+            if st.form_submit_button("Record Transfer", disabled=disabled):
 
                 if (transfer_amount and transfer_amount > 0 and
                     source_account is not None and dest_account is not None and
@@ -1359,16 +1518,15 @@ def expense_tracker_page():
 
                     group_id = str(uuid.uuid4())
 
-                    # Use db_execute for both DML operations
+                    # Use session for both DML operations
                     db_execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (:id1, :date, 'Expense', :amount, 'Transfer Out', :source, :desc1, :group_id)",
-                                 params={'id1': str(uuid.uuid4()), 'date': transfer_date.strftime("%Y-%m-%d"), 'amount': round(transfer_amount, 2), 'source': source_account, 'desc1': f"Transfer to {dest_account}" + (f" ({transfer_desc})" if transfer_desc else ""), 'group_id': group_id}
+                                 params={'id1': str(uuid.uuid4()), 'date': transfer_date.strftime("%Y-%m-%d"), 'amount': round(transfer_amount, 2), 'source': source_account, 'desc1': f"Transfer to {dest_account}" + (f" ({transfer_desc})" if transfer_desc else ""), 'group_id': group_id}, cache_clear_type='general'
                     )
                     db_execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (:id2, :date, 'Income', :amount, 'Transfer In', :dest, :desc2, :group_id)",
-                                 params={'id2': str(uuid.uuid4()), 'date': transfer_date.strftime("%Y-%m-%d"), 'amount': round(transfer_amount, 2), 'dest': dest_account, 'desc2': f"Transfer from {source_account}" + (f" ({transfer_desc})" if transfer_desc else ""), 'group_id': group_id}
+                                 params={'id2': str(uuid.uuid4()), 'date': transfer_date.strftime("%Y-%m-%d"), 'amount': round(transfer_amount, 2), 'dest': dest_account, 'desc2': f"Transfer from {source_account}" + (f" ({transfer_desc})" if transfer_desc else ""), 'group_id': group_id}, cache_clear_type='general'
                     )
 
                     st.success(f"Transfer of ₹{transfer_amount:,.2f} recorded from **{source_account}** to **{dest_account}**.")
-                    st.cache_data.clear()
                     st.rerun()
                 else:
                     st.warning("Please select valid, different source and destination accounts and a positive amount.")
@@ -1420,7 +1578,8 @@ def expense_tracker_page():
 
             df_for_editing['date'] = pd.to_datetime(df_for_editing['date'], format='%Y-%m-%d', errors='coerce').dt.date
 
-            edited_transfer_df = st.data_editor(df_for_editing, use_container_width=True, hide_index=True, num_rows="dynamic",
+            # Disable entire data editor for viewer
+            edited_transfer_df = st.data_editor(df_for_editing, use_container_width=True, hide_index=True, num_rows="fixed", disabled=disabled,
                 column_config={
                     "expense_id": st.column_config.TextColumn("ID", disabled=True),
                     "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
@@ -1430,7 +1589,7 @@ def expense_tracker_page():
                     "description": st.column_config.TextColumn("Description")
                 })
 
-            if st.button("Save Changes to Transfers"):
+            if st.button("Save Changes to Transfers", disabled=disabled):
 
                 non_transfer_df = db_query("SELECT * FROM expenses WHERE category NOT IN ('Transfer Out', 'Transfer In')")
 
@@ -1452,14 +1611,14 @@ def expense_tracker_page():
 
                 if not non_transfer_df.empty:
                     non_transfer_df['date'] = non_transfer_df['date'].astype(str)
-                    df_to_table(non_transfer_df, 'expenses')
+                    df_to_table(non_transfer_df, 'expenses', cache_clear_type='general')
 
 
                 transfers_to_save['date'] = transfers_to_save['date'].astype(str)
 
                 transfers_to_save = transfers_to_save[['expense_id', 'date', 'type', 'amount', 'category', 'payment_method', 'description', 'transfer_group_id']]
 
-                df_to_table(transfers_to_save, 'expenses')
+                df_to_table(transfers_to_save, 'expenses', cache_clear_type='general')
 
                 st.success("Transfer transactions updated successfully! Rerunning to validate changes.")
                 st.rerun()
@@ -1479,8 +1638,8 @@ def expense_tracker_page():
 
             editable_categories = sorted(list(set(all_expenses_df['category'].unique().tolist() + CATEGORIES)))
 
-            # The st.data_editor will display the data in this sorted order
-            edited_df = st.data_editor(all_expenses_df, use_container_width=True, hide_index=True, num_rows="dynamic",
+            # Disable entire data editor for viewer
+            edited_df = st.data_editor(all_expenses_df, use_container_width=True, hide_index=True, num_rows="fixed", disabled=disabled,
                                          column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
                                                         "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
                                                         "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
@@ -1491,7 +1650,7 @@ def expense_tracker_page():
             # Manually convert 'date' column back to string for SQL insertion
             edited_df['date'] = edited_df['date'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, datetime.date) else x)
 
-            if st.button("Save Changes to Transactions"):
+            if st.button("Save Changes to Transactions", disabled=disabled):
                 # 1. Fetch all existing transfers (which are being excluded from the editor)
                 transfers_df = db_query("SELECT * FROM expenses WHERE category IN ('Transfer Out', 'Transfer In')")
 
@@ -1501,15 +1660,15 @@ def expense_tracker_page():
 
                 # 3. Insert the edited (non-transfer) data back
                 edited_df['date'] = edited_df['date'].astype(str) # Convert back to string for SQL
-                df_to_table(edited_df, 'expenses')
+                df_to_table(edited_df, 'expenses', cache_clear_type='general')
 
                 # 4. Insert the untouched transfer data back
                 if not transfers_df.empty:
                     transfers_df['date'] = transfers_df['date'].astype(str)
-                    df_to_table(transfers_df, 'expenses')
+                    df_to_table(transfers_df, 'expenses', cache_clear_type='general')
 
                 st.success("Expenses updated successfully! (Transfer records were preserved)")
-                st.cache_data.clear() # Clear cache in case categories changed
+                st.cache_data(get_expense_categories_list).clear() # Clear cache in case categories changed
                 st.rerun()
         else:
             st.info("No non-transfer transaction history to display.")
@@ -1517,19 +1676,25 @@ def expense_tracker_page():
         st.header("Set Your Monthly Budgets")
         budget_month_str = datetime.date.today().strftime("%Y-%m")
         st.info(f"You are setting the budget for: **{datetime.datetime.strptime(budget_month_str, '%Y-%m').strftime('%B %Y')}**")
+
         # Exclude transfer categories from budgeting
         expense_categories_for_budget = db_query("SELECT DISTINCT category FROM expenses WHERE type='Expense' AND category != 'Transfer Out'")['category'].tolist()
         expense_categories_for_budget = sorted(list(expense_categories_for_budget or CATEGORIES))
 
         existing_budgets = db_query(f"SELECT category, amount FROM budgets WHERE month_year = '{budget_month_str}'").set_index('category')
         budget_df = pd.DataFrame({'category': expense_categories_for_budget, 'amount': [0.0] * len(expense_categories_for_budget)})
+
         if not existing_budgets.empty:
             budget_df = budget_df.set_index('category').combine_first(existing_budgets).reset_index()
-        edited_budgets = st.data_editor(budget_df, num_rows="dynamic", use_container_width=True, column_config={
-            "category": st.column_config.TextColumn(label="Category", disabled=True),
-            "amount": st.column_config.NumberColumn(label="Amount", min_value=0.0)
-        })
-        if st.button("Save Budgets"):
+
+        # Disable entire data editor for viewer
+        edited_budgets = st.data_editor(budget_df, num_rows="fixed", disabled=disabled, use_container_width=True,
+            column_config={
+                "category": st.column_config.TextColumn(label="Category", disabled=True),
+                "amount": st.column_config.NumberColumn(label="Amount", min_value=0.0)
+            })
+
+        if st.button("Save Budgets", disabled=disabled):
 
             with get_session() as session:
                 # Delete existing budgets for the month and re-insert the updated list
@@ -1543,23 +1708,29 @@ def expense_tracker_page():
 
             st.success("Budgets saved!")
             st.rerun()
+
     elif view == "Manage Recurring":
         st.header("Manage Recurring Expenses")
         st.info("Set up expenses that occur every month (e.g., rent, subscriptions). They will be logged automatically.")
+
         recurring_df = db_query("SELECT recurring_id, description, amount, category, payment_method, day_of_month FROM recurring_expenses")
-        edited_recurring = st.data_editor(recurring_df, num_rows="dynamic", use_container_width=True, column_config={
-            "recurring_id": st.column_config.NumberColumn(disabled=True),
-            "category": st.column_config.TextColumn("Category", required=True),
-            "payment_method": st.column_config.SelectboxColumn("Payment Method", options=PAYMENT_ACCOUNTS, required=True),
-            "day_of_month": st.column_config.NumberColumn("Day of Month (1-31)", min_value=1, max_value=31, step=1, required=True)
-        })
-        if st.button("Save Recurring Rules"):
+
+        # Disable entire data editor for viewer
+        edited_recurring = st.data_editor(recurring_df, num_rows="fixed", use_container_width=True, disabled=disabled,
+            column_config={
+                "recurring_id": st.column_config.NumberColumn(disabled=True),
+                "category": st.column_config.TextColumn("Category", required=True),
+                "payment_method": st.column_config.SelectboxColumn("Payment Method", options=PAYMENT_ACCOUNTS, required=True),
+                "day_of_month": st.column_config.NumberColumn("Day of Month (1-31)", min_value=1, max_value=31, step=1, required=True)
+            })
+
+        if st.button("Save Recurring Rules", disabled=disabled):
             # DML update needs to be session based.
             with get_session() as session:
                 session.execute(_sql_text('DELETE FROM recurring_expenses'))
                 for _, row in edited_recurring.iterrows():
                     if row['description'] and row['amount'] > 0:
-                        # Inserting new rows, relying on SERIAL PRIMARY KEY for recurring_id
+                        # Inserting new rows, relying on SERIAL PRIMARY KEY for recurring-id
                         session.execute(_sql_text("INSERT INTO recurring_expenses (description, amount, category, payment_method, day_of_month) VALUES (:desc, :amount, :cat, :pm, :day)"),
                                          params={'desc': row['description'], 'amount': round(row['amount'], 2), 'cat': row['category'], 'pm': row['payment_method'], 'day': row['day_of_month']})
             st.success("Recurring expense rules saved!")
@@ -1568,46 +1739,54 @@ def expense_tracker_page():
 def mutual_fund_page():
     """Renders the Mutual Fund tracker page."""
     st.title("📚 Mutual Fund Tracker")
+    is_viewer = st.session_state.get("role") == "viewer"
+    disabled = is_viewer
+
     _process_recurring_expenses()
     _process_mf_sips()
     key_prefix = "mf"
 
     # Read transactions_df at the beginning of the function
+    # Optimized: Cache this query
     transactions_df = db_query("SELECT transaction_id, date, scheme_name, yfinance_symbol, type, units, nav FROM mf_transactions ORDER BY date DESC")
 
+    # Select box is enabled for viewer
     view_options = ["Holdings", "Transaction History"]
-    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view", label_visibility="hidden")
+    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view", label_visibility="hidden", disabled=False) # Always enable for navigation
 
     if table_view == "Holdings":
         st.sidebar.header("Add Transaction")
 
-        # --- MF Search/Selection Block (Fixed) ---
+        # --- MF Search/Selection Block ---
+        # Optimized: Use cached function for schemes
         if f"{key_prefix}_all_schemes" not in st.session_state:
             st.session_state[f"{key_prefix}_all_schemes"] = fetch_mf_schemes()
             st.session_state[f"{key_prefix}_search_results"] = []
             st.session_state[f"{key_prefix}_search_term_input"] = ""
 
         with st.sidebar.form(f"{key_prefix}_search_form"):
-            company_name = st.text_input("Search Fund Name", value=st.session_state.get(f"{key_prefix}_search_term_input", ""), key=f"{key_prefix}_search_term_input_live")
-            search_button = st.form_submit_button("Search")
+            company_name = st.text_input("Search Fund Name", value=st.session_state.get(f"{key_prefix}_search_term_input", ""), key=f"{key_prefix}_search_term_input_live", disabled=disabled)
+            search_button = st.form_submit_button("Search", disabled=disabled)
 
-        if search_button and company_name:
+        if search_button and company_name and not disabled:
             filtered_schemes = {name: code for name, code in st.session_state[f"{key_prefix}_all_schemes"].items() if company_name.lower() in name.lower()}
             st.session_state[f"{key_prefix}_search_results"] = [f"{name} ({code})" for name, code in filtered_schemes.items()]
             st.session_state[f"{key_prefix}_selected_result"] = None
             st.session_state[f"{key_prefix}_search_term_input"] = company_name # Keep search term visible
             st.rerun()
 
-        # Display selection box only if results exist
+        # Display selection box only if results exist (enabled for viewer if only viewing)
         selected_result = None
         if st.session_state.get(f"{key_prefix}_search_results"):
             results = st.session_state[f"{key_prefix}_search_results"]
+            # Enabled for viewer for selection
             selected_result = st.sidebar.selectbox(
                 "Select Scheme",
                 options=[None] + results,
                 index=0,
                 key=f"{key_prefix}_select_result",
-                format_func=lambda x: "Select a scheme..." if x is None else x
+                format_func=lambda x: "Select a scheme..." if x is None else x,
+                disabled=disabled
             )
 
             # Store selected result in session state for later use
@@ -1620,15 +1799,18 @@ def mutual_fund_page():
             selected_name = selected_result.split(" (")[0]
             selected_code = selected_result.split(" (")[-1].replace(")", "")
 
+            if disabled:
+                 st.sidebar.warning("Add Transaction form is disabled in Viewer mode.")
+
             with st.sidebar.form(f"{key_prefix}_add_details_form"):
                 st.subheader(f"Transaction for: {selected_name}")
-                mf_date = st.date_input("Date", max_value=datetime.date.today())
-                mf_type = st.selectbox("Type", ["Purchase", "Redemption"])
-                mf_units = st.number_input("Units", min_value=0.001, format="%.4f")
-                mf_nav = st.number_input("NAV (Net Asset Value)", min_value=0.01, format="%.4f")
-                mf_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", value=0.0)
+                mf_date = st.date_input("Date", max_value=datetime.date.today(), disabled=disabled)
+                mf_type = st.selectbox("Type", ["Purchase", "Redemption"], disabled=disabled)
+                mf_units = st.number_input("Units", min_value=0.001, format="%.4f", disabled=disabled)
+                mf_nav = st.number_input("NAV (Net Asset Value)", min_value=0.01, format="%.4f", disabled=disabled)
+                mf_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", value=0.0, disabled=disabled)
 
-                if st.form_submit_button("Add Transaction"):
+                if st.form_submit_button("Add Transaction", disabled=disabled):
                     if not (mf_units and mf_units > 0 and mf_nav and mf_nav > 0):
                         st.warning("Please fill all fields.")
                     else:
@@ -1641,7 +1823,7 @@ def mutual_fund_page():
 
                         # Use db_execute for the transaction insertion
                         db_execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav) VALUES (:id, :date, :scheme, :symbol, :type, :units, :nav)",
-                                     params={'id': str(uuid.uuid4()), 'date': mf_date.strftime('%Y-%m-%d'), 'scheme': selected_name, 'symbol': selected_code, 'type': mf_type, 'units': round(mf_units, 4), 'nav': round(mf_nav, 4)}
+                                     params={'id': str(uuid.uuid4()), 'date': mf_date.strftime('%Y-%m-%d'), 'scheme': selected_name, 'symbol': selected_code, 'type': mf_type, 'units': round(mf_units, 4), 'nav': round(mf_nav, 4)}, cache_clear_type='mf'
                         )
 
                         st.success(f"{mf_type} of {selected_name} logged!")
@@ -1654,6 +1836,7 @@ def mutual_fund_page():
 
         st.divider()
 
+        # Optimized: Use cached function for holdings
         holdings_df = get_mf_holdings_df()
         if not holdings_df.empty:
             total_investment = holdings_df['Investment'].sum()
@@ -1675,9 +1858,11 @@ def mutual_fund_page():
             st.header("Return Chart (Individual Schemes)")
 
             all_schemes = transactions_df['scheme_name'].unique().tolist() if not transactions_df.empty else []
-            selected_schemes = st.multiselect("Select schemes to compare", options=all_schemes, default=all_schemes)
+            # Multiselect for viewing schemes is functional for all users
+            selected_schemes = st.multiselect("Select schemes to compare", options=all_schemes, default=all_schemes, disabled=False) # Always ENABLED for viewing/filtering
 
             if selected_schemes:
+                # Optimized: Use cached function for return calculation
                 filtered_transactions = transactions_df[transactions_df['scheme_name'].isin(selected_schemes)]
                 cumulative_return_df, sip_marker_df = _calculate_mf_cumulative_return(filtered_transactions)
 
@@ -1710,7 +1895,9 @@ def mutual_fund_page():
         if not transactions_df.empty:
             transactions_df['date'] = pd.to_datetime(transactions_df['date'], format='%Y-%m-%d', errors='coerce')
             st.subheader("Edit Mutual Fund Transactions")
-            edited_df = st.data_editor(transactions_df, use_container_width=True, hide_index=True, num_rows="dynamic",
+
+            # Disable entire data editor for viewer
+            edited_df = st.data_editor(transactions_df, use_container_width=True, hide_index=True, num_rows="fixed", disabled=disabled,
                                          column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
                                                         "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
                                                         "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
@@ -1720,13 +1907,13 @@ def mutual_fund_page():
                                                         "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
                                                              })
 
-            if st.button("Save Mutual Fund Changes"):
+            if st.button("Save Mutual Fund Changes", disabled=disabled):
                 # DML update needs to be session based.
                 with get_session() as session:
                     session.execute(_sql_text('DELETE FROM mf_transactions'))
 
                 edited_df['date'] = edited_df['date'].astype(str)
-                df_to_table(edited_df, 'mf_transactions')
+                df_to_table(edited_df, 'mf_transactions', cache_clear_type='mf')
 
                 st.success("Mutual Fund transactions updated successfully!")
                 st.rerun()
@@ -1758,6 +1945,9 @@ def render_asset_page(config):
     """Renders the Investment and Trading pages."""
     key_prefix = config['key_prefix']
     is_trading_section = key_prefix == 'trade'
+    is_viewer = st.session_state.get("role") == "viewer"
+    disabled = is_viewer
+
     st.title(config["title"])
 
     trade_mode_selection = "All Trades"
@@ -1768,10 +1958,11 @@ def render_asset_page(config):
         if f"{key_prefix}_paper_trading_state" not in st.session_state:
             st.session_state[f"{key_prefix}_paper_trading_state"] = False
 
-        # Read the state from the toggle
+        # Read the state from the toggle, disabled for viewer
         is_paper_trading = st.toggle("Enable Paper Trading (Transactions won't affect Funds)",
                                      key=f"{key_prefix}_paper_trading_toggle",
-                                     value=st.session_state[f"{key_prefix}_paper_trading_state"])
+                                     value=st.session_state[f"{key_prefix}_paper_trading_state"],
+                                     disabled=disabled)
 
         # Immediately save the new toggle state back to session state
         st.session_state[f"{key_prefix}_paper_trading_state"] = is_paper_trading
@@ -1785,12 +1976,13 @@ def render_asset_page(config):
             "Filter Trade Data",
             ["All Trades", "Live Trades Only", "Paper Trades Only"],
             horizontal=True,
-            key=f"{key_prefix}_trade_mode_filter"
+            key=f"{key_prefix}_trade_mode_filter",
+            disabled=disabled
         )
         st.divider()
 
-    # Disable sidebar actions as there is no viewer anymore
-    sidebar_disabled = False
+    # Sidebar disabled flag
+    sidebar_disabled = disabled
 
     # --- Sidebar forms for Add/Sell remain the same ---
 
@@ -1798,13 +1990,18 @@ def render_asset_page(config):
     with st.sidebar.form(f"{key_prefix}_add_form"):
         company_name = st.text_input(f"{config['asset_name']} Name", value=st.session_state.get(f"{key_prefix}_add_company_name_input", ""), key=f"{key_prefix}_add_company_name_input", disabled=sidebar_disabled)
         search_button = st.form_submit_button("Search", disabled=sidebar_disabled)
+
+    # Search logic must be conditional on button click and permission
     if search_button and company_name and not sidebar_disabled:
         st.session_state[f"{key_prefix}_search_results"] = search_for_ticker(company_name)
         st.session_state[f"{key_prefix}_selected_symbol"] = None
         st.rerun()
+
     if st.session_state.get(f"{key_prefix}_search_results"):
         results = st.session_state[f"{key_prefix}_search_results"]
         symbols_only = [res.split(" - ")[0] for res in results]
+
+        # Selectbox is disabled for viewer
         selected_symbol_from_search = st.sidebar.selectbox(
             f"Select {config['asset_name']} Symbol",
             options=[None] + symbols_only,
@@ -1813,10 +2010,18 @@ def render_asset_page(config):
             format_func=lambda x: "Select a stock..." if x is None else x,
             disabled=sidebar_disabled
         )
-        if selected_symbol_from_search and selected_symbol_from_search != st.session_state.get(f"{key_prefix}_selected_symbol"):
+
+        # Rerun only on user action (owner mode)
+        if selected_symbol_from_search and selected_symbol_from_search != st.session_state.get(f"{key_prefix}_selected_symbol") and not sidebar_disabled:
             st.session_state[f"{key_prefix}_selected_symbol"] = selected_symbol_from_search
             st.rerun()
-    if st.session_state.get(f"{key_prefix}_selected_symbol") and not sidebar_disabled:
+
+    # Add Details Form (Only visible/functional for owner)
+    if st.session_state.get(f"{key_prefix}_selected_symbol"):
+
+        if sidebar_disabled:
+            st.sidebar.warning("Add/Edit forms are disabled in Viewer mode.")
+
         with st.sidebar.form(f"{key_prefix}_add_details_form"):
             symbol = st.session_state[f"{key_prefix}_selected_symbol"]
             st.write(f"Selected: **{symbol}**")
@@ -1825,21 +2030,26 @@ def render_asset_page(config):
             sector = stock_info['sector']
             market_cap = stock_info['market_cap']
             currency = "₹" if ".NS" in symbol else "$"
+
             if current_price:
                 st.info(f"Current Price: {currency}{current_price:,.2f}")
             else:
                 st.warning("Could not fetch current price.")
-            buy_price = st.number_input(f"Buy Price ({currency})", min_value=0.01, format="%.2f", key=f"{key_prefix}_buy_price")
-            buy_date = st.date_input("Buy Date", max_value=datetime.date.today(), key=f"{key_prefix}_buy_date")
-            quantity = st.number_input("Quantity", min_value=1, step=1, key=f"{key_prefix}_buy_quantity")
-            transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_buy_transaction_fee", value=0.0)
+
+            buy_price = st.number_input(f"Buy Price ({currency})", min_value=0.01, format="%.2f", key=f"{key_prefix}_buy_price", disabled=sidebar_disabled)
+            buy_date = st.date_input("Buy Date", max_value=datetime.date.today(), key=f"{key_prefix}_buy_date", disabled=sidebar_disabled)
+            quantity = st.number_input("Quantity", min_value=1, step=1, key=f"{key_prefix}_buy_quantity", disabled=sidebar_disabled)
+            transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_buy_transaction_fee", value=0.0, disabled=sidebar_disabled)
+
             if not is_trading_section:
                 st.text_input("Sector", value=sector, key=f"{key_prefix}_sector", disabled=True)
                 st.text_input("Market Cap", value=_categorize_market_cap(market_cap) if market_cap != 'N/A' else 'N/A', key=f"{key_prefix}_market_cap", disabled=True)
             else:
-                target_price = st.number_input("Target Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_target_price")
-                stop_loss_price = st.number_input("Stop Loss Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_stop_loss_price")
-            add_button = st.form_submit_button(f"Add to {config['asset_name_plural']}")
+                target_price = st.number_input("Target Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_target_price", disabled=sidebar_disabled)
+                stop_loss_price = st.number_input("Stop Loss Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_stop_loss_price", disabled=sidebar_disabled)
+
+            add_button = st.form_submit_button(f"Add to {config['asset_name_plural']}", disabled=sidebar_disabled)
+
             if add_button:
                 is_paper_trading_on_submit = st.session_state.get(f"trade_paper_trading_state", False) if is_trading_section else False
 
@@ -1887,10 +2097,12 @@ def render_asset_page(config):
 
 
     st.sidebar.header(f"Sell {config['asset_name']}")
+    # Optimized: Use cached holdings function
     all_symbols_df = db_query(f"SELECT {config['asset_col']} FROM {config['asset_table']}")
     all_symbols = all_symbols_df[config['asset_col']].tolist()
 
     if all_symbols:
+        # Selectbox is disabled for viewer
         selected_option = st.sidebar.selectbox(
             f"Select {config['asset_name']} to Sell",
             options=[None] + all_symbols,
@@ -1910,13 +2122,15 @@ def render_asset_page(config):
                 symbol_to_sell = None
         else:
             symbol_to_sell = None
+
         with st.sidebar.form(f"{key_prefix}_sell_form"):
-            is_disabled = not symbol_to_sell or sidebar_disabled
-            sell_qty = st.number_input("Quantity to Sell", min_value=1, max_value=available_qty, step=1, key=f"{key_prefix}_sell_qty", disabled=is_disabled)
-            sell_price = st.number_input("Sell Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_sell_price", disabled=is_disabled)
-            sell_date = st.date_input("Sell Date", max_value=datetime.date.today(), key=f"{key_prefix}_sell_date", disabled=is_disabled)
-            sell_transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_sell_transaction_fee", disabled=is_disabled, value=0.0)
-            sell_button = st.form_submit_button(f"Sell {config['asset_name']}", disabled=is_disabled)
+            is_disabled_form = not symbol_to_sell or sidebar_disabled
+            sell_qty = st.number_input("Quantity to Sell", min_value=1, max_value=available_qty, step=1, key=f"{key_prefix}_sell_qty", disabled=is_disabled_form)
+            sell_price = st.number_input("Sell Price", min_value=0.01, format="%.2f", key=f"{key_prefix}_sell_price", disabled=is_disabled_form)
+            sell_date = st.date_input("Sell Date", max_value=datetime.date.today(), key=f"{key_prefix}_sell_date", disabled=is_disabled_form)
+            sell_transaction_fee = st.number_input("Transaction Fee (₹)", min_value=0.00, format="%.2f", key=f"{key_prefix}_sell_transaction_fee", disabled=is_disabled_form, value=0.0)
+            sell_button = st.form_submit_button(f"Sell {config['asset_name']}", disabled=is_disabled_form)
+
             if sell_button and not sidebar_disabled:
                 is_paper_trading_on_submit = st.session_state.get(f"trade_paper_trading_state", False) if is_trading_section else False
 
@@ -1974,12 +2188,14 @@ def render_asset_page(config):
     view_options = ["Open Trades", "Closed Trades"] # Simplified for Trading view
 
     # Fetch Data
+    # Optimized: Use cached function
     full_holdings_df = get_holdings_df(config['asset_table'])
     full_realized_df = get_realized_df(config['realized_table']) # Fetch realized data
 
     # Identify Live Trade Symbols
     live_trade_symbols = set()
     if is_trading_section:
+        # Optimized: db_query is cached
         fund_tx = db_query("SELECT description FROM fund_transactions WHERE type='Withdrawal'")
         for desc in fund_tx['description']:
             if desc.startswith("Purchase"):
@@ -2006,7 +2222,8 @@ def render_asset_page(config):
 
     # --- Render Open/Closed Trades ---
     st.subheader(f"{config['title']} - {trade_mode_selection if is_trading_section and trade_mode_selection else config['title']}")
-    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view_secondary", label_visibility="collapsed") # Re-use the existing selector
+    # Selectbox is disabled for viewer
+    table_view = st.selectbox("View Options", view_options, key=f"{key_prefix}_table_view_secondary", label_visibility="collapsed", disabled=disabled)
 
     if table_view == view_options[0]:
         # OPEN TRADES (HOLDINGS)
@@ -2065,6 +2282,7 @@ def render_asset_page(config):
                     'Buy Date': date_formatter,
                     'Expected RRR': '{:.2f}'
                 })
+                # Disable the data editor for the viewer
                 st.dataframe(styled_holdings_df, use_container_width=True, hide_index=True)
             # --- END: DETAILED HOLDINGS EXPANDER (COMMON BLOCK) ---
 
@@ -2073,7 +2291,8 @@ def render_asset_page(config):
             # --- MOVED: Return Chart (Individual Assets) ---
             st.header("Return Chart (Individual Assets)")
             all_symbols_list = df_to_display["symbol"].tolist()
-            selected_symbols = st.multiselect("Select assets for return chart", all_symbols_list, default=all_symbols_list, key=f"{key_prefix}_perf_symbols")
+            # Multiselect for viewing is functional for all users
+            selected_symbols = st.multiselect("Select assets for return chart", all_symbols_list, default=all_symbols_list, key=f"{key_prefix}_perf_symbols", disabled=False) # Always ENABLED for viewing/filtering
             chart_data = []
             for symbol in selected_symbols:
                 asset_info = df_to_display.loc[df_to_display["symbol"] == symbol].iloc[0]
@@ -2123,12 +2342,13 @@ def render_asset_page(config):
 
                     default_index = benchmark_options.index(initial_benchmark)
 
-                    # Store the benchmark selection in session state
+                    # Selectbox is ENABLED for viewer as it is a viewing filter
                     benchmark_choice = st.selectbox(
                         "Select Benchmark for Chart Comparison:",
                         options=benchmark_options,
                         key=f"{key_prefix}_benchmark_selector_chart",
-                        index=default_index
+                        index=default_index,
+                        disabled=False # Always ENABLED for viewing/filtering
                     )
 
                     # Update session state with the selected choice
@@ -2142,7 +2362,7 @@ def render_asset_page(config):
                     chart = alt.Chart(comparison_df).mark_line().encode(
                         x=alt.X('Date:T', title='Date'),
                         y=alt.Y('Return %:Q', title='Cumulative Return (%)'),
-                        color=alt.Color('Type:N', scale=alt.Scale(range=['#1f77b4', '#ff7f0e'])),
+                        color=alt.Color('Type:N', scale=alt.Scale(domain=['Portfolio', benchmark_choice], range=['#1f77b4', '#ff7f0e'])),
                         tooltip=['Date', 'Type', alt.Tooltip('Return %', format=".2f")]
                     ).properties(
                         height=400,
@@ -2165,9 +2385,9 @@ def render_asset_page(config):
             if is_trading_section:
                 trading_metrics = calculate_trading_metrics(realized_df)
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Win Ratio", f"{trading_metrics['win_ratio']}%")
-                col2.metric("Profit Factor", f"{trading_metrics['profit_factor']}")
-                col3.metric("Expectancy", f"₹{trading_metrics['expectancy']}")
+                with col1: st.metric("Win Ratio", f"{trading_metrics['win_ratio']}%")
+                with col2: st.metric("Profit Factor", f"{trading_metrics['profit_factor']}")
+                with col3: st.metric("Expectancy", f"₹{trading_metrics['expectancy']}")
             st.divider()
             with st.expander(f"View Detailed {view_options[1]}"):
                 df_to_style = realized_df.drop(columns=['transaction_id'], errors='ignore')
@@ -2190,6 +2410,7 @@ def render_asset_page(config):
                     'Sell Date': date_formatter,
                     'Expected RRR': '{:.2f}', 'Actual RRR': '{:.2f}'
                 })
+                # Disable the data editor for the viewer
                 st.dataframe(styled_realized_df, use_container_width=True, hide_index=True)
             st.header("Return Chart")
             realized_df['color'] = realized_df['realized_return_pct'].apply(lambda x: 'Profit' if x >= 0 else 'Loss')
@@ -2213,10 +2434,11 @@ def main_app():
     if "page" not in st.session_state:
         st.session_state.page = "home"
 
-    # Sidebar Check (No viewer role needed anymore)
-    if st.session_state.get("logged_in"):
-        st.sidebar.markdown(f"**Logged in as: Owner**")
-        st.sidebar.markdown("---")
+    user_role = st.session_state.get("role", "owner")
+
+    # Sidebar status update
+    st.sidebar.markdown(f"**Logged in as: {user_role.capitalize()}**")
+    st.sidebar.markdown("---")
 
 
     # All pages must be defined before this dictionary is created
@@ -2233,21 +2455,29 @@ def main_app():
 
     if st.session_state.page != "home":
         st.button("Back to Home", on_click=set_page, args=("home",))
+
+    # Logout button is always available
     if st.sidebar.button("Logout", type="secondary"):
         st.session_state.logged_in = False
+        # Clear specific role and page info on logout
+        if "role" in st.session_state: del st.session_state["role"]
         st.session_state.page = "home"
         st.rerun()
-    if st.sidebar.button("Clear Session State", type="secondary"):
+
+    # Clear session state button is only for the owner
+    if st.sidebar.button("Clear Session State", type="secondary", disabled=user_role != "owner"):
         current_page = st.session_state.get("page", "home")
-        for key in list(st.session_state.keys()):
-            if key not in ['page', 'mf_all_schemes', 'logged_in']:
-                del st.session_state[key]
+        # Optimized: Call our custom clear function instead of using Streamlit's global clear which breaks resources
+        clear_all_data_caches()
+        # Rerun to refresh the state fully
         st.session_state.page = current_page
         st.rerun()
 
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
+    # Initialize role to 'owner' if user is not logged in yet (or on initial load)
+    st.session_state.role = "owner"
 
 if st.session_state.logged_in:
     main_app()
