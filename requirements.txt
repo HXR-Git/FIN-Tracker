@@ -8,3 +8,4 @@ altair
 psycopg2-binary  # MUST be included for PostgreSQL connection
 mftool
 deprecated
+#end

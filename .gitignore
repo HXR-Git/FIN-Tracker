@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 finance.db
 .DS_Store
+#end
