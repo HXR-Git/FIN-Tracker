@@ -40,6 +40,9 @@ def clear_mf_caches():
     st.cache_data(get_mf_holdings_df).clear()
     st.cache_data(_calculate_mf_cumulative_return).clear()
     st.cache_data(get_combined_returns).clear()
+    # Clear the fundamental transaction data which affects MF P&L calculations
+    st.cache_data(get_fund_transactions_df).clear()
+    st.cache_data(get_live_trade_symbols).clear()
 
 def clear_all_data_caches():
     """Clears the most common data caches (DB reads and computed holdings)."""
@@ -48,6 +51,12 @@ def clear_all_data_caches():
     st.cache_data(get_realized_df).clear()
     st.cache_data(get_current_portfolio_allocation).clear()
     st.cache_data(get_combined_returns).clear()
+
+    # Clear the core transaction and expense data caches
+    st.cache_data(get_fund_transactions_df).clear()
+    st.cache_data(get_all_expenses_df).clear()
+    st.cache_data(get_live_trade_symbols).clear()
+
     # Also clear MF caches, just in case
     clear_mf_caches()
 
@@ -128,6 +137,9 @@ def db_execute(sql: str, params: dict = None, cache_clear_type='general'):
         clear_all_data_caches()
     elif cache_clear_type == 'mf':
         clear_mf_caches()
+    elif cache_clear_type == 'none':
+        # Don't clear caches, used primarily for DDL in init
+        pass
 
     try:
         with get_session() as session:
@@ -168,21 +180,22 @@ def df_to_table(df: pd.DataFrame, table_name: str, if_exists: str = 'append', ca
                 logging.warning(f"Failed inserting row into {table_name}: {ex}")
 
 # ------------------ APP CONFIG ------------------
-USERNAME = st.secrets.get("auth", {}).get("username", "HXR")
-PASSWORD = st.secrets.get("auth", {}).get("password", "Rossph")
+# NOTE: Credentials now rely solely on st.secrets, removing hardcoded defaults for security.
+USERNAME = st.secrets.get("auth", {}).get("username")
+PASSWORD = st.secrets.get("auth", {}).get("password")
 
 # --- VIEWER CREDENTIALS ---
 # Viewer uses VIEWER_USERNAME as the Access Code, password is ignored for UI simplicity
-VIEWER_USERNAME = st.secrets.get("auth", {}).get("viewer_username", "viewer")
-VIEWER_PASSWORD = st.secrets.get("auth", {}).get("viewer_password", "viewpassword")
+VIEWER_USERNAME = st.secrets.get("auth", {}).get("viewer_username")
+VIEWER_PASSWORD = st.secrets.get("auth", {}).get("viewer_password")
 # --------------------------
 
 def login_page():
     # --- Dark Color Schema ---
     BACKGROUND_COLOR = "#0F172A"  # Dark Slate Blue
     CARD_COLOR = "#1F2937"        # Dark Grey/Slate for Card
-    PRIMARY_COLOR = "#10B981"     # Emerald Green Accent
-    TEXT_COLOR = "#F3F4F6"        # Light Text
+    PRIMARY_COLOR = "#10B981"      # Emerald Green Accent
+    TEXT_COLOR = "#F3F4F6"         # Light Text
 
     # Inject custom CSS for a superb dark login page
     st.markdown(f"""
@@ -305,11 +318,13 @@ def login_page():
 
                 if not is_viewer:
                     # Owner login attempt
+                    # USERNAME and PASSWORD are read from st.secrets.
                     if st.session_state.get("form_owner_username") == USERNAME and st.session_state.get("form_owner_password") == PASSWORD:
                         login_successful = True
                         role = "owner"
                 else:
                     # Viewer login attempt (using access code only)
+                    # VIEWER_USERNAME is read from st.secrets.
                     if st.session_state.get("form_viewer_access_code") == VIEWER_USERNAME:
                         login_successful = True
                         role = "viewer"
@@ -392,6 +407,59 @@ def bollinger(close, period=20, std_dev=2):
     upper_band = rolling_mean + (rolling_std * std_dev)
     lower_band = rolling_mean - (rolling_std * std_dev)
     return upper_band, rolling_mean, lower_band
+
+# ------------------ CACHED TRANSACTION DATA FETCHERS (NEW) ------------------
+@st.cache_data(ttl=180, show_spinner=False)
+def get_fund_transactions_df():
+    """Fetches and processes fund transactions for display and balance calculation."""
+    # Query all fund transactions
+    fund_df = db_query("SELECT transaction_id, date, type, amount, description, transfer_group_id FROM fund_transactions")
+    if fund_df.empty:
+        return pd.DataFrame()
+
+    fund_df['date'] = pd.to_datetime(fund_df['date'], format='%Y-%m-%d', errors='coerce')
+    fund_df['balance'] = fund_df.apply(lambda row: row['amount'] if row['type'] == 'Deposit' else -row['amount'], axis=1)
+
+    # Calculate cumulative balance on a chronologically sorted copy for accuracy
+    chronological_df = fund_df.copy()
+    # Primary sort by date (ASC), secondary sort by ID (ASC) to ensure correct chronological cumulative sum
+    chronological_df.sort_values(['date', 'transaction_id'], ascending=[True, True], inplace=True)
+    chronological_df['cumulative_balance'] = chronological_df['balance'].cumsum()
+
+    # Merge the cumulative balance back onto the display DF
+    fund_df = fund_df.merge(
+        chronological_df[['transaction_id', 'cumulative_balance']],
+        on='transaction_id',
+        how='left'
+    )
+    # Final sort for display (newest day first, NEWEST entry first within the day)
+    fund_df.sort_values(['date', 'transaction_id'], ascending=[False, False], inplace=True)
+    return fund_df
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_all_expenses_df():
+    """Fetches all raw expense/income/transfer data for dashboard and history views."""
+    all_expenses_df = db_query("SELECT * from expenses")
+    if all_expenses_df.empty:
+        return pd.DataFrame()
+    all_expenses_df['date'] = pd.to_datetime(all_expenses_df['date'])
+    return all_expenses_df
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_live_trade_symbols():
+    """Identifies and caches the set of stock symbols linked to fund withdrawals."""
+    fund_tx = db_query("SELECT description FROM fund_transactions WHERE type='Withdrawal'")
+    live_trade_symbols = set()
+    if not fund_tx.empty:
+        for desc in fund_tx['description']:
+            # Example: "Purchase 10 units of AAPL"
+            if desc.startswith("Purchase"):
+                parts = desc.split(' of ')
+                if len(parts) > 1:
+                    live_trade_symbols.add(parts[-1].strip())
+    return live_trade_symbols
+# ------------------ END CACHED TRANSACTION DATA FETCHERS ------------------
+
 
 # ------------------ DATA FETCHERS ------------------
 
@@ -634,17 +702,8 @@ def get_mf_holdings_df():
 @st.cache_data(ttl=180, show_spinner=False)
 def get_combined_returns():
     try:
-        # Optimized: Fetch descriptions only once
-        fund_tx_df = db_query("SELECT description, type, amount, date FROM fund_transactions")
-
-        live_trade_symbols = set()
-        if not fund_tx_df.empty:
-            live_trades_df = fund_tx_df[fund_tx_df['type'] == 'Withdrawal']
-            for desc in live_trades_df['description']:
-                if desc.startswith("Purchase"):
-                    parts = desc.split(' of ')
-                    if len(parts) > 1:
-                        live_trade_symbols.add(parts[-1].strip())
+        # Optimized: Use cached function for live trade symbols
+        live_trade_symbols = get_live_trade_symbols()
 
     except Exception as e:
         logging.error(f"Error loading live trade symbols in get_combined_returns: {e}")
@@ -686,8 +745,8 @@ def get_combined_returns():
 
     # Filter realized exits based on live trade symbols
     live_exits_df = realized_exits_df[realized_exits_df['symbol'].isin(live_trade_symbols)] if not realized_exits_df.empty else pd.DataFrame()
-    realized_inv       = float(realized_stocks_df['realized_profit_loss'].sum()) if not realized_stocks_df.empty else 0
-    realized_trade = float(live_exits_df['realized_profit_loss'].sum())           if not live_exits_df.empty       else 0
+    realized_inv         = float(realized_stocks_df['realized_profit_loss'].sum()) if not realized_stocks_df.empty else 0
+    realized_trade = float(live_exits_df['realized_profit_loss'].sum())            if not live_exits_df.empty        else 0
     realized_mf    = 0
 
     return {
@@ -1115,34 +1174,19 @@ def funds_page():
             else:
                 st.warning("Withdrawal amount must be greater than zero.")
 
-    # Optimized: Cache this query (now handled by general db_query cache)
-    fund_df = db_query("SELECT transaction_id, date, type, amount, description FROM fund_transactions ORDER BY date DESC, transaction_id DESC")
+    # Optimized: Use cached function to retrieve pre-processed DataFrame
+    fund_df = get_fund_transactions_df()
 
     # --- CALCULATE AVAILABLE CASH ---
+    # The sum should be quick since it operates on the cached DF
     total_deposits, total_withdrawals = fund_df.loc[fund_df['type'] == 'Deposit', 'amount'].sum(), fund_df.loc[fund_df['type'] == 'Withdrawal', 'amount'].sum()
     available_capital = round(total_deposits - total_withdrawals, 2)
 
+
     if not fund_df.empty:
-        fund_df['date'] = pd.to_datetime(fund_df['date'], format='%Y-%m-%d', errors='coerce')
-        fund_df['balance'] = fund_df.apply(lambda row: row['amount'] if row['type'] == 'Deposit' else -row['amount'], axis=1)
-
+        # Calculate chronological_df for the chart only, as the full fund_df is already sorted and merged
         chronological_df = fund_df.copy()
-        # Primary sort by date (ASC), secondary sort by ID (ASC) to ensure correct chronological cumulative sum
-        chronological_df.sort_values(['date', 'transaction_id'], ascending=[True, True], inplace=True)
-
-        # Calculate cumulative balance on the chronologically sorted data
-        chronological_df['cumulative_balance'] = chronological_df['balance'].cumsum()
-
-        # Merge the cumulative balance back onto the display DF using the unique ID
-        fund_df = fund_df.merge(
-            chronological_df[['transaction_id', 'cumulative_balance']],
-            on='transaction_id',
-            how='left'
-        )
-
-        # Final sort for display (newest day first, NEWEST entry first within the day)
-        fund_df.sort_values(['date', 'transaction_id'], ascending=[False, False], inplace=True)
-
+        chronological_df.sort_values(['date', 'transaction_id'], ascending=[True, True], inplace=True) # Ensure chronological sort for cumsum
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Deposits", f"₹{total_deposits:,.2f}")
@@ -1281,14 +1325,14 @@ def expense_tracker_page():
                     # Use session for execution via db_execute helper
                     db_execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description) VALUES (:id, :date, :type, :amount, :cat, :pm, :desc)",
                                  params={
-                                    'id': str(uuid.uuid4()),
-                                    'date': trans_date.strftime("%Y-%m-%d"),
-                                    'type': trans_type,
-                                    'amount': round(trans_amount, 2),
-                                    'cat': final_cat,
-                                    'pm': trans_pm,
-                                    'desc': trans_desc
-                                }, cache_clear_type='general'
+                                     'id': str(uuid.uuid4()),
+                                     'date': trans_date.strftime("%Y-%m-%d"),
+                                     'type': trans_type,
+                                     'amount': round(trans_amount, 2),
+                                     'cat': final_cat,
+                                     'pm': trans_pm,
+                                     'desc': trans_desc
+                                 }, cache_clear_type='general'
                     )
                     st.success(f"{trans_type} added! Category: **{final_cat}**")
 
@@ -1306,20 +1350,19 @@ def expense_tracker_page():
     if view == "Dashboard":
         today = datetime.date.today()
         start_date_7days = today - datetime.timedelta(days=6)
-
-
         month_year = today.strftime("%Y-%m")
 
-        # Optimized: Only query full and current month data once
-        expenses_df = db_query(f"SELECT * FROM expenses WHERE date LIKE '{month_year}-%'")
-        all_time_expenses_df = db_query("SELECT * from expenses")
-        all_time_expenses_df['date'] = pd.to_datetime(all_time_expenses_df['date'])
+        # Optimized: Use cached function for all raw expense data
+        all_time_expenses_df = get_all_expenses_df()
 
         if all_time_expenses_df.empty:
             st.info("No expenses logged yet to display the dashboard.")
             return
 
-        # Optimized: db_query is cached
+        # Filter the cached full dataframe for the current month
+        expenses_df = all_time_expenses_df[all_time_expenses_df['date'].dt.strftime('%Y-%m') == month_year]
+
+        # Optimized: db_query for budgets is quick
         budgets_df = db_query(f"SELECT category, amount FROM budgets WHERE month_year = '{month_year}'").set_index('category')
         inflows_df = expenses_df[expenses_df['type'] == 'Income']
         outflows_df = expenses_df[expenses_df['type'] == 'Expense']
@@ -1352,12 +1395,12 @@ def expense_tracker_page():
 
 
         col2.metric("Total Spent this Month (Excl. Transfers)", f"₹{total_spent:,.2f}",
-                      help=f"**Spent Breakdown (This Month, Excl. Transfers):**\n{spent_help_text}")
+                     help=f"**Spent Breakdown (This Month, Excl. Transfers):**\n{spent_help_text}")
 
 
         col3.metric("Net Flow (Excl. Transfers)", f"₹{net_flow:,.2f}",
-                      delta_color="inverse" if net_flow >= 0 else "normal",
-                      help=f"**Net Remaining Breakdown (Includes all time funds movements):**\n{remaining_help_text}")
+                     delta_color="inverse" if net_flow >= 0 else "normal",
+                     help=f"**Net Remaining Breakdown (Includes all time funds movements):**\n{remaining_help_text}")
 
 
         # --- NEW METRIC: Available Amount (Budget - Spent) ---
@@ -1381,7 +1424,7 @@ def expense_tracker_page():
               available_help_text = "No budgets set for this month."
 
         col4.metric("Available Amount (Budget)", f"₹{total_available:,.2f}",
-                      help=f"**Available Amount Breakdown (Budget - Spent this month):**\n{available_help_text}")
+                     help=f"**Available Amount Breakdown (Budget - Spent this month):**\n{available_help_text}")
 
         # --- END NEW METRIC ---
 
@@ -1631,15 +1674,21 @@ def expense_tracker_page():
     elif view == "Transaction History":
         st.header("Transaction History")
 
-        all_expenses_df = db_query("SELECT expense_id, date, type, amount, category, payment_method, description FROM expenses WHERE category NOT IN ('Transfer Out', 'Transfer In') ORDER BY date DESC, expense_id DESC")
+        # Optimized: Use cached function and filter
+        all_expenses_df = get_all_expenses_df()
 
-        if not all_expenses_df.empty:
-            all_expenses_df['date'] = pd.to_datetime(all_expenses_df['date'], format='%Y-%m-%d', errors='coerce').dt.date
+        # Exclude transfers for this view
+        non_transfer_expenses_df = all_expenses_df[all_expenses_df['category'].isin(['Transfer Out', 'Transfer In']) == False].sort_values(['date', 'expense_id'], ascending=[False, False])
+
+        if not non_transfer_expenses_df.empty:
+            all_expenses_df = non_transfer_expenses_df.copy()
+            all_expenses_df['date'] = all_expenses_df['date'].dt.date
 
             editable_categories = sorted(list(set(all_expenses_df['category'].unique().tolist() + CATEGORIES)))
 
             # Disable entire data editor for viewer
-            edited_df = st.data_editor(all_expenses_df, use_container_width=True, hide_index=True, num_rows="fixed", disabled=disabled,
+            edited_df = st.data_editor(all_expenses_df[['expense_id', 'date', 'type', 'amount', 'category', 'payment_method', 'description']],
+                                         use_container_width=True, hide_index=True, num_rows="fixed", disabled=disabled,
                                          column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
                                                         "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
                                                         "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
@@ -1746,8 +1795,7 @@ def mutual_fund_page():
     _process_mf_sips()
     key_prefix = "mf"
 
-    # Read transactions_df at the beginning of the function
-    # Optimized: Cache this query
+    # Read transactions_df from DB (not cached here, relies on core cache)
     transactions_df = db_query("SELECT transaction_id, date, scheme_name, yfinance_symbol, type, units, nav FROM mf_transactions ORDER BY date DESC")
 
     # Select box is enabled for viewer
@@ -1800,7 +1848,7 @@ def mutual_fund_page():
             selected_code = selected_result.split(" (")[-1].replace(")", "")
 
             if disabled:
-                 st.sidebar.warning("Add Transaction form is disabled in Viewer mode.")
+                st.sidebar.warning("Add Transaction form is disabled in Viewer mode.")
 
             with st.sidebar.form(f"{key_prefix}_add_details_form"):
                 st.subheader(f"Transaction for: {selected_name}")
@@ -1905,7 +1953,7 @@ def mutual_fund_page():
                                                         "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
                                                         "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
                                                         "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True)
-                                                             })
+                                                               })
 
             if st.button("Save Mutual Fund Changes", disabled=disabled):
                 # DML update needs to be session based.
@@ -2071,19 +2119,19 @@ def render_asset_page(config):
 
                             if is_trading_section:
                                 session.execute(_sql_text(f"UPDATE {config['asset_table']} SET buy_price=:price, quantity=:qty, target_price=:target, stop_loss_price=:stop WHERE {config['asset_col']}=:symbol"),
-                                                params={'price': round(new_avg_price, 2), 'qty': new_quantity, 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2), 'symbol': symbol})
+                                                 params={'price': round(new_avg_price, 2), 'qty': new_quantity, 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2), 'symbol': symbol})
                             else:
                                 session.execute(_sql_text(f"UPDATE {config['asset_table']} SET buy_price=:price, quantity=:qty, sector=:sector, market_cap=:mc WHERE {config['asset_col']}=:symbol"),
-                                                params={'price': round(new_avg_price, 2), 'qty': new_quantity, 'sector': sector, 'mc': _categorize_market_cap(market_cap), 'symbol': symbol})
+                                                 params={'price': round(new_avg_price, 2), 'qty': new_quantity, 'sector': sector, 'mc': _categorize_market_cap(market_cap), 'symbol': symbol})
 
                             st.success(f"Updated {symbol}. New quantity: {new_quantity}, New avg. price: {currency}{new_avg_price:,.2f}")
                         else:
                             if is_trading_section:
                                 session.execute(_sql_text(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, target_price, stop_loss_price) VALUES (:symbol, :price, :date, :qty, :target, :stop)"),
-                                                params={'symbol': symbol, 'price': round(buy_price, 2), 'date': buy_date.strftime("%Y-%m-%d"), 'qty': quantity, 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2)})
+                                                 params={'symbol': symbol, 'price': round(buy_price, 2), 'date': buy_date.strftime("%Y-%m-%d"), 'qty': quantity, 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2)})
                             else:
                                 session.execute(_sql_text(f"INSERT INTO {config['asset_table']} ({config['asset_col']}, buy_price, buy_date, quantity, sector, market_cap) VALUES (:symbol, :price, :date, :qty, :sector, :mc)"),
-                                                params={'symbol': symbol, 'price': round(buy_price, 2), 'date': buy_date.strftime("%Y-%m-%d"), 'qty': quantity, 'sector': sector, 'mc': _categorize_market_cap(market_cap)})
+                                                 params={'symbol': symbol, 'price': round(buy_price, 2), 'date': buy_date.strftime("%Y-%m-%d"), 'qty': quantity, 'sector': sector, 'mc': _categorize_market_cap(market_cap)})
 
                             st.success(f"{symbol} added successfully!")
 
@@ -2164,10 +2212,10 @@ def render_asset_page(config):
                     with get_session() as session:
                         if is_trading_section:
                             session.execute(_sql_text(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct, target_price, stop_loss_price) VALUES (:id, :symbol, :bprice, :bdate, :qty, :sprice, :sdate, :ret, :target, :stop)"),
-                                            params={'id': transaction_id, 'symbol': symbol_to_sell, 'bprice': round(buy_price, 2), 'bdate': buy_date, 'qty': sell_qty, 'sprice': round(sell_price, 2), 'sdate': sell_date.strftime("%Y-%m-%d"), 'ret': round(realized_return, 2), 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2)})
+                                             params={'id': transaction_id, 'symbol': symbol_to_sell, 'bprice': round(buy_price, 2), 'bdate': buy_date, 'qty': sell_qty, 'sprice': round(sell_price, 2), 'sdate': sell_date.strftime("%Y-%m-%d"), 'ret': round(realized_return, 2), 'target': round(target_price, 2), 'stop': round(stop_loss_price, 2)})
                         else:
                             session.execute(_sql_text(f"INSERT INTO {config['realized_table']} (transaction_id, {config['asset_col']}, buy_price, buy_date, quantity, sell_price, sell_date, realized_return_pct) VALUES (:id, :symbol, :bprice, :bdate, :qty, :sprice, :sdate, :ret)"),
-                                            params={'id': transaction_id, 'symbol': symbol_to_sell, 'bprice': round(buy_price, 2), 'bdate': buy_date, 'qty': sell_qty, 'sprice': round(sell_price, 2), 'sdate': sell_date.strftime("%Y-%m-%d"), 'ret': round(realized_return, 2)})
+                                             params={'id': transaction_id, 'symbol': symbol_to_sell, 'bprice': round(buy_price, 2), 'bdate': buy_date, 'qty': sell_qty, 'sprice': round(sell_price, 2), 'sdate': sell_date.strftime("%Y-%m-%d"), 'ret': round(realized_return, 2)})
 
                         # --- FUND UPDATE LOGIC (SELL) ---
                         if not is_trading_section or (is_trading_section and not is_paper_trading_on_submit):
@@ -2195,13 +2243,8 @@ def render_asset_page(config):
     # Identify Live Trade Symbols
     live_trade_symbols = set()
     if is_trading_section:
-        # Optimized: db_query is cached
-        fund_tx = db_query("SELECT description FROM fund_transactions WHERE type='Withdrawal'")
-        for desc in fund_tx['description']:
-            if desc.startswith("Purchase"):
-                parts = desc.split(' of ')
-                if len(parts) > 1:
-                    live_trade_symbols.add(parts[-1].strip())
+        # Optimized: Use cached function for live trade symbols
+        live_trade_symbols = get_live_trade_symbols()
 
     # Apply Mode Filter
     holdings_df = full_holdings_df.copy()
