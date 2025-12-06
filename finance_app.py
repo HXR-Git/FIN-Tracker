@@ -18,9 +18,6 @@ from sqlalchemy.orm import sessionmaker
 # ------------------ CONFIG & LOGGING ------------------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:root:%(message)s")
 
-# ------------------ END NAVIGATION HELPER ------------------------------------
-
-
 st.set_page_config(
     page_title="Finance Dashboard",
     page_icon="pages/logo.png",
@@ -231,18 +228,15 @@ def df_to_table(df: pd.DataFrame, table_name: str, if_exists: str = 'append', ca
                 logging.warning(f"Failed inserting row into {table_name}: {ex}")
 
 # ------------------ APP CONFIG ------------------
-# NOTE: Credentials now rely solely on st.secrets, removing hardcoded defaults for security.
 USERNAME = st.secrets.get("auth", {}).get("username")
 PASSWORD = st.secrets.get("auth", {}).get("password")
 
 # --- VIEWER CREDENTIALS ---
-# Viewer uses VIEWER_USERNAME as the Access Code, password is ignored for UI simplicity
 VIEWER_USERNAME = st.secrets.get("auth", {}).get("viewer_username")
 VIEWER_PASSWORD = st.secrets.get("auth", {}).get("viewer_password")
 # --------------------------
 
 # --- REVISED GLOBAL PAYMENT METHODS ---
-# Simplified payment methods as requested
 PAYMENT_METHODS = ["Online", "Cash", "Credit Card", "N/A"]
 PAYMENT_ACCOUNTS = [pm for pm in PAYMENT_METHODS if pm != 'N/A']
 # --------------------------------------
@@ -251,7 +245,7 @@ def login_page():
     # --- Dark Color Schema ---
     BACKGROUND_COLOR = "#0F172A"  # Dark Slate Blue
     CARD_COLOR = "#1F2937"        # Dark Grey/Slate for Card
-    PRIMARY_COLOR = "#10B981"      # Emerald Green Accent
+    PRIMARY_COLOR = "#10B981"     # Emerald Green Accent
     TEXT_COLOR = "#F3F4F6"        # Light Text
 
     # Inject custom CSS for a superb dark login page
@@ -817,6 +811,7 @@ def _sync_mf_to_expenses():
 
     for _, tx_row in mf_tx_df.iterrows():
         # Derive the description that the live transaction logic uses
+        tx_type = tx_row['type']
         expense_type = "Expense" if tx_row['type'] == "Purchase" else "Income"
         expense_desc = f"{tx_type} {tx_row['scheme_name']} units"
 
@@ -948,7 +943,7 @@ def get_combined_returns():
     total_invested = inv_invested + trade_invested + mf_invested
     total_current  = inv_current + trade_current + mf_current
     total_return_amount = round(total_current - total_invested, 2)
-    total_return_pct         = round((total_return_amount / total_invested) * 100, 2) if total_invested > 0 else 0
+    total_return_pct           = round((total_return_amount / total_invested) * 100, 2) if total_invested > 0 else 0
 
     # Optimized: Use cached realized dataframes
     realized_stocks_df = get_realized_df("realized_stocks")
@@ -956,8 +951,8 @@ def get_combined_returns():
 
     # Filter realized exits based on live trade symbols
     live_exits_df = realized_exits_df[realized_exits_df['symbol'].isin(live_trade_symbols)] if not realized_exits_df.empty else pd.DataFrame()
-    realized_inv       = float(realized_stocks_df['realized_profit_loss'].sum()) if not realized_stocks_df.empty else 0
-    realized_trade = float(live_exits_df['realized_profit_loss'].sum())           if not live_exits_df.empty      else 0
+    realized_inv         = float(realized_stocks_df['realized_profit_loss'].sum()) if not realized_stocks_df.empty else 0
+    realized_trade = float(live_exits_df['realized_profit_loss'].sum())            if not live_exits_df.empty       else 0
     realized_mf    = 0
 
     return {
@@ -1012,7 +1007,7 @@ def get_benchmark_data(benchmark_choice, start_date):
         data = yf.download(
             ticker,
             start=start_date_str, # Use string date
-            end=end_date_str,     # Use string date
+            end=end_date_str,      # Use string date
             progress=False,
             auto_adjust=True
         )
@@ -1494,7 +1489,7 @@ def funds_page():
         st.info("No fund transactions logged yet.")
 
 def expense_tracker_page():
-    """Renders the Expense Tracker page with a simplified dashboard, new Savings feature, and revised payment methods."""
+    """Renders the Expense Tracker page with a simplified dashboard and transaction logging."""
     st.title("💸 Expense Tracker")
     is_viewer = st.session_state.get("role") == "viewer"
     disabled = is_viewer
@@ -1525,10 +1520,11 @@ def expense_tracker_page():
 
     CATEGORIES = st.session_state.expense_categories_list
 
-    view = st.radio("Select View", ["Dashboard", "Transaction History", "Manage Budgets", "Manage Recurring", "Transfer", "Savings"], horizontal=True, label_visibility="hidden", disabled=disabled)
+    # MODIFIED: Removed "Savings" as a top-level view
+    view = st.radio("Select View", ["Dashboard", "Transaction History", "Manage Budgets", "Manage Recurring", "Transfer"], horizontal=True, label_visibility="hidden", disabled=disabled)
 
 
-    if view not in ["Transfer", "Savings"]:
+    if view != "Transfer": # The sidebar form should not appear on the Transfer page
         st.sidebar.header("Add Transaction")
         with st.sidebar.form("new_transaction_form", clear_on_submit=True):
             trans_type = st.radio("Transaction Type", ["Expense", "Income"], key="trans_type", disabled=disabled)
@@ -1563,17 +1559,33 @@ def expense_tracker_page():
                 final_cat = None
             # ------------------------------------
 
+            debit_funds_toggle = True # Default to affecting funds unless overridden
+
             if trans_type == "Income":
                 trans_pm = st.selectbox("Destination Account/Method", options=PAYMENT_ACCOUNTS, index=None, disabled=disabled)
+                debit_funds_toggle = True # Income always credits funds
             else:
                 trans_pm = st.selectbox("Payment Method", options=PAYMENT_ACCOUNTS, index=None, disabled=disabled)
+
+                # --- NEW SAVINGS DEBIT TOGGLE (Conditional based on category) ---
+                if final_cat == "Savings":
+                    # For Savings, we allow the user to explicitly control the Funds debit
+                    debit_funds_toggle = st.toggle(
+                        "Debit from Funds (Bank Account)?",
+                        value=True,
+                        help="If YES, this saving amount will be treated as a cash withdrawal from your monitored 'Funds' balance.",
+                        disabled=disabled
+                    )
+                else:
+                    debit_funds_toggle = True # All non-Savings expenses debit the funds by default
+                # -----------------------------------------------------------------
 
             trans_desc = st.text_input("Description", value="", disabled=disabled)
 
             if st.form_submit_button("Add Transaction", disabled=disabled):
                 if trans_amount and final_cat and trans_pm:
 
-                    # Use session for execution via db_execute helper
+                    # 1. Insert into Expense Tracker (Always happens)
                     db_execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (:id, :date, :type, :amount, :cat, :pm, :desc, :tg_id)",
                               params={
                                   'id': str(uuid.uuid4()),
@@ -1586,7 +1598,21 @@ def expense_tracker_page():
                                   'tg_id': None # Regular transactions do not use a transfer group ID
                               }, cache_clear_type='general'
                     )
-                    st.success(f"{trans_type} added! Category: **{final_cat}**")
+
+                    # 2. Conditionally update Funds (Cash Balance)
+                    if debit_funds_toggle and trans_type == "Expense":
+                        # Record a withdrawal
+                        update_funds_on_transaction("Withdrawal", round(trans_amount, 2), f"EXPENSE: {final_cat} - {trans_desc}", trans_date.strftime("%Y-%m-%d"))
+                        st.success(f"{trans_type} added! Funds **debited** by ₹{trans_amount:,.2f}.")
+                    elif debit_funds_toggle and trans_type == "Income":
+                        # Record a deposit
+                         update_funds_on_transaction("Deposit", round(trans_amount, 2), f"INCOME: {final_cat} - {trans_desc}", trans_date.strftime("%Y-%m-%d"))
+                         st.success(f"{trans_type} added! Funds **credited** by ₹{trans_amount:,.2f}.")
+                    elif final_cat == "Savings" and not debit_funds_toggle:
+                        # Logged as expense, but funds NOT debited (as per toggle)
+                        st.success(f"Savings of ₹{trans_amount:,.2f} recorded in Expense Tracker only (Funds NOT debited).")
+                    else:
+                        st.success(f"{trans_type} added! Category: **{final_cat}**.")
 
 
                     if final_cat not in st.session_state.expense_categories_list:
@@ -1597,59 +1623,6 @@ def expense_tracker_page():
                     st.rerun()
                 else:
                     st.warning("Please fill all required fields (Amount, Category, and Payment Method).")
-
-
-    elif view == "Savings":
-        st.header("💵 Log Dedicated Savings")
-        st.info("Record amounts saved separately from investments, trading, or mutual funds.")
-
-        with st.form("saving_form", clear_on_submit=True):
-            saving_date = st.date_input("Date", max_value=datetime.date.today(), value=datetime.date.today(), disabled=disabled)
-            saving_amount = st.number_input("Amount Saved", min_value=0.01, format="%.2f", value=None, disabled=disabled)
-            # Use 'Online' as the default payment method for saving entries
-            # Use PAYMENT_ACCOUNTS which is ["Online", "Cash", "Credit Card"]
-            saving_pm = st.selectbox("From Account (Source)", options=[pm for pm in PAYMENT_ACCOUNTS if pm != 'Credit Card'], index=0, placeholder="Select Source Account", disabled=disabled)
-            saving_desc = st.text_input("Description (Optional)", value="", placeholder="e.g., Target emergency fund goal", disabled=disabled)
-
-            if st.form_submit_button("Record Saving", disabled=disabled):
-                if saving_amount and saving_amount > 0 and saving_pm:
-                    # Log as an expense under the "Savings" category
-                    db_execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (:id, :date, 'Expense', :amount, 'Savings', :pm, :desc, :tg_id)",
-                                params={
-                                    'id': str(uuid.uuid4()),
-                                    'date': saving_date.strftime("%Y-%m-%d"),
-                                    'amount': round(saving_amount, 2),
-                                    'cat': 'Savings',
-                                    'pm': saving_pm,
-                                    'desc': saving_desc if saving_desc else "General Savings Log",
-                                    'tg_id': None
-                                }, cache_clear_type='general'
-                    )
-                    st.success(f"Savings of ₹{saving_amount:,.2f} recorded.")
-                    st.rerun()
-                else:
-                    st.warning("Please fill all required fields with a positive amount.")
-
-        st.divider()
-        st.subheader("Savings History")
-
-        savings_df = db_query("SELECT date, amount, payment_method, description FROM expenses WHERE category='Savings' ORDER BY date DESC")
-
-        if not savings_df.empty:
-            savings_df.rename(columns={'amount': 'Amount Saved', 'payment_method': 'Source Account'}, inplace=True)
-
-            # Recalculate and display total saved
-            total_saved_query = db_query("SELECT SUM(amount) AS total FROM expenses WHERE category='Savings'")
-            total_saved = total_saved_query['total'].iloc[0] if not total_saved_query.empty else 0.0
-
-            st.metric("Total Saved Amount", f"₹{total_saved:,.2f}")
-
-            savings_df['Amount Saved'] = savings_df['Amount Saved'].apply(lambda x: f"₹{x:,.2f}")
-            savings_df['date'] = pd.to_datetime(savings_df['date']).dt.date
-
-            st.dataframe(savings_df, hide_index=True, use_container_width=True)
-        else:
-            st.info("No savings recorded yet.")
 
 
     elif view == "Dashboard":
@@ -1673,38 +1646,53 @@ def expense_tracker_page():
         outflows_df = expenses_df[expenses_df['type'] == 'Expense']
 
 
-        # --- START: RESTORED ESSENTIAL METRICS ---
+        # --- START: ESSENTIAL METRICS ---
 
         # 1. Total Income (Excl. Transfers)
         total_income = inflows_df[inflows_df['category'] != 'Transfer In']['amount'].sum()
 
         # 2. Total Spent (Excl. Transfers)
-        # Note: Savings are now included in the expense count, but explicitly excluding transfers here.
+        # Note: Savings are included in total spent (correct for macro cash flow)
         spent_categories_to_include = outflows_df[outflows_df['category'] != 'Transfer Out']
         total_spent = spent_categories_to_include['amount'].sum()
 
         # 3. Net Flow (Excl. Transfers)
         net_flow = total_income - total_spent
 
-        # 4. Available Amount (Budget - Spent)
-        spent_by_category_df = spent_categories_to_include.groupby('category')['amount'].sum().reset_index().set_index('category')
-        available_df = budgets_df.copy().rename(columns={'amount': 'budget'})
-        available_df['spent'] = spent_by_category_df.reindex(available_df.index)['amount'].fillna(0)
-        available_df['available'] = available_df['budget'] - available_df['spent']
-        total_available = available_df['available'].sum()
-
         # Metric Display Block
         st.subheader(f"Monthly Summary ({month_year})")
-        col1, col2, col3, col4 = st.columns(4)
 
-        col1.metric("Total Income", f"₹{total_income:,.2f}", help="Total cash inflow this month (excluding transfers).")
-        col2.metric("Total Outflow", f"₹{total_spent:,.2f}", help="Total cash outflow this month (all expenses including savings, excluding transfers).")
-        col3.metric("Net Flow", f"₹{net_flow:,.2f}", delta_color="inverse" if net_flow >= 0 else "normal", help="Income - Outflow for the current month.")
-        col4.metric("Total Budget Available", f"₹{total_available:,.2f}", help="Sum of remaining funds across all tracked budget categories.")
+        # REMOVED METRIC: Total Budget Available (col4) as requested
+        col1, col2, col3 = st.columns(3)
 
-        # --- END: RESTORED ESSENTIAL METRICS ---
+        with col1:
+            st.metric("Total Income", f"₹{total_income:,.2f}", help="Total cash inflow this month (excluding transfers).")
+        with col2:
+            st.metric("Total Outflow", f"₹{total_spent:,.2f}", help="Total cash outflow this month (all expenses including savings, excluding transfers).")
+        with col3:
+            st.metric("Net Flow", f"₹{net_flow:,.2f}", delta_color="inverse" if net_flow >= 0 else "normal", help="Income - Outflow for the current month.")
+
+        # --- END: ESSENTIAL METRICS ---
 
         st.divider()
+
+        # --- START: Roll-Off Indicator (Monthly Roll-Over Display) ---
+        today = datetime.date.today()
+        current_month_name = today.strftime("%B %Y")
+        next_month = (today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        next_month_name = next_month.strftime("%B %Y")
+
+        if net_flow > 0:
+            roll_off_text = f"**+₹{net_flow:,.2f}** will be rolled forward to **{next_month_name}** as a carry-over."
+            st.success(f"💰 {current_month_name} Surplus: {roll_off_text}")
+        elif net_flow < 0:
+            roll_off_text = f"**-₹{abs(net_flow):,.2f}** will be the deficit carried forward to **{next_month_name}**."
+            st.error(f"🚨 {current_month_name} Deficit: {roll_off_text}")
+        else:
+            st.info(f"The net flow for {current_month_name} is balanced (₹0.00).")
+
+        st.divider()
+        # --- END: Roll-Off Indicator ---
 
 
         st.subheader("Daily Spending: Last 7 Days (Excl. Transfers and Savings)")
@@ -1764,8 +1752,8 @@ def expense_tracker_page():
                 color=alt.Color(field="category", type="nominal"),
 
                 tooltip=["category",
-                          alt.Tooltip('amount', format='.2f', title='Amount (₹)'),
-                          alt.Tooltip('percentage', format='.2f', title='Percentage (%)')],
+                         alt.Tooltip('amount', format='.2f', title='Amount (₹)'),
+                         alt.Tooltip('percentage', format='.2f', title='Percentage (%)')],
                 order=alt.Order("amount", sort="descending")
             )
 
@@ -1815,7 +1803,7 @@ def expense_tracker_page():
                 monthly_flows_df_raw['Net'] = monthly_flows_df_raw['Income'] - monthly_flows_df_raw['Expense']
 
                 # Calculate the cumulative net flow, lagged by one period for the carry-over
-                # This represents the balance brought forward from all preceding months
+                # This represents the balance brought forward from all preceding months (the Roll-Off amount)
                 monthly_flows_df_raw['Carry_Over'] = monthly_flows_df_raw['Net'].shift(1).fillna(0).cumsum()
 
                 # Reshape for Altair (Income, Expense, and Carry_Over to display the components)
@@ -2022,10 +2010,10 @@ def expense_tracker_page():
                                              use_container_width=True, hide_index=True, num_rows="fixed", disabled=disabled,
                                              column_config={"expense_id": st.column_config.TextColumn("ID", disabled=True),
                                                             "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                            "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
-                                                            # Use a selectbox for categories allowing user input of new ones
-                                                            "category": st.column_config.SelectboxColumn("Category", options=editable_categories, required=True),
-                                                            "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS], required=True)})
+                                                             "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"], required=True),
+                                                             # Use a selectbox for categories allowing user input of new ones
+                                                             "category": st.column_config.SelectboxColumn("Category", options=editable_categories, required=True),
+                                                             "payment_method": st.column_config.SelectboxColumn("Payment Method", options=[pm for pm in PAYMENT_METHODS], required=True)})
 
             # Manually convert 'date' column back to string for SQL insertion
             edited_df['date'] = edited_df['date'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, datetime.date) else x)
@@ -2086,7 +2074,7 @@ def expense_tracker_page():
                     if row['amount'] >= 0 and row['category']:
                         # Using 'budgets' table defined with SERIAL PRIMARY KEY
                         session.execute(_sql_text("INSERT INTO budgets (month_year, category, amount) VALUES (:month, :cat, :amount)"),
-                                             params={'month': budget_month_str, 'cat': row['category'], 'amount': round(row['amount'], 2)})
+                                            params={'month': budget_month_str, 'cat': row['category'], 'amount': round(row['amount'], 2)})
 
             st.success("Budgets saved!")
             st.rerun()
@@ -2114,7 +2102,7 @@ def expense_tracker_page():
                     if row['description'] and row['amount'] > 0:
                         # Inserting new rows, relying on SERIAL PRIMARY KEY for recurring-id
                         session.execute(_sql_text("INSERT INTO recurring_expenses (description, amount, category, payment_method, day_of_month) VALUES (:desc, :amount, :cat, :pm, :day)"),
-                                             params={'desc': row['description'], 'amount': round(row['amount'], 2), 'cat': row['category'], 'pm': row['payment_method'], 'day': row['day_of_month']})
+                                            params={'desc': row['description'], 'amount': round(row['amount'], 2), 'cat': row['category'], 'pm': row['payment_method'], 'day': row['day_of_month']})
             st.success("Recurring expense rules saved!")
             st.rerun()
 
@@ -2129,8 +2117,11 @@ def mutual_fund_page():
 
     # --- Sync Historical MF Data to Expenses on load ---
     if st.session_state.get("mf_sync_run") != True:
+      try:
         _sync_mf_to_expenses()
         st.session_state["mf_sync_run"] = True
+      except Exception as e:
+        logging.warning(f"Initial MF sync failed: {e}")
     # ---------------------------------------------------
 
     key_prefix = "mf"
@@ -2213,7 +2204,7 @@ def mutual_fund_page():
 
                         # 2. Update MF Transactions
                         db_execute("INSERT INTO mf_transactions (transaction_id, date, scheme_name, yfinance_symbol, type, units, nav, amount) VALUES (:id, :date, :scheme, :symbol, :type, :units, :nav, :amount)",
-                                    params={'id': str(uuid.uuid4()), 'date': mf_date.strftime('%Y-%m-%d'), 'scheme': selected_name, 'symbol': selected_code, 'type': mf_type, 'units': round(mf_units, 4), 'nav': round(mf_nav, 4), 'amount': final_cash_amount}, # Use final cash amount for consistency
+                                     params={'id': str(uuid.uuid4()), 'date': mf_date.strftime('%Y-%m-%d'), 'scheme': selected_name, 'symbol': selected_code, 'type': mf_type, 'units': round(mf_units, 4), 'nav': round(mf_nav, 4), 'amount': final_cash_amount}, # Use final cash amount for consistency
                         )
 
                         # 3. Update Expense Tracker (Investment Category)
@@ -2221,16 +2212,16 @@ def mutual_fund_page():
                         expense_desc = f"{mf_type} {selected_name} units"
 
                         db_execute("INSERT INTO expenses (expense_id, date, type, amount, category, payment_method, description, transfer_group_id) VALUES (:id, :date, :type, :amount, :cat, :pm, :desc, :tg_id)",
-                                    params={
-                                        'id': str(uuid.uuid4()),
-                                        'date': mf_date.strftime("%Y-%m-%d"),
-                                        'type': expense_type,
-                                        'amount': final_cash_amount,
-                                        'cat': 'Investment',
-                                        'pm': 'N/A',
-                                        'desc': expense_desc,
-                                        'tg_id': None
-                                    }, cache_clear_type='general'
+                                     params={
+                                         'id': str(uuid.uuid4()),
+                                         'date': mf_date.strftime("%Y-%m-%d"),
+                                         'type': expense_type,
+                                         'amount': final_cash_amount,
+                                         'cat': 'Investment',
+                                         'pm': 'N/A',
+                                         'desc': expense_desc,
+                                         'tg_id': None
+                                     }, cache_clear_type='general'
                         )
 
                         st.success(f"{mf_type} of {selected_name} logged and Expense Tracker updated!")
@@ -2309,13 +2300,13 @@ def mutual_fund_page():
             edited_df = st.data_editor(transactions_df, use_container_width=True, hide_index=True, num_rows="fixed", disabled=disabled,
                                              column_config={"transaction_id": st.column_config.TextColumn("ID", disabled=True),
                                                             "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
-                                                            "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
-                                                            "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
-                                                            "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
-                                                            "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
-                                                            "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True),
-                                                            "amount": st.column_config.NumberColumn("Amount (Cash Value)", min_value=0.01, required=True) # Added Amount column
-                                                                })
+                                                             "scheme_name": st.column_config.TextColumn("Scheme Name", required=True),
+                                                             "yfinance_symbol": st.column_config.TextColumn("YF Symbol", required=True),
+                                                             "type": st.column_config.SelectboxColumn("Type", options=["Purchase", "Redemption"], required=True),
+                                                             "units": st.column_config.NumberColumn("Units", min_value=0.0001, required=True),
+                                                             "nav": st.column_config.NumberColumn("NAV", min_value=0.01, required=True),
+                                                             "amount": st.column_config.NumberColumn("Amount (Cash Value)", min_value=0.01, required=True) # Added Amount column
+                                                                 })
 
             if st.button("Save Mutual Fund Changes", disabled=disabled):
                 # DML update needs to be session based.
